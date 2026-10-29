@@ -122,6 +122,7 @@ public:
   void loop();
   void handleCmdFrame(size_t len);
   bool advert();
+  bool advertFlood();   // flood, within the default scope
   void enterCLIRescue();
 
   int  getRecentlyHeard(AdvertPath dest[], int max_num);

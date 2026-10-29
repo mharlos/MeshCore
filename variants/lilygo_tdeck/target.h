@@ -8,7 +8,11 @@
 #include <helpers/AutoDiscoverRTCClock.h>
 #include <helpers/SensorManager.h>
 #ifdef DISPLAY_CLASS
-  #include <helpers/ui/ST7789LCDDisplay.h>
+  #ifdef CYBERDECK_UI
+    #include "CyberDeckDisplay.h"
+  #else
+    #include <helpers/ui/ST7789LCDDisplay.h>
+  #endif
   #include <helpers/ui/MomentaryButton.h>
 #endif
 #include "helpers/sensors/EnvironmentSensorManager.h"
