@@ -37,14 +37,22 @@
 
 class TDeckInput {
   bool _kb_present;
+  uint8_t _kb_errors;
   unsigned long _next_kb_poll;
-  int _pend_up, _pend_down, _pend_left, _pend_right;
+  int _acc_v, _acc_h;               // pulses since the last step: +down/-up, +right/-left
+  int _steps_v, _steps_h;           // steps decided but not yet returned
+  unsigned long _last_pulse, _last_v_step;
+  int _thresh_v, _thresh_h;
 
 public:
-  TDeckInput() : _kb_present(false), _next_kb_poll(0), _pend_up(0), _pend_down(0), _pend_left(0), _pend_right(0) { }
+  TDeckInput() : _kb_present(false), _kb_errors(0), _next_kb_poll(0), _acc_v(0), _acc_h(0), _steps_v(0), _steps_h(0),
+                 _last_pulse(0), _last_v_step(0) { setSensitivity(3); }
 
   void begin();
   bool hasKeyboard() const { return _kb_present; }
+
+  // 1 (needs a deliberate roll) .. 5 (every pulse counts)
+  void setSensitivity(int level);
 
   // the next key or trackball step, or TKEY_NONE
   int read();

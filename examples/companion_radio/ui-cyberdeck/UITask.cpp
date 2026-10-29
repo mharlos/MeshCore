@@ -4,21 +4,26 @@
 #include <helpers/TxtDataHelpers.h>
 #include <helpers/AdvertDataHelpers.h>
 #include <target.h>
+#include "font_spleen8x16.h"
 
 #ifndef CD_DEFAULT_DIM_SECS
   #define CD_DEFAULT_DIM_SECS  90
 #endif
 #define CD_PREFS_FILE   "/cdeck"
-#define CD_PREFS_MAGIC  0xCD
+#define CD_PREFS_MAGIC  0xCE
 
+// Two fonts: Spleen 8x16 for everything you read, the built-in 6x8 for the status
+// bar and key hints.
 #define SCR_W       CYBERDECK_W
-#define CHAR_W      6
-#define ROW_H       10
-#define COLS        (SCR_W / CHAR_W)    // 53
-#define BODY_Y      26
-#define BODY_ROWS   18
+#define CHAR_W      8
+#define ROW_H       16
+#define COLS        (SCR_W / CHAR_W)    // 40
+#define SMALL_W     6
+#define TABS_Y      17
+#define BODY_Y      35
+#define BODY_ROWS   11
 #define INPUT_Y     214
-#define FOOT_Y      231
+#define FOOT_Y      232
 
 #define TKEY_CLICK   0x85
 #define TKEY_HOLD    0x86
@@ -77,7 +82,7 @@ static const char* typeTag(uint8_t type) {
   switch (type) {
     case ADV_TYPE_CHAT:     return "USR";
     case ADV_TYPE_REPEATER: return "RPT";
-    case ADV_TYPE_ROOM:     return "ROOM";
+    case ADV_TYPE_ROOM:     return "RMS";
     case ADV_TYPE_SENSOR:   return "SNS";
     default:                return "???";
   }
@@ -125,6 +130,7 @@ void UITask::begin(DisplayDriver* display, SensorManager* sensors, NodePrefs* no
   user_btn.begin();
   _input.begin();
   loadPrefs();
+  _input.setSensitivity(_prefs.ball);
   applyTheme();
   refreshChannels();
   refreshNodes();
@@ -141,8 +147,9 @@ void UITask::begin(DisplayDriver* display, SensorManager* sensors, NodePrefs* no
 void UITask::loadPrefs() {
   _prefs.magic = CD_PREFS_MAGIC;
   _prefs.theme = 0;
-  _prefs.crt = 1;
+  _prefs.crt = 0;
   _prefs.dim_secs = CD_DEFAULT_DIM_SECS;
+  _prefs.ball = 3;
 
   File f = SPIFFS.open(CD_PREFS_FILE, "r");
   if (f) {
@@ -150,6 +157,7 @@ void UITask::loadPrefs() {
     if (f.read((uint8_t*)&p, sizeof(p)) == sizeof(p) && p.magic == CD_PREFS_MAGIC) {
       _prefs = p;
       if (_prefs.theme >= NUM_THEMES) _prefs.theme = 0;
+      if (_prefs.ball < 1 || _prefs.ball > 5) _prefs.ball = 3;
     }
     f.close();
   }
@@ -667,9 +675,10 @@ void UITask::runCommand(const char* line) {
   for (char* p = cmd; *p; p++) *p = tolower(*p);
 
   if (strcmp(cmd, "help") == 0 || strcmp(cmd, "?") == 0) {
-    consolePrint("advert [flood]  ble on|off  gps on|off  name <x>");
-    consolePrint("theme matrix|amber|gibson|redline  crt on|off");
-    consolePrint("dim <secs>  tz <hours>  clear  reboot  off");
+    consolePrint("advert [flood]  name <x>  ble/gps on|off");
+    consolePrint("theme matrix|amber|gibson|redline");
+    consolePrint("ball 1-5  crt on|off  dim <s>  tz <h>");
+    consolePrint("clear  reboot  off");
   } else if (strcmp(cmd, "advert") == 0) {
     bool flood = strcmp(arg, "flood") == 0;
     bool ok = flood ? the_mesh.advertFlood() : the_mesh.advert();
@@ -687,7 +696,8 @@ void UITask::runCommand(const char* line) {
       strncpy(_node_prefs->node_name, arg, sizeof(_node_prefs->node_name) - 1);
       _node_prefs->node_name[sizeof(_node_prefs->node_name) - 1] = 0;
       the_mesh.savePrefs();
-      consolePrint("HANDLE NOW %s // ADVERT TO ANNOUNCE", _node_prefs->node_name);
+      consolePrint("HANDLE NOW %s", _node_prefs->node_name);
+      consolePrint("RUN advert flood TO ANNOUNCE IT");
     } else {
       consolePrint("HANDLE %s", _node_prefs->node_name);
     }
@@ -700,6 +710,16 @@ void UITask::runCommand(const char* line) {
       }
     }
     consolePrint("THEME %s", THEMES[_prefs.theme].name);
+  } else if (strcmp(cmd, "ball") == 0) {
+    if (*arg) {
+      int b = atoi(arg);
+      if (b >= 1 && b <= 5) {
+        _prefs.ball = b;
+        _input.setSensitivity(b);
+        savePrefs();
+      }
+    }
+    consolePrint("TRACKBALL SENSITIVITY %u/5", _prefs.ball);
   } else if (strcmp(cmd, "crt") == 0) {
     if (strcmp(arg, "on") == 0) _prefs.crt = 1;
     else if (strcmp(arg, "off") == 0) _prefs.crt = 0;
@@ -729,7 +749,7 @@ void UITask::runCommand(const char* line) {
   } else if (strcmp(cmd, "off") == 0) {
     shutdown(false);
   } else if (cmd[0]) {
-    consolePrint("UNKNOWN COMMAND: %s // TRY help", cmd);
+    consolePrint("UNKNOWN: %s // TRY help", cmd);
   }
   _dirty = true;
 }
@@ -819,18 +839,30 @@ void UITask::loop() {
     _cursor_on = !_cursor_on;
     _next_blink = now + 500;
     render();
-    _display->pushRows(INPUT_Y - 2, ROW_H + 2);   // only the prompt line changes
+    _display->pushRows(INPUT_Y - 2, ROW_H + 4);   // only the prompt line changes
   }
 }
 
 /* ---------------------------------------- drawing -------------------------------------- */
 
 void UITask::text(int x, int y, uint16_t col, const char* s) {
+  uint16_t* buf = _display->buffer();
   Adafruit_GFX& g = _display->gfx();
-  g.setTextSize(1);
-  g.setTextColor(col);
-  g.setCursor(x, y);
-  g.print(s);
+  for (; *s && x <= SCR_W - CHAR_W; s++, x += CHAR_W) {
+    if (x < 0) continue;
+    const uint8_t* glyph = &SPLEEN_8X16_CP437[(uint8_t)*s * 16];
+    for (int r = 0; r < 16; r++) {
+      int py = y + r;
+      uint8_t bits = glyph[r];
+      if (bits == 0 || py < 0 || py >= CYBERDECK_H) continue;
+      if (buf) {
+        uint16_t* px = buf + py * CYBERDECK_W + x;
+        for (int c = 0; c < 8; c++) if (bits & (0x80 >> c)) px[c] = col;
+      } else {
+        for (int c = 0; c < 8; c++) if (bits & (0x80 >> c)) g.drawPixel(x + c, py, col);
+      }
+    }
+  }
 }
 
 void UITask::textf(int x, int y, uint16_t col, const char* fmt, ...) {
@@ -840,6 +872,14 @@ void UITask::textf(int x, int y, uint16_t col, const char* fmt, ...) {
   vsnprintf(buf, sizeof(buf), fmt, args);
   va_end(args);
   text(x, y, col, buf);
+}
+
+void UITask::stext(int x, int y, uint16_t col, const char* s) {
+  Adafruit_GFX& g = _display->gfx();
+  g.setTextSize(1);
+  g.setTextColor(col);
+  g.setCursor(x, y);
+  g.print(s);
 }
 
 int UITask::battPercent() const {
@@ -892,12 +932,14 @@ void UITask::render() {
 
     // alert banner, over whatever is underneath
     if (_alert[0] && (long)(_alert_until - millis()) > 0) {
-      int w = (strlen(_alert) + 8) * CHAR_W;
+      char a[COLS + 1];
+      snprintf(a, sizeof(a), "<< %.32s >>", _alert);
+      int w = strlen(a) * CHAR_W;
       int x = (SCR_W - w) / 2;
-      g.fillRect(x, 100, w, 22, c_bg);
-      g.drawRect(x, 100, w, 22, c_alert);
-      g.drawRect(x + 2, 102, w - 4, 18, c_alert);
-      textf(x + 6, 107, c_alert, "<<< %s >>>", _alert);
+      g.fillRect(x - 6, 94, w + 12, 30, c_bg);
+      g.drawRect(x - 6, 94, w + 12, 30, c_alert);
+      g.drawRect(x - 4, 96, w + 8, 26, c_alert);
+      text(x, 101, c_alert, a);
     }
   }
 
@@ -911,12 +953,12 @@ void UITask::drawBoot() {
   char tmp[COLS + 1];
 
   snprintf(lines[n++], COLS + 1, "MESHCORE//DECK BIOS %s", FIRMWARE_VERSION);
-  snprintf(lines[n++], COLS + 1, "(C) 1995 NOBODY. ALL RIGHTS DISAVOWED.");
+  snprintf(lines[n++], COLS + 1, "(C) 1995 NOBODY. RIGHTS DISAVOWED.");
   lines[n++][0] = 0;
 
   #define BOOT_CHECK(label, ok) do { \
     snprintf(tmp, sizeof(tmp), "%s ", label); \
-    int l = strlen(tmp); while (l < 40) tmp[l++] = '.'; tmp[l] = 0; \
+    int l = strlen(tmp); while (l < 31) tmp[l++] = '.'; tmp[l] = 0; \
     snprintf(lines[n++], COLS + 1, "%s %s", tmp, (ok) ? "[ OK ]" : "[FAIL]"); \
   } while (0)
 
@@ -924,26 +966,25 @@ void UITask::drawBoot() {
   char label[COLS + 1];
   snprintf(label, sizeof(label), "PSRAM %uK", (unsigned)(ESP.getPsramSize() / 1024));
   BOOT_CHECK(label, ESP.getPsramSize() > 0);
-  snprintf(label, sizeof(label), "LORA SX1262 %.3fMHZ SF%u BW%.1f", _node_prefs->freq, _node_prefs->sf, _node_prefs->bw);
+  snprintf(label, sizeof(label), "LORA %.3f SF%u BW%.1f", _node_prefs->freq, _node_prefs->sf, _node_prefs->bw);
   BOOT_CHECK(label, true);
   BOOT_CHECK("KEYBOARD I2C 0x55", _input.hasKeyboard());
-  snprintf(label, sizeof(label), "MSG BUFFER %d SLOTS", _max_msgs);
+  snprintf(label, sizeof(label), "MSG BUFFER %d", _max_msgs);
   BOOT_CHECK(label, _max_msgs > 0);
   lines[n++][0] = 0;
 
   const uint8_t* pk = the_mesh.self_id.pub_key;
-  snprintf(lines[n++], COLS + 1, "HANDLE  %s", _node_prefs->node_name);
-  snprintf(lines[n++], COLS + 1, "NODE ID %02X%02X%02X%02X%02X%02X  CONTACTS %d  CHANNELS %d",
-           pk[0], pk[1], pk[2], pk[3], pk[4], pk[5], _num_nodes, _num_chans);
-  if (isBluetoothEnabled()) snprintf(lines[n++], COLS + 1, "BLE PIN %06u", (unsigned)the_mesh.getBLEPin());
+  snprintf(lines[n++], COLS + 1, "HANDLE   %s", _node_prefs->node_name);
+  snprintf(lines[n++], COLS + 1, "NODE ID  %02X%02X%02X%02X%02X%02X", pk[0], pk[1], pk[2], pk[3], pk[4], pk[5]);
+  snprintf(lines[n++], COLS + 1, "CONTACTS %d  CHANNELS %d", _num_nodes, _num_chans);
+  if (isBluetoothEnabled()) snprintf(lines[n++], COLS + 1, "BLE PIN  %06u", (unsigned)the_mesh.getBLEPin());
   else snprintf(lines[n++], COLS + 1, "BLE OFF");
-  lines[n++][0] = 0;
   snprintf(lines[n++], COLS + 1, ">> JACKING IN");
 
   // type it out at ~250 chars/sec
   int budget = (millis() - _boot_started) / 4;
-  int y = 8;
-  for (int i = 0; i < n && budget > 0; i++, y += ROW_H + 2) {
+  int y = 2;
+  for (int i = 0; i < n && budget > 0; i++, y += ROW_H) {
     int len = strlen(lines[i]);
     int shown = (budget < len) ? budget : len;
     budget -= len + 6;   // a beat between lines
@@ -953,12 +994,13 @@ void UITask::drawBoot() {
     if (strstr(tmp, "[FAIL]")) col = c_alert;
     text(4, y, col, tmp);
     if (shown < len || i == n - 1) {
-      bool blink = (millis() / 250) % 2;
-      if (blink) _display->gfx().fillRect(4 + shown * CHAR_W, y, CHAR_W - 1, 8, c_fg);
+      int cx = 4 + shown * CHAR_W;
       if (i == n - 1 && shown == len) {   // dots after JACKING IN
         int dots = ((millis() - _boot_started) / 300) % 4;
-        for (int d = 0; d < dots; d++) text(4 + (len + d) * CHAR_W, y, c_fg, ".");
+        for (int d = 0; d < dots; d++) text(cx + d * CHAR_W, y, c_fg, ".");
+        cx += dots * CHAR_W;
       }
+      if ((millis() / 250) % 2) _display->gfx().fillRect(cx, y + 1, CHAR_W - 1, 13, c_fg);
       break;
     }
   }
@@ -966,30 +1008,24 @@ void UITask::drawBoot() {
 
 void UITask::drawHeader() {
   Adafruit_GFX& g = _display->gfx();
-  g.fillRect(0, 0, SCR_W, 11, c_fg);
-  text(2, 2, c_bg, G_DARK G_MED G_LIGHT " MESHCORE//DECK");
+  g.fillRect(0, 0, SCR_W, 16, c_fg);
+  text(2, 0, c_bg, G_DARK G_MED G_LIGHT " MESHCORE//DECK");
 
   char clock[12];
   fmtTime(clock, rtc_clock.getCurrentTime());
   char right[48];
+  int pos = 0;
   int unread = totalUnread();
-  if (unread) snprintf(right, sizeof(right), "MSG %d BAT%3d%% %s", unread, battPercent(), clock);
-  else snprintf(right, sizeof(right), "BAT%3d%% %s", battPercent(), clock);
-  int x = SCR_W - 2 - strlen(right) * CHAR_W;
-  text(x, 2, c_bg, right);
-
-  // radio link indicators, left of the battery
-  int ix = x - 4;
-  if (getGPSState()) { ix -= 4 * CHAR_W; text(ix, 2, c_bg, "GPS"); }
-  if (isBluetoothEnabled()) {
-    ix -= 5 * CHAR_W;
-    text(ix, 2, c_bg, hasConnection() ? "BLE+" : "BLE");
-  }
+  if (unread) pos += snprintf(right + pos, sizeof(right) - pos, "MSG %d  ", unread);
+  if (isBluetoothEnabled()) pos += snprintf(right + pos, sizeof(right) - pos, hasConnection() ? "BLE+  " : "BLE  ");
+  if (getGPSState()) pos += snprintf(right + pos, sizeof(right) - pos, "GPS  ");
+  snprintf(right + pos, sizeof(right) - pos, "%d%%  %s", battPercent(), clock);
+  stext(SCR_W - 3 - strlen(right) * SMALL_W, 4, c_bg, right);
 }
 
 void UITask::drawTabs() {
   Adafruit_GFX& g = _display->gfx();
-  int x = 2;
+  int x = 0;
   for (int t = 0; t < TAB_COUNT; t++) {
     char label[16];
     int unread = 0;
@@ -999,23 +1035,23 @@ void UITask::drawTabs() {
       for (int i = 0; i < _max_msgs; i++) if (_msgs[i].seq && _msgs[i].unread && _msgs[i].kind == CONV_DM) unread++;
     }
     snprintf(label, sizeof(label), unread ? " %s*" : " %s ", TAB_NAMES[t]);
-    int w = strlen(label) * CHAR_W + CHAR_W;
+    int w = strlen(label) * CHAR_W + CHAR_W / 2;
     if (t == _tab) {
-      g.fillRect(x, 13, w, 11, c_fg);
-      text(x + 3, 15, c_bg, label);
+      g.fillRect(x, TABS_Y - 1, w, ROW_H + 1, c_fg);
+      text(x, TABS_Y, c_bg, label);
     } else {
-      g.drawRect(x, 13, w, 11, c_dim);
-      text(x + 3, 15, unread ? c_hi : c_dim, label);
+      g.drawRect(x, TABS_Y - 1, w, ROW_H + 1, c_dim);
+      text(x, TABS_Y, unread ? c_hi : c_dim, label);
     }
-    x += w + 3;
+    x += w + 4;
   }
-  g.drawFastHLine(0, 24, SCR_W, c_dim);
+  g.drawFastHLine(0, TABS_Y + ROW_H + 1, SCR_W, c_dim);
 }
 
 void UITask::drawFooter(const char* hint) {
   Adafruit_GFX& g = _display->gfx();
-  g.drawFastHLine(0, FOOT_Y - 3, SCR_W, c_dim);
-  text(2, FOOT_Y, c_dim, hint);
+  g.drawFastHLine(0, FOOT_Y - 2, SCR_W, c_dim);
+  stext(2, FOOT_Y, c_dim, hint);
 }
 
 static int listTop(int count, int sel, int rows) {
@@ -1030,12 +1066,12 @@ void UITask::drawChanList() {
   if (sel >= _num_chans) sel = _num_chans ? _num_chans - 1 : 0;
 
   if (_num_chans == 0) {
-    text(8, BODY_Y + 10, c_dim, "NO CHANNELS. ADD THEM FROM THE PHONE APP.");
+    text(4, BODY_Y + ROW_H, c_dim, "NO CHANNELS YET.");
+    text(4, BODY_Y + 2 * ROW_H, c_dim, "ADD THEM FROM THE PHONE APP.");
   }
-  int rows = BODY_ROWS - 1;
-  int top = listTop(_num_chans, sel, rows);
-  for (int r = 0; r < rows && top + r < _num_chans; r++) {
-    int i = top + r, y = BODY_Y + 2 + r * ROW_H;
+  int top = listTop(_num_chans, sel, BODY_ROWS);
+  for (int r = 0; r < BODY_ROWS && top + r < _num_chans; r++) {
+    int i = top + r, y = BODY_Y + r * ROW_H;
     int idx = _chan_idx[i];
     ChannelDetails cd;
     the_mesh.getChannel(idx, cd);
@@ -1050,18 +1086,17 @@ void UITask::drawChanList() {
     }
     int unread = unreadFor(CONV_CHANNEL, idx, NULL);
     bool is_sel = i == sel;
-    uint16_t col = is_sel ? c_bg : c_fg;
-    if (is_sel) g.fillRect(0, y - 1, SCR_W, ROW_H, c_fg);
+    if (is_sel) g.fillRect(0, y, SCR_W, ROW_H, c_fg);
 
-    textf(2, y, col, "%s #%-18.18s", is_sel ? G_RIGHT : " ", name);
-    if (unread) textf(26 * CHAR_W, y, is_sel ? c_bg : c_hi, "%2d NEW", unread);
+    textf(0, y, is_sel ? c_bg : c_fg, "%s#%-18.18s", is_sel ? G_RIGHT : " ", name);
+    if (unread) textf(21 * CHAR_W, y, is_sel ? c_bg : c_hi, "%2d NEW", unread);
     if (last) {
       char t[8];
       fmtTime(t, last->ts);
-      textf(34 * CHAR_W, y, is_sel ? c_bg : c_dim, "%-12.12s %s", last->from, t);
+      text(35 * CHAR_W, y, is_sel ? c_bg : c_dim, t);
     }
   }
-  drawFooter(G_UP G_DOWN " SELECT  RET OPEN  " G_LEFT G_RIGHT " TAB  A-Z JUMP");
+  drawFooter(G_UP G_DOWN " SELECT   RET OPEN   " G_LEFT G_RIGHT " TAB   A-Z JUMP");
 }
 
 void UITask::drawNodeList(bool recent) {
@@ -1079,16 +1114,15 @@ void UITask::drawNodeList(bool recent) {
   if (sel >= count) sel = count ? count - 1 : 0;
 
   if (count == 0) {
-    text(8, BODY_Y + 10, c_dim, recent ? "NOTHING HEARD YET. TRY: advert flood (SYS TAB)"
-                                        : "NO CONTACTS YET. WAITING FOR ADVERTS...");
+    text(4, BODY_Y + ROW_H, c_dim, recent ? "NOTHING HEARD YET." : "NO CONTACTS YET.");
+    text(4, BODY_Y + 2 * ROW_H, c_dim, recent ? "TRY advert flood ON THE SYS TAB." : "WAITING FOR ADVERTS...");
   }
-  int rows = BODY_ROWS - 1;
-  int top = listTop(count, sel, rows);
-  for (int r = 0; r < rows && top + r < count; r++) {
-    int i = top + r, y = BODY_Y + 2 + r * ROW_H;
+  int top = listTop(count, sel, BODY_ROWS);
+  for (int r = 0; r < BODY_ROWS && top + r < count; r++) {
+    int i = top + r, y = BODY_Y + r * ROW_H;
     bool is_sel = i == sel;
     uint16_t col = is_sel ? c_bg : c_fg, dim = is_sel ? c_bg : c_dim;
-    if (is_sel) g.fillRect(0, y - 1, SCR_W, ROW_H, c_fg);
+    if (is_sel) g.fillRect(0, y, SCR_W, ROW_H, c_fg);
 
     char name[32], ago[8], hops[8];
     const char* tag = "";
@@ -1115,78 +1149,76 @@ void UITask::drawNodeList(bool recent) {
     else if (path_len == 0) strcpy(hops, "DIRECT");
     else snprintf(hops, sizeof(hops), "%dHOP", path_len);
 
-    textf(2, y, col, "%s", is_sel ? G_RIGHT : " ");
-    textf(2 * CHAR_W + 2, y, dim, "[%-4s]", tag);
-    textf(9 * CHAR_W + 2, y, col, "%-22.22s", name);
-    if (unread) textf(32 * CHAR_W, y, is_sel ? c_bg : c_hi, "%d NEW", unread);
-    textf(39 * CHAR_W, y, dim, "%6s %5s", hops, ago);
+    text(0, y, col, is_sel ? G_RIGHT : " ");
+    textf(1 * CHAR_W, y, dim, "%-3s", tag);
+    textf(5 * CHAR_W, y, col, "%-17.17s", name);
+    if (unread) text(23 * CHAR_W, y, is_sel ? c_bg : c_hi, "*");
+    textf(25 * CHAR_W, y, dim, "%6s", hops);
+    textf(35 * CHAR_W, y, dim, "%4s", ago);
   }
-  drawFooter(G_UP G_DOWN " SELECT  RET OPEN  " G_LEFT G_RIGHT " TAB");
+  drawFooter(G_UP G_DOWN " SELECT   RET OPEN   " G_LEFT G_RIGHT " TAB");
 }
 
 void UITask::drawSys() {
   Adafruit_GFX& g = _display->gfx();
-  int y = BODY_Y + 2;
+  int y = BODY_Y;
   const uint8_t* pk = the_mesh.self_id.pub_key;
 
-  textf(2, y, c_dim, "HANDLE");
-  textf(9 * CHAR_W, y, c_fg, "%-22.22s ID %02X%02X%02X%02X", _node_prefs->node_name, pk[0], pk[1], pk[2], pk[3]);
+  text(0, y, c_dim, "ID");
+  textf(5 * CHAR_W, y, c_fg, "%-22.22s %02X%02X%02X%02X", _node_prefs->node_name, pk[0], pk[1], pk[2], pk[3]);
   y += ROW_H;
-  textf(2, y, c_dim, "RADIO");
-  textf(9 * CHAR_W, y, c_fg, "%.3fMHZ BW%.1f SF%u CR%u %ddBm", _node_prefs->freq, _node_prefs->bw, _node_prefs->sf,
+  text(0, y, c_dim, "RF");
+  textf(5 * CHAR_W, y, c_fg, "%.3f BW%.1f SF%u CR%u %ddB", _node_prefs->freq, _node_prefs->bw, _node_prefs->sf,
         _node_prefs->cr, _node_prefs->tx_power_dbm);
   y += ROW_H;
   unsigned long up = millis() / 1000;
-  textf(2, y, c_dim, "POWER");
-  textf(9 * CHAR_W, y, c_fg, "%.2fV %d%%   UPTIME %luh%02lum", getBattMilliVolts() / 1000.0f, battPercent(), up / 3600, (up / 60) % 60);
+  text(0, y, c_dim, "PWR");
+  textf(5 * CHAR_W, y, c_fg, "%.2fV %d%%   UP %luh%02lum", getBattMilliVolts() / 1000.0f, battPercent(), up / 3600, (up / 60) % 60);
   y += ROW_H;
-  textf(2, y, c_dim, "BLE");
-  if (isBluetoothEnabled()) textf(9 * CHAR_W, y, c_fg, "ON  PIN %06u  %s", (unsigned)the_mesh.getBLEPin(), hasConnection() ? "[LINKED]" : "[IDLE]");
-  else textf(9 * CHAR_W, y, c_fg, "OFF");
+  text(0, y, c_dim, "LINK");
+  char ble[24];
+  if (isBluetoothEnabled()) snprintf(ble, sizeof(ble), "BLE %06u %s", (unsigned)the_mesh.getBLEPin(), hasConnection() ? "LINKED" : "IDLE");
+  else strcpy(ble, "BLE OFF");
+  textf(5 * CHAR_W, y, c_fg, "%-20s GPS %s", ble, getGPSState() ? "ON" : "OFF");
   y += ROW_H;
-  textf(2, y, c_dim, "GPS");
-  if (getGPSState()) textf(9 * CHAR_W, y, c_fg, "ON  %.5f %.5f", _sensors->node_lat, _sensors->node_lon);
-  else textf(9 * CHAR_W, y, c_fg, "OFF");
-  y += ROW_H;
-  textf(2, y, c_dim, "MESH");
-  textf(9 * CHAR_W, y, c_fg, "CONTACTS %d  CHANNELS %d  APP QUEUE %d", _num_nodes, _num_chans, _msgcount);
-  y += ROW_H;
-  textf(2, y, c_dim, "SCOPE");
-  textf(9 * CHAR_W, y, c_fg, "%s", _node_prefs->default_scope_name[0] ? _node_prefs->default_scope_name : "* (UNSCOPED)");
-  y += ROW_H + 2;
+  text(0, y, c_dim, "NET");
+  textf(5 * CHAR_W, y, c_fg, "%d NODES %d CHAN  SCOPE %s", _num_nodes, _num_chans,
+        _node_prefs->default_scope_name[0] ? _node_prefs->default_scope_name : "*");
+  y += ROW_H + 3;
   g.drawFastHLine(0, y - 2, SCR_W, c_dim);
 
-  if (_console_len == 0) text(2, y + 1, c_dim, "TYPE help FOR COMMANDS");
+  if (_console_len == 0) text(0, y, c_dim, "TYPE help FOR COMMANDS");
   for (int i = 0; i < _console_len; i++) {
-    text(2, y + 1 + i * ROW_H, _console[i][0] == '>' ? c_dim : c_fg, _console[i]);
+    text(0, y + i * ROW_H, _console[i][0] == '>' ? c_dim : c_hi, _console[i]);
   }
   drawInput(INPUT_Y, "root@deck:~#", _cmd_buf, _cmd_len);
-  drawFooter("TYPE A COMMAND  RET RUN  " G_LEFT G_RIGHT " TAB");
+  drawFooter("TYPE A COMMAND   RET RUN   " G_LEFT G_RIGHT " TAB");
 }
 
 void UITask::drawInput(int y, const char* prompt, const char* buf, int len) {
   Adafruit_GFX& g = _display->gfx();
-  g.drawRect(0, y - 3, SCR_W, ROW_H + 4, c_dim);
-  textf(3, y, c_hi, "%s", prompt);
-  int px = 3 + (strlen(prompt) + 1) * CHAR_W;
-  int room = (SCR_W - px - 4) / CHAR_W - 1;
+  g.drawRect(0, y - 2, SCR_W, ROW_H + 2, c_dim);
+  text(2, y - 1, c_hi, prompt);
+  int px = 2 + (strlen(prompt) + 1) * CHAR_W;
+  int room = (SCR_W - px - 2) / CHAR_W - 1;
   const char* shown = (len > room) ? buf + (len - room) : buf;   // keep the end of long input visible
-  text(px, y, c_fg, shown);
-  if (_cursor_on) {
-    int cx = px + strlen(shown) * CHAR_W;
-    g.fillRect(cx, y, CHAR_W - 1, 8, c_fg);
-  }
+  text(px, y - 1, c_fg, shown);
+  if (_cursor_on) g.fillRect(px + strlen(shown) * CHAR_W, y, CHAR_W - 1, ROW_H - 3, c_fg);
 }
 
 void UITask::drawChat() {
   Adafruit_GFX& g = _display->gfx();
 
-  // title strip
+  // title strip, where the tabs usually are
+  if (_conv_kind == CONV_CHANNEL) textf(0, TABS_Y, c_hi, "#%.30s", _conv_name);
+  else textf(0, TABS_Y, c_hi, "LINK // %.24s", _conv_name);
   int unread_elsewhere = totalUnread();
-  if (_conv_kind == CONV_CHANNEL) textf(2, 14, c_hi, "CHANNEL #%s", _conv_name);
-  else textf(2, 14, c_hi, "SECURE LINK // %s", _conv_name);
-  if (unread_elsewhere) textf(SCR_W - 12 * CHAR_W, 14, c_alert, "%2d UNREAD " G_LEFT, unread_elsewhere);
-  g.drawFastHLine(0, 24, SCR_W, c_dim);
+  if (unread_elsewhere) {
+    char u[16];
+    snprintf(u, sizeof(u), "%d UNREAD " G_LEFT, unread_elsewhere);
+    stext(SCR_W - 3 - strlen(u) * SMALL_W, TABS_Y + 4, c_alert, u);
+  }
+  g.drawFastHLine(0, TABS_Y + ROW_H + 1, SCR_W, c_dim);
 
   // lay out lines bottom-up: newest message last
   struct Line { const Msg* m; uint16_t start; uint8_t len; };
@@ -1196,7 +1228,7 @@ void UITask::drawChat() {
   int want = BODY_ROWS + _scroll;
   if (want > max_lines) want = max_lines;
 
-  static char full[COLS * 6];
+  static char full[COLS * 8];
   for (uint32_t s = _next_seq - 1; s > 0 && s + _max_msgs >= _next_seq && n < want; s--) {
     const Msg* m = findMsg(s);
     if (m == NULL || !msgInConv(*m, _conv_kind, _conv_chan, _conv_peer)) continue;
@@ -1204,13 +1236,13 @@ void UITask::drawChat() {
     // break this message into wrapped segments, then add them last-first
     char t[8];
     fmtTime(t, m->ts);
-    int flen = snprintf(full, sizeof(full), "%s <%s> %s", t, m->from, m->text);
+    int flen = snprintf(full, sizeof(full), "%s %s: %s", t, m->from, m->text);
     if (flen >= (int)sizeof(full)) flen = sizeof(full) - 1;
     uint16_t seg_start[8];
     uint8_t seg_len[8];
     int segs = 0, pos = 0;
     while (pos < flen && segs < 8) {
-      int width = (segs == 0) ? COLS : COLS - 3;   // continuation lines are indented
+      int width = (segs == 0) ? COLS : COLS - 2;   // continuation lines are indented
       int len = flen - pos;
       if (len > width) {
         len = width;
@@ -1234,10 +1266,10 @@ void UITask::drawChat() {
   if (_scroll > n - BODY_ROWS) _scroll = (n > BODY_ROWS) ? n - BODY_ROWS : 0;
 
   if (n == 0) {
-    text(8, BODY_Y + 10, c_dim, _conv_kind == CONV_CHANNEL ? "NO TRAFFIC YET. SAY SOMETHING." : "LINK OPEN. NO MESSAGES YET.");
+    text(4, BODY_Y + ROW_H, c_dim, _conv_kind == CONV_CHANNEL ? "NO TRAFFIC YET. SAY SOMETHING." : "LINK OPEN. NO MESSAGES YET.");
   }
 
-  // draw: each line re-derives its text from the message, so only a pointer and offsets were stored
+  // each line re-derives its text from the message, so only a pointer and offsets were stored
   for (int r = 0; r < BODY_ROWS; r++) {
     int li = _scroll + (BODY_ROWS - 1 - r);
     if (li >= n) continue;
@@ -1245,11 +1277,11 @@ void UITask::drawChat() {
     const Msg* m = L.m;
     char t[8];
     fmtTime(t, m->ts);
-    int flen = snprintf(full, sizeof(full), "%s <%s> %s", t, m->from, m->text);
+    int flen = snprintf(full, sizeof(full), "%s %s: %s", t, m->from, m->text);
     if (flen >= (int)sizeof(full)) flen = sizeof(full) - 1;
 
-    int y = BODY_Y + 2 + r * ROW_H;
-    int x = 2 + (L.start > 0 ? 3 * CHAR_W : 0);
+    int y = BODY_Y + r * ROW_H;
+    int x = (L.start > 0) ? 2 * CHAR_W : 0;
     char seg[COLS + 1];
     int len = L.len < COLS ? L.len : COLS;
     memcpy(seg, &full[L.start], len);
@@ -1258,8 +1290,8 @@ void UITask::drawChat() {
     uint16_t body_col = m->outgoing ? c_hi : c_fg;
     if (m->status == ST_FAILED) body_col = c_alert;
     if (L.start == 0) {
-      // "[time] <from>" prefix in its own colours
-      int tlen = strlen(t), plen = tlen + 1 + strlen(m->from) + 2;
+      // "time from:" prefix in its own colours
+      int tlen = strlen(t), plen = tlen + 1 + strlen(m->from) + 1;
       if (plen > len) plen = len;
       char pre[COLS + 1];
       memcpy(pre, seg, tlen);
@@ -1273,29 +1305,32 @@ void UITask::drawChat() {
       text(x, y, body_col, seg);
     }
 
-    // delivery state at the end of a message's last line
-    bool last_line = li == 0 || lines[li - 1].m != m;   // a message's final segment sits nearest the bottom
+    // a message's final segment sits nearest the bottom: delivery state or route goes after it
+    bool last_line = li == 0 || lines[li - 1].m != m;
+    int end_x = x + len * CHAR_W;
     if (m->outgoing && last_line) {
       const char* mark = (m->status == ST_SENDING) ? " ..." : (m->status == ST_DELIVERED) ? " " G_CHECK
-                       : (m->status == ST_FAILED) ? " FAILED" : "";
-      int mx = x + len * CHAR_W;
-      if (mx + strlen(mark) * CHAR_W <= SCR_W) text(mx, y, m->status == ST_FAILED ? c_alert : c_dim, mark);
+                       : (m->status == ST_FAILED) ? " FAIL" : "";
+      if (end_x + (int)strlen(mark) * CHAR_W <= SCR_W) text(end_x, y, m->status == ST_FAILED ? c_alert : c_dim, mark);
     } else if (!m->outgoing && last_line && m->hops != 0xFF) {
-      // hops/SNR tag for received flood messages, right-aligned if it fits
       char tag[16];
-      snprintf(tag, sizeof(tag), " %dh %+ddB", m->hops, m->snr4 / 4);
-      int mx = x + len * CHAR_W;
-      if (mx + (int)strlen(tag) * CHAR_W <= SCR_W - 2) text(SCR_W - 2 - strlen(tag) * CHAR_W, y, c_dim, tag);
+      snprintf(tag, sizeof(tag), "%dh %+ddB", m->hops, m->snr4 / 4);
+      int tx = SCR_W - 2 - strlen(tag) * SMALL_W;
+      if (end_x + SMALL_W <= tx) stext(tx, y + 5, c_dim, tag);
     }
   }
-  if (_scroll > 0) textf(SCR_W - 10 * CHAR_W, BODY_Y + 2, c_alert, G_DOWN " +%d", _scroll);
+  if (_scroll > 0) {
+    char sc[12];
+    snprintf(sc, sizeof(sc), G_DOWN " +%d", _scroll);
+    stext(SCR_W - 3 - strlen(sc) * SMALL_W, BODY_Y + 1, c_alert, sc);
+  }
 
-  char prompt[24];
-  snprintf(prompt, sizeof(prompt), "%.10s>", _node_prefs->node_name);
+  char prompt[16];
+  snprintf(prompt, sizeof(prompt), "%.8s>", _node_prefs->node_name);
   drawInput(INPUT_Y, prompt, _input_buf, _input_len);
-  char hint[COLS + 1];
+  char hint[64];
   int max_len = CD_INPUT_MAX - (_conv_kind == CONV_CHANNEL ? strlen(_node_prefs->node_name) + 2 : 0);
-  snprintf(hint, sizeof(hint), "RET SEND  " G_UP G_DOWN " SCROLL  " G_LEFT " BACK  /help CMDS  %3d/%d", _input_len, max_len);
+  snprintf(hint, sizeof(hint), "RET SEND  " G_UP G_DOWN " SCROLL  " G_LEFT " BACK  /help CMDS   %3d/%d", _input_len, max_len);
   drawFooter(hint);
 }
 
@@ -1307,41 +1342,40 @@ void UITask::drawNode() {
   if (i == _num_nodes) { _screen = SCR_LIST; return; }
   const Node& n = _nodes[i];
 
-  int y = 14;
-  textf(2, y, c_hi, "NODE DOSSIER // [%s] %s", typeTag(n.type), n.name);
-  _display->gfx().drawFastHLine(0, 24, SCR_W, c_dim);
-  y = BODY_Y + 4;
+  textf(0, TABS_Y, c_hi, "DOSSIER // [%s] %.22s", typeTag(n.type), n.name);
+  _display->gfx().drawFastHLine(0, TABS_Y + ROW_H + 1, SCR_W, c_dim);
+  int y = BODY_Y;
 
   ContactInfo* c = the_mesh.lookupContactByPubKey(n.pub, sizeof(n.pub));
   if (c) {
     char hex[65];
     for (int k = 0; k < 32; k++) sprintf(&hex[k * 2], "%02X", c->id.pub_key[k]);
-    textf(2, y, c_dim, "PUBKEY");
+    text(0, y, c_dim, "KEY");
     char half[33];
     memcpy(half, hex, 32); half[32] = 0;
-    text(10 * CHAR_W, y, c_fg, half);
+    text(7 * CHAR_W, y, c_fg, half);
     y += ROW_H;
-    text(10 * CHAR_W, y, c_fg, &hex[32]);
+    text(7 * CHAR_W, y, c_fg, &hex[32]);
     y += ROW_H + 4;
   }
   char ago[8];
   fmtAgo(ago, n.lastmod);
-  textf(2, y, c_dim, "HEARD");
-  textf(10 * CHAR_W, y, c_fg, "%s AGO", ago);
+  text(0, y, c_dim, "HEARD");
+  textf(7 * CHAR_W, y, c_fg, "%s AGO", ago);
   y += ROW_H;
-  textf(2, y, c_dim, "ROUTE");
-  if (n.path_len == OUT_PATH_UNKNOWN) textf(10 * CHAR_W, y, c_fg, "UNKNOWN // FLOODS");
-  else if (n.path_len == 0) textf(10 * CHAR_W, y, c_fg, "DIRECT");
-  else textf(10 * CHAR_W, y, c_fg, "%d HOPS VIA REPEATERS", n.path_len);
+  text(0, y, c_dim, "ROUTE");
+  if (n.path_len == OUT_PATH_UNKNOWN) text(7 * CHAR_W, y, c_fg, "UNKNOWN // FLOODS");
+  else if (n.path_len == 0) text(7 * CHAR_W, y, c_fg, "DIRECT");
+  else textf(7 * CHAR_W, y, c_fg, "%d HOPS VIA REPEATERS", n.path_len);
   y += ROW_H;
-  textf(2, y, c_dim, "COORDS");
-  if (n.lat || n.lon) textf(10 * CHAR_W, y, c_fg, "%.5f %.5f", n.lat / 1e6, n.lon / 1e6);
-  else text(10 * CHAR_W, y, c_fg, "NOT SHARED");
+  text(0, y, c_dim, "COORD");
+  if (n.lat || n.lon) textf(7 * CHAR_W, y, c_fg, "%.5f %.5f", n.lat / 1e6, n.lon / 1e6);
+  else text(7 * CHAR_W, y, c_fg, "NOT SHARED");
   y += ROW_H + 8;
 
-  if (n.type == ADV_TYPE_REPEATER) text(2, y, c_dim, "REPEATER. ADMIN AND LOGIN FROM THE PHONE APP.");
-  else if (n.type == ADV_TYPE_ROOM) text(2, y, c_dim, "ROOM SERVER. JOIN AND POST FROM THE PHONE APP.");
-  else if (n.type == ADV_TYPE_SENSOR) text(2, y, c_dim, "SENSOR. TELEMETRY FROM THE PHONE APP.");
+  if (n.type == ADV_TYPE_REPEATER) text(0, y, c_dim, "REPEATER: ADMIN FROM THE PHONE APP.");
+  else if (n.type == ADV_TYPE_ROOM) text(0, y, c_dim, "ROOM: JOIN AND POST FROM THE APP.");
+  else if (n.type == ADV_TYPE_SENSOR) text(0, y, c_dim, "SENSOR: TELEMETRY FROM THE APP.");
 
   drawFooter("R RESET PATH   " G_LEFT " BACK");
 }
@@ -1349,10 +1383,10 @@ void UITask::drawNode() {
 void UITask::crtPass() {
   uint16_t* buf = _display->buffer();
   if (buf == NULL) return;
-  // dim every other row to fake CRT scanlines
+  // knock a quarter off every other row: a hint of CRT scanlines that keeps text legible
   for (int y = 1; y < CYBERDECK_H; y += 2) {
     uint16_t* row = buf + y * CYBERDECK_W;
-    for (int x = 0; x < CYBERDECK_W; x++) row[x] = (row[x] >> 1) & 0x7BEF;
+    for (int x = 0; x < CYBERDECK_W; x++) row[x] -= (row[x] >> 2) & 0x39E7;
   }
 }
 

@@ -14,9 +14,23 @@ static void IRAM_ATTR onTrackDown()  { portENTER_CRITICAL_ISR(&tb_mux); tb_down+
 static void IRAM_ATTR onTrackLeft()  { portENTER_CRITICAL_ISR(&tb_mux); tb_left++;  portEXIT_CRITICAL_ISR(&tb_mux); }
 static void IRAM_ATTR onTrackRight() { portENTER_CRITICAL_ISR(&tb_mux); tb_right++; portEXIT_CRITICAL_ISR(&tb_mux); }
 
+#define TB_IDLE_RESET_MILLIS   250   // partial movement older than this is dropped
+#define TB_AXIS_LOCK_MILLIS    300   // after a vertical step, ignore sideways drift for a moment
+
 static bool probeKeyboard() {
   Wire.beginTransmission(TDECK_KB_ADDR);
-  return Wire.endTransmission() == 0;
+  if (Wire.endTransmission() == 0) return true;
+  // some keyboard firmwares only answer reads
+  return Wire.requestFrom((uint8_t)TDECK_KB_ADDR, (uint8_t)1) == 1 && Wire.read() >= 0;
+}
+
+void TDeckInput::setSensitivity(int level) {
+  if (level < 1) level = 1;
+  if (level > 5) level = 5;
+  static const int v[] = { 4, 3, 2, 1, 1 };
+  static const int h[] = { 6, 5, 4, 3, 1 };   // sideways switches tabs/leaves chats, so it takes more
+  _thresh_v = v[level - 1];
+  _thresh_h = h[level - 1];
 }
 
 void TDeckInput::begin() {
@@ -35,31 +49,47 @@ void TDeckInput::begin() {
 
 int TDeckInput::read() {
   portENTER_CRITICAL(&tb_mux);
-  _pend_up += tb_up;       tb_up = 0;
-  _pend_down += tb_down;   tb_down = 0;
-  _pend_left += tb_left;   tb_left = 0;
-  _pend_right += tb_right; tb_right = 0;
+  int up = tb_up, down = tb_down, left = tb_left, right = tb_right;
+  tb_up = tb_down = tb_left = tb_right = 0;
   portEXIT_CRITICAL(&tb_mux);
 
-  // one step per call, so a fast roll scrolls several lines rather than jumping
-  if (_pend_up > 0)    { _pend_up--;    return TKEY_UP; }
-  if (_pend_down > 0)  { _pend_down--;  return TKEY_DOWN; }
-  if (_pend_left > 0)  { _pend_left--;  return TKEY_LEFT; }
-  if (_pend_right > 0) { _pend_right--; return TKEY_RIGHT; }
+  unsigned long now = millis();
+  if (up || down || left || right) {
+    if (now - _last_pulse > TB_IDLE_RESET_MILLIS) _acc_v = _acc_h = 0;
+    _last_pulse = now;
+    _acc_v += down - up;
+    if (now - _last_v_step > TB_AXIS_LOCK_MILLIS) _acc_h += right - left;
 
-  if ((long)(millis() - _next_kb_poll) < 0) return TKEY_NONE;
+    while (_acc_v >= _thresh_v)  { _acc_v -= _thresh_v; _steps_v++; }
+    while (_acc_v <= -_thresh_v) { _acc_v += _thresh_v; _steps_v--; }
+    while (_acc_h >= _thresh_h)  { _acc_h -= _thresh_h; _steps_h++; }
+    while (_acc_h <= -_thresh_h) { _acc_h += _thresh_h; _steps_h--; }
+    if (_steps_v) { _acc_h = 0; _steps_h = 0; _last_v_step = now; }   // scrolling wins over drift
+  }
+
+  // one step per call, so a fast roll scrolls several lines rather than jumping
+  if (_steps_v > 0) { _steps_v--; return TKEY_DOWN; }
+  if (_steps_v < 0) { _steps_v++; return TKEY_UP; }
+  if (_steps_h > 0) { _steps_h--; return TKEY_RIGHT; }
+  if (_steps_h < 0) { _steps_h++; return TKEY_LEFT; }
+
+  if ((long)(now - _next_kb_poll) < 0) return TKEY_NONE;
 
   if (!_kb_present) {
-    _next_kb_poll = millis() + KB_PROBE_MILLIS;
+    _next_kb_poll = now + KB_PROBE_MILLIS;
     _kb_present = probeKeyboard();
     return TKEY_NONE;
   }
 
-  _next_kb_poll = millis() + KB_POLL_MILLIS;
+  _next_kb_poll = now + KB_POLL_MILLIS;
   if (Wire.requestFrom((uint8_t)TDECK_KB_ADDR, (uint8_t)1) != 1) {
-    _kb_present = false;
+    if (++_kb_errors >= 5) {   // a glitch now and then is normal on a shared bus
+      _kb_present = false;
+      _kb_errors = 0;
+    }
     return TKEY_NONE;
   }
+  _kb_errors = 0;
   int c = Wire.read();
   return (c > 0) ? c : TKEY_NONE;
 }

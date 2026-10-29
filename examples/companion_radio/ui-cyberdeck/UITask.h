@@ -23,7 +23,7 @@
   #define CD_PENDING_SENDS     8    // direct messages awaiting an ACK
 #endif
 #define CD_INPUT_MAX          MAX_TEXT_LEN
-#define CD_CONSOLE_LINES      9
+#define CD_CONSOLE_LINES      5
 
 class UITask : public AbstractUITask {
 public:
@@ -71,6 +71,7 @@ private:
     uint8_t theme;
     uint8_t crt;
     uint8_t dim_secs;      // 0 = never
+    uint8_t ball;          // trackball sensitivity 1-5
   };
 
   CyberDeckDisplay* _display;
@@ -158,8 +159,9 @@ private:
   void drawChat();
   void drawNode();
   void drawInput(int y, const char* prompt, const char* buf, int len);
-  void text(int x, int y, uint16_t col, const char* s);
+  void text(int x, int y, uint16_t col, const char* s);      // 8x16
   void textf(int x, int y, uint16_t col, const char* fmt, ...);
+  void stext(int x, int y, uint16_t col, const char* s);     // 6x8
   void crtPass();
   void glitchPass();
 
