@@ -88,7 +88,7 @@ def ls(link, path):
     h = link.header(("#LS", "#ERR"))
     if h.startswith("#ERR"):
         raise IOError(h)
-    dirs, files = [], {}
+    dirs, files = [], []
     while True:
         ln = link.line()
         if ln.startswith("#END"):
@@ -96,8 +96,7 @@ def ls(link, path):
         if ln.startswith("D "):
             dirs.append(ln[2:])
         elif ln.startswith("F "):
-            name, size = ln[2:].rsplit(" ", 1)
-            files[name] = int(size)
+            files.append(ln[2:])
 
 
 def fetch_dir(link, path, dest):
@@ -133,28 +132,30 @@ def pull(s, remote, local):
     s.reset_input_buffer()
     start, total_files, total_bytes, total_bad, skipped = time.time(), 0, 0, 0, 0
 
-    # walk the tree first, so we know how much there is
-    todo, stack = [], [remote]
+    # walk the folders first (cheap), so we know how much there is
+    todo, stack, want = [], [remote], 0
     while stack:
         path = stack.pop()
         dirs, files = ls(link, path)
         if files:
-            todo.append((path, files))
+            todo.append((path, len(files)))
+            want += len(files)
         stack.extend(sorted((path.rstrip("/") + "/" + d for d in dirs), reverse=True))
-    want = sum(len(f) for _, f in todo)
     print(f"{len(todo)} folders, {want} files on the card", flush=True)
 
-    for i, (path, files) in enumerate(todo, 1):
+    folders_done = 0
+    for i, (path, count) in enumerate(todo, 1):
         dest = os.path.join(local, *path[len(remote):].strip("/").split("/"))
-        have = all(os.path.exists(os.path.join(dest, n)) and os.path.getsize(os.path.join(dest, n)) == sz
-                   for n, sz in files.items())
-        if have:
-            skipped += len(files)
+        marker = os.path.join(dest, ".complete")
+        if os.path.exists(marker):   # finished on an earlier run
+            skipped += count
             continue
         for attempt in range(3):
             try:
                 n, nb, bad = fetch_dir(link, path, dest)
-                break
+                if bad == 0:
+                    break
+                print(f"  {bad} bad checksums in {path}, fetching it again", flush=True)
             except TimeoutError:
                 print(f"  timeout on {path}, retrying", flush=True)
                 time.sleep(2)
@@ -162,15 +163,16 @@ def pull(s, remote, local):
                 link.buf = b""
         else:
             raise SystemExit(f"gave up on {path}")
+        open(marker, "w").close()
         total_files += n
         total_bytes += nb
         total_bad += bad
+        folders_done += 1
         el = time.time() - start
         done = total_files + skipped
         rate = total_bytes / el / 1024 if el else 0
         eta = (want - done) / (total_files / el) / 60 if total_files and el else 0
-        print(f"[{i}/{len(todo)}] {path}: {n} files{' ' + str(bad) + ' BAD' if bad else ''}  "
-              f"total {done}/{want}  {rate:.0f}KB/s  ~{eta:.0f} min left", flush=True)
+        print(f"[{i}/{len(todo)}] {path}: {n} files  total {done}/{want}  {rate:.0f}KB/s  ~{eta:.0f} min left", flush=True)
 
     print(f"done: copied {total_files} files ({total_bytes / 1048576:.1f}MB), already had {skipped}, "
           f"{total_bad} failed checksum, {(time.time() - start) / 60:.1f} min", flush=True)

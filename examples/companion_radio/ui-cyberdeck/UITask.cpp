@@ -1,6 +1,7 @@
 #include "UITask.h"
 #include <SPIFFS.h>
 #include <SD.h>
+#include <dirent.h>
 #include <stdarg.h>
 #include <esp_system.h>
 #include <helpers/TxtDataHelpers.h>
@@ -388,21 +389,20 @@ static void bridgeWrite(const uint8_t* p, size_t n) {
   }
 }
 
-// "#LS path" then "D name" / "F name size" lines, then "#END count"
+// "#LS path" then "D name" / "F name" lines, then "#END count". Reads the directory
+// entries directly: File::openNextFile() opens every file, ~25ms each on a big folder.
 static void sdList(const String& path) {
-  File dir = SD.open(path);
-  if (!dir || !dir.isDirectory()) { Serial.printf("\n#ERR %s\n", path.c_str()); return; }
+  String vfs = String("/sd") + path;   // where the SD library mounts the card
+  DIR* dir = opendir(vfs.c_str());
+  if (dir == NULL) { Serial.printf("\n#ERR %s\n", path.c_str()); return; }
   Serial.printf("\n#LS %s\n", path.c_str());
   int n = 0;
-  for (File f = dir.openNextFile(); f; f = dir.openNextFile()) {
-    const char* base = strrchr(f.name(), '/') ? strrchr(f.name(), '/') + 1 : f.name();
-    if (f.isDirectory()) Serial.printf("D %s\n", base);
-    else Serial.printf("F %s %u\n", base, (unsigned)f.size());
-    f.close();
-    n++;
-    if ((n & 63) == 0) yield();
+  for (struct dirent* e = readdir(dir); e; e = readdir(dir)) {
+    if (e->d_name[0] == '.') continue;
+    Serial.printf("%c %s\n", e->d_type == DT_DIR ? 'D' : 'F', e->d_name);
+    if ((++n & 63) == 0) yield();
   }
-  dir.close();
+  closedir(dir);
   Serial.printf("#END %d\n", n);
 }
 
