@@ -133,6 +133,9 @@ void halt() {
 #endif
 
 void setup() {
+#if defined(CD_SERIAL_BRIDGE) && ARDUINO_USB_MODE
+  Serial.setTxBufferSize(16384);   // the cyberdeck bridge streams screenshots and SD files
+#endif
   Serial.begin(115200);
   board.begin();
 

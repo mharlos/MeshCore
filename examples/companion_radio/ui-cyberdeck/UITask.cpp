@@ -304,7 +304,7 @@ bool UITask::sdBegin() {
   pinMode(P_LORA_NSS, OUTPUT);
   digitalWrite(P_LORA_NSS, HIGH);
   sd_spi.begin(P_LORA_SCLK, P_LORA_MISO, P_LORA_MOSI);
-  _sd_ok = SD.begin(PIN_SD_CS, sd_spi, 20000000) && SD.cardType() != CARD_NONE;
+  _sd_ok = SD.begin(PIN_SD_CS, sd_spi, 20000000) && SD.cardType() != CARD_NONE;   // 40MHz is no faster over USB
   return _sd_ok;
 }
 
@@ -353,6 +353,85 @@ static void sdWalk(const char* path, int depth, int& lines) {
     if (dirs > 3) { Serial.printf("%*s... %d more dirs ...\n", (depth + 1) * 2, "", dirs - 3); lines++; }
     sdWalk(last_sub, depth + 1, lines);
   }
+}
+
+// zlib-compatible CRC32, so the PC can check each file with zlib.crc32()
+static uint32_t crc32Update(uint32_t crc, const uint8_t* p, size_t n) {
+  static uint32_t table[256];
+  static bool ready = false;
+  if (!ready) {
+    for (uint32_t i = 0; i < 256; i++) {
+      uint32_t c = i;
+      for (int k = 0; k < 8; k++) c = (c & 1) ? 0xEDB88320 ^ (c >> 1) : c >> 1;
+      table[i] = c;
+    }
+    ready = true;
+  }
+  crc = ~crc;
+  while (n--) crc = table[(crc ^ *p++) & 0xFF] ^ (crc >> 8);
+  return ~crc;
+}
+
+static String bridgeLine() {
+  Serial.setTimeout(2000);
+  String s = Serial.readStringUntil('\n');
+  s.trim();
+  return s;
+}
+
+static void bridgeWrite(const uint8_t* p, size_t n) {
+  while (n > 0) {
+    size_t w = Serial.write(p, n);
+    p += w;
+    n -= w;
+    if (w == 0) delay(1);
+  }
+}
+
+// "#LS path" then "D name" / "F name size" lines, then "#END count"
+static void sdList(const String& path) {
+  File dir = SD.open(path);
+  if (!dir || !dir.isDirectory()) { Serial.printf("\n#ERR %s\n", path.c_str()); return; }
+  Serial.printf("\n#LS %s\n", path.c_str());
+  int n = 0;
+  for (File f = dir.openNextFile(); f; f = dir.openNextFile()) {
+    const char* base = strrchr(f.name(), '/') ? strrchr(f.name(), '/') + 1 : f.name();
+    if (f.isDirectory()) Serial.printf("D %s\n", base);
+    else Serial.printf("F %s %u\n", base, (unsigned)f.size());
+    f.close();
+    n++;
+    if ((n & 63) == 0) yield();
+  }
+  dir.close();
+  Serial.printf("#END %d\n", n);
+}
+
+// every file directly in a folder: "#F name size\n" + bytes + "\n#C crc32hex\n" ... "#END count"
+static void sdSendDir(const String& path) {
+  File dir = SD.open(path);
+  if (!dir || !dir.isDirectory()) { Serial.printf("\n#ERR %s\n", path.c_str()); return; }
+  static uint8_t buf[4096];
+  Serial.printf("\n#DIR %s\n", path.c_str());
+  int n = 0;
+  for (File f = dir.openNextFile(); f; f = dir.openNextFile()) {
+    if (f.isDirectory()) { f.close(); continue; }
+    const char* base = strrchr(f.name(), '/') ? strrchr(f.name(), '/') + 1 : f.name();
+    uint32_t size = f.size(), left = size, crc = 0;
+    Serial.printf("#F %s %u\n", base, (unsigned)size);
+    while (left > 0) {
+      int got = f.read(buf, left < sizeof(buf) ? left : sizeof(buf));
+      if (got <= 0) { memset(buf, 0, sizeof(buf)); got = left < sizeof(buf) ? left : sizeof(buf); }   // keep the framing; the CRC will flag it
+      crc = crc32Update(crc, buf, got);
+      bridgeWrite(buf, got);
+      left -= got;
+    }
+    f.close();
+    Serial.printf("\n#C %08x\n", (unsigned)crc);
+    n++;
+    yield();
+  }
+  dir.close();
+  Serial.printf("#END %d\n", n);
 }
 #endif
 
@@ -2039,6 +2118,14 @@ void UITask::serialBridge() {
         _cmd_buf[0] = 0;
         _dirty = true;
         break;
+      case 0x14:     // list one folder: 0x14 <path>\n
+      case 0x13: {   // send every file in one folder: 0x13 <path>\n
+        String path = bridgeLine();
+        if (!_sd_ok) sdBegin();
+        if (!_sd_ok) { Serial.println("\n#ERR no card"); break; }
+        if (c == 0x14) sdList(path); else sdSendDir(path);
+        break;
+      }
       case 0x12: {   // walk the SD card
         if (!_sd_ok) sdBegin();
         if (!_sd_ok) { Serial.println("\n#SD none"); break; }
