@@ -47,6 +47,14 @@ void TDeckInput::begin() {
   _next_kb_poll = millis();
 }
 
+void TDeckInput::setBacklight(uint8_t level) {
+  if (!_kb_present) return;
+  Wire.beginTransmission(TDECK_KB_ADDR);
+  Wire.write(0x01);   // LILYGO_KB_BRIGHTNESS_CMD
+  Wire.write(level);
+  Wire.endTransmission();
+}
+
 int TDeckInput::read() {
   portENTER_CRITICAL(&tb_mux);
   int up = tb_up, down = tb_down, left = tb_left, right = tb_right;

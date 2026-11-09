@@ -1,8 +1,10 @@
 #include "UITask.h"
 #include <SPIFFS.h>
 #include <stdarg.h>
+#include <esp_system.h>
 #include <helpers/TxtDataHelpers.h>
 #include <helpers/AdvertDataHelpers.h>
+#include <Utils.h>
 #include <target.h>
 #include "font_spleen8x16.h"
 
@@ -10,11 +12,20 @@
   #define CD_DEFAULT_DIM_SECS  90
 #endif
 #define CD_PREFS_FILE   "/cdeck"
-#define CD_PREFS_MAGIC  0xCE
+#define CD_PREFS_MAGIC  0xD2          // bump when Prefs changes shape
+#define CD_HIST_FILE    "/cdhist"
+#define CD_HIST_MAGIC   0x43444832    // "CDH2"
+
+#ifdef RTC_TIME_MIN
+  #define CLOCK_FLOOR   RTC_TIME_MIN  // what the clock reads after a cold boot
+#else
+  #define CLOCK_FLOOR   1772323200UL
+#endif
 
 // Two fonts: Spleen 8x16 for everything you read, the built-in 6x8 for the status
 // bar and key hints.
 #define SCR_W       CYBERDECK_W
+#define SCR_H       CYBERDECK_H
 #define CHAR_W      8
 #define ROW_H       16
 #define COLS        (SCR_W / CHAR_W)    // 40
@@ -30,9 +41,23 @@
 
 #define SEND_ATTEMPTS  3
 
+#define BEEP_DM      1
+#define BEEP_CHAN    2
+#define BEEP_KEYS    4
+
+#define BOOT_MILLIS        5200
+#define PAGE_TONE_EVERY    2500
+#define PAGE_TONE_FOR      (10 * 60 * 1000UL)   // stop the alarm (not the screen) after this
+#define MULE_MAX_AGE       (2 * 3600 * 1000UL)
+#define MULE_MAX_SENDS     2
+#define MULE_PER_FLUSH     12
+#define MULE_NEIGH_STALE   (30 * 60 * 1000UL)
+#define MULE_FLUSH_GAP     (60 * 1000UL)
+#define CLOCK_AGREE_SECS   600
+
 #define RGB(r, g, b)  (uint16_t)((((r) & 0xF8) << 8) | (((g) & 0xFC) << 3) | ((b) >> 3))
 
-// CP437 glyphs from the built-in font
+// CP437 glyphs
 #define G_LIGHT   "\xB0"
 #define G_MED     "\xB1"
 #define G_DARK    "\xB2"
@@ -56,12 +81,23 @@ static const Theme THEMES[] = {
 };
 #define NUM_THEMES  (sizeof(THEMES) / sizeof(THEMES[0]))
 
-static const char* TAB_NAMES[] = { "CHAN", "NODES", "HEARD", "SYS" };
+struct RadioPreset { const char* name; float freq, bw; uint8_t sf, cr; };
+// from docs/radio_presets.md, docs/faq.md and docs/cli_commands.md
+static const RadioPreset PRESETS[] = {
+  { "usa",       910.525f, 62.5f, 7, 5 },
+  { "eu-narrow", 869.618f, 62.5f, 8, 5 },
+  { "au-narrow", 916.575f, 62.5f, 7, 7 },
+  { "nz-narrow", 917.375f, 62.5f, 7, 5 },
+  { "pt-868",    869.618f, 62.5f, 7, 6 },
+};
+#define NUM_PRESETS  (sizeof(PRESETS) / sizeof(PRESETS[0]))
+
+static const char* TAB_NAMES[] = { "CHAN", "NODES", "HEARD", "RF", "SYS" };
 
 static AdvertPath heard[16];
 static int num_heard = 0;
 
-// copy text for the built-in font: ASCII as-is, each UTF-8 sequence as one small block
+// copy text for the CP437 fonts: ASCII as-is, each UTF-8 sequence as one small block
 static void sanitize(char* dest, size_t dest_size, const char* src) {
   size_t j = 0;
   for (size_t i = 0; src[i] && j < dest_size - 1; i++) {
@@ -88,6 +124,62 @@ static const char* typeTag(uint8_t type) {
   }
 }
 
+static const char* payloadName(uint8_t t) {
+  static const char* names[] = { "REQ", "RESP", "TXT", "ACK", "ADVERT", "GRPTXT", "GRPDAT", "ANON",
+                                 "PATH", "TRACE", "MULTI", "CTRL", "T0C", "T0D", "T0E", "RAW" };
+  return names[t & 0x0F];
+}
+
+// "#name" for channels; hashtag channels already carry their '#'
+static void chanLabel(char* dest, size_t sz, const char* name) {
+  char clean[32];
+  sanitize(clean, sizeof(clean), name);
+  snprintf(dest, sz, clean[0] == '#' ? "%s" : "#%s", clean);
+}
+
+static bool strieq(const char* a, const char* b) {
+  while (*a && *b) { if (tolower(*a++) != tolower(*b++)) return false; }
+  return *a == *b;
+}
+
+static bool stristr(const char* hay, const char* needle) {
+  size_t n = strlen(needle);
+  if (n == 0) return false;
+  for (; *hay; hay++) {
+    size_t i = 0;
+    while (i < n && hay[i] && tolower(hay[i]) == tolower(needle[i])) i++;
+    if (i == n) return true;
+  }
+  return false;
+}
+
+static void toHex(char* dest, const uint8_t* src, int len) {
+  for (int i = 0; i < len; i++) sprintf(&dest[i * 2], "%02x", src[i]);
+}
+
+// days since 1970-01-01 <-> civil date (Howard Hinnant's algorithms)
+static int32_t daysFromCivil(int y, unsigned m, unsigned d) {
+  y -= m <= 2;
+  int era = (y >= 0 ? y : y - 399) / 400;
+  unsigned yoe = (unsigned)(y - era * 400);
+  unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+  unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  return era * 146097 + (int32_t)doe - 719468;
+}
+
+static void civilFromDays(int32_t z, int& y, unsigned& m, unsigned& d) {
+  z += 719468;
+  int era = (z >= 0 ? z : z - 146096) / 146097;
+  unsigned doe = (unsigned)(z - era * 146097);
+  unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+  y = (int)yoe + era * 400;
+  unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+  unsigned mp = (5 * doy + 2) / 153;
+  d = doy - (153 * mp + 2) / 5 + 1;
+  m = mp < 10 ? mp + 3 : mp - 9;
+  y += (m <= 2);
+}
+
 UITask::UITask(mesh::MainBoard* board, MultiSerialInterface* serial) : AbstractUITask(board, serial) {
   _display = NULL;
   _sensors = NULL;
@@ -95,21 +187,44 @@ UITask::UITask(mesh::MainBoard* board, MultiSerialInterface* serial) : AbstractU
   _msgs = NULL;
   _max_msgs = 0;
   _nodes = NULL;
+  _rf = NULL;
+  _mule = NULL;
   _num_nodes = _num_chans = 0;
   _next_seq = 1;
+  _hist_ok = false;
   memset(_pending, 0, sizeof(_pending));
   memset(_sel, 0, sizeof(_sel));
-  _screen = SCR_BOOT;
+  memset(_neigh, 0, sizeof(_neigh));
+  memset(_logged_in, 0, sizeof(_logged_in));
+  memset(_login_pending, 0, sizeof(_login_pending));
+  memset(&_status, 0, sizeof(_status));
+  _num_logged_in = 0;
+  _login_timeout = _status_timeout = 0;
+  _rf_head = _rf_count = 0;
+  _rf_total = 0;
+  _mule_last_flush = 0;
+  _mule_relayed = 0;
+  _screen = _page_return = SCR_BOOT;
   _tab = TAB_CHAN;
   _scroll = 0;
   _conv_kind = CONV_NONE;
-  _input_len = _cmd_len = _console_len = 0;
-  _input_buf[0] = _cmd_buf[0] = 0;
+  _conv_chan = 0;
+  memset(_conv_peer, 0, sizeof(_conv_peer));
+  _conv_name[0] = 0;
+  _node_mode = NM_VIEW;
+  _input_len = _cmd_len = _console_len = _console_scroll = 0;
+  _input_buf[0] = _cmd_buf[0] = _last_cmd[0] = 0;
   _alert[0] = 0;
   _msgcount = 0;
   _dirty = true;
   _cursor_on = true;
   _nodes_dirty = true;
+  _clock_src = CLK_NONE;
+  _clk_cand_ts = _clk_cand_ms = _clk_last_rtc = _clk_last_ms = 0;
+  memset(_clk_cand_from, 0, sizeof(_clk_cand_from));
+  _page_seq = 0;
+  _page_next_tone = _page_started = 0;
+  _kbl_flash = false;
   _boot_started = _next_render = _next_blink = _auto_off = _glitch_until = _alert_until = _last_render = _nodes_refresh_at = 0;
 }
 
@@ -126,30 +241,48 @@ void UITask::begin(DisplayDriver* display, SensorManager* sensors, NodePrefs* no
     if (_msgs == NULL) _max_msgs = 0;
   }
   _nodes = (Node*) ps_calloc(MAX_CONTACTS, sizeof(Node));
+  _rf = (RfEntry*) ps_calloc(CD_RF_LOG, sizeof(RfEntry));
+  _mule = (MuleEntry*) ps_calloc(CD_MULE_SLOTS, sizeof(MuleEntry));
 
   user_btn.begin();
   _input.begin();
   loadPrefs();
   _input.setSensitivity(_prefs.ball);
+  _audio.begin();
+  _audio.setVolume(_prefs.volume);
+  if (_prefs.kbl) _input.setBacklight(_prefs.kbl);
   applyTheme();
+  if (_prefs.history) loadHistory();
   refreshChannels();
   refreshNodes();
+
+  // a warm reboot restores the time from RTC memory; a cold boot starts at the floor
+  _clk_last_rtc = rtc_clock.getCurrentTime();
+  _clk_last_ms = millis();
+  if (_clk_last_rtc > CLOCK_FLOOR + 86400) _clock_src = CLK_SET;
 
   _boot_started = millis();
   _auto_off = millis() + _prefs.dim_secs * 1000UL;
   _screen = SCR_BOOT;
   _dirty = true;
   if (_display) _display->turnOn();
+  beep(Tones::BOOT);
 }
 
 /* ---------------------------------------- prefs ---------------------------------------- */
 
 void UITask::loadPrefs() {
+  memset(&_prefs, 0, sizeof(_prefs));
   _prefs.magic = CD_PREFS_MAGIC;
   _prefs.theme = 0;
   _prefs.crt = 0;
   _prefs.dim_secs = CD_DEFAULT_DIM_SECS;
   _prefs.ball = 3;
+  _prefs.beep = BEEP_DM | BEEP_CHAN;
+  _prefs.volume = 6;
+  _prefs.kbl = 0;
+  _prefs.mule = 0;
+  _prefs.history = 1;
 
   File f = SPIFFS.open(CD_PREFS_FILE, "r");
   if (f) {
@@ -158,6 +291,8 @@ void UITask::loadPrefs() {
       _prefs = p;
       if (_prefs.theme >= NUM_THEMES) _prefs.theme = 0;
       if (_prefs.ball < 1 || _prefs.ball > 5) _prefs.ball = 3;
+      if (_prefs.volume > 10) _prefs.volume = 6;
+      for (int i = 0; i < CD_KEYWORDS; i++) _prefs.keywords[i][sizeof(_prefs.keywords[i]) - 1] = 0;
     }
     f.close();
   }
@@ -179,6 +314,71 @@ void UITask::applyTheme() {
   c_alert = t.alert;
   c_bg = 0;
   _dirty = true;
+}
+
+void UITask::beep(const Tone* t) {
+  _audio.play(t);
+}
+
+/* --------------------------------------- history --------------------------------------- */
+// A fixed-size file of message slots: slot (seq % max) holds message seq, just like RAM.
+
+struct HistHeader { uint32_t magic; uint16_t msg_size; uint16_t slots; };
+
+void UITask::loadHistory() {
+  _hist_ok = false;
+  if (_max_msgs == 0) return;
+  HistHeader want = { CD_HIST_MAGIC, (uint16_t)sizeof(Msg), (uint16_t)_max_msgs };
+
+  File f = SPIFFS.open(CD_HIST_FILE, "r");
+  if (f) {
+    HistHeader h;
+    bool ok = f.read((uint8_t*)&h, sizeof(h)) == sizeof(h) && memcmp(&h, &want, sizeof(h)) == 0;
+    if (ok) {
+      uint32_t max_seq = 0;
+      for (int i = 0; i < _max_msgs; i++) {
+        Msg m;
+        if (f.read((uint8_t*)&m, sizeof(m)) != sizeof(m)) break;
+        if (m.seq == 0 || m.kind < CONV_CHANNEL || m.kind > CONV_DM || (int)(m.seq % _max_msgs) != i) continue;
+        m.from[sizeof(m.from) - 1] = 0;
+        m.text[sizeof(m.text) - 1] = 0;
+        if (m.status == ST_SENDING) m.status = ST_FAILED;   // the retries died with the reboot
+        _msgs[i] = m;
+        if (m.seq > max_seq) max_seq = m.seq;
+      }
+      _next_seq = max_seq + 1;
+      f.close();
+      _hist_ok = true;
+      return;
+    }
+    f.close();
+  }
+  wipeHistory();
+}
+
+void UITask::wipeHistory() {
+  HistHeader h = { CD_HIST_MAGIC, (uint16_t)sizeof(Msg), (uint16_t)_max_msgs };
+  File f = SPIFFS.open(CD_HIST_FILE, "w");
+  if (!f) { _hist_ok = false; return; }
+  f.write((const uint8_t*)&h, sizeof(h));
+  static uint8_t zeros[512];
+  size_t left = (size_t)_max_msgs * sizeof(Msg);
+  while (left > 0) {
+    size_t n = left < sizeof(zeros) ? left : sizeof(zeros);
+    f.write(zeros, n);
+    left -= n;
+  }
+  f.close();
+  _hist_ok = true;
+}
+
+void UITask::saveMsg(const Msg* m) {
+  if (!_prefs.history || !_hist_ok || m == NULL || _max_msgs == 0) return;
+  File f = SPIFFS.open(CD_HIST_FILE, "r+");
+  if (!f) return;
+  f.seek(sizeof(HistHeader) + (size_t)(m - _msgs) * sizeof(Msg));
+  f.write((const uint8_t*)m, sizeof(Msg));
+  f.close();
 }
 
 /* ------------------------------------- mesh state -------------------------------------- */
@@ -215,6 +415,13 @@ void UITask::refreshNodes() {
     return (la < lb) ? 1 : (la > lb) ? -1 : 0;
   });
   if (_sel[TAB_NODES] >= _num_nodes) _sel[TAB_NODES] = _num_nodes > 0 ? _num_nodes - 1 : 0;
+}
+
+const UITask::Node* UITask::findNode(const uint8_t* pub) const {
+  for (int i = 0; i < _num_nodes; i++) {
+    if (memcmp(_nodes[i].pub, pub, 6) == 0) return &_nodes[i];
+  }
+  return NULL;
 }
 
 bool UITask::msgInConv(const Msg& m, ConvKind kind, uint8_t chan, const uint8_t* peer) const {
@@ -269,12 +476,77 @@ int UITask::totalUnread() const {
 }
 
 void UITask::markRead(ConvKind kind, uint8_t chan, const uint8_t* peer) {
+  File f;
   for (int i = 0; i < _max_msgs; i++) {
-    if (msgInConv(_msgs[i], kind, chan, peer)) _msgs[i].unread = 0;
+    if (_msgs[i].unread && msgInConv(_msgs[i], kind, chan, peer)) {
+      _msgs[i].unread = 0;
+      if (_prefs.history && _hist_ok) {
+        if (!f) f = SPIFFS.open(CD_HIST_FILE, "r+");
+        if (f) {
+          f.seek(sizeof(HistHeader) + (size_t)i * sizeof(Msg));
+          f.write((const uint8_t*)&_msgs[i], sizeof(Msg));
+        }
+      }
+    }
   }
+  if (f) f.close();
 }
 
 /* --------------------------------------- sending --------------------------------------- */
+
+bool UITask::sendText(const char* text, uint8_t flags) {
+  int len = strlen(text);
+  if (len == 0) return false;
+
+  if (_conv_kind == CONV_CHANNEL) {
+    ChannelDetails cd;
+    if (!the_mesh.getChannel(_conv_chan, cd) || !cd.name[0]) {
+      showAlert("CHANNEL GONE", 2000);
+      return false;
+    }
+    uint32_t ts = the_mesh.getRTCClock()->getCurrentTimeUnique();
+    Msg* m = addMsg(CONV_CHANNEL, _conv_chan, NULL, _node_prefs->node_name, text, true);
+    bool ok = the_mesh.sendGroupMessage(ts, cd.channel, _node_prefs->node_name, text, len);
+    if (m) {
+      m->status = ok ? ST_SENT : ST_FAILED;
+      m->flags = flags;
+      saveMsg(m);
+    }
+    if (!ok) showAlert("TX FAILED: QUEUE FULL", 2500);
+    _dirty = true;
+    return ok;
+  }
+  if (_conv_kind == CONV_DM) {
+    Msg* m = addMsg(CONV_DM, 0, _conv_peer, _node_prefs->node_name, text, true);
+    if (m == NULL) return false;
+    m->flags = flags;
+
+    int slot = -1;
+    for (int i = 0; i < CD_PENDING_SENDS; i++) {
+      if (_pending[i].seq == 0) { slot = i; break; }
+    }
+    bool ok = false;
+    if (slot < 0) {
+      m->status = ST_FAILED;
+      showAlert("TOO MANY UNACKED MSGS", 2500);
+    } else {
+      _pending[slot].seq = m->seq;
+      _pending[slot].msg_ts = the_mesh.getRTCClock()->getCurrentTimeUnique();
+      _pending[slot].first_sent = millis();
+      m->status = ST_SENDING;
+      ok = sendDirect(slot, 0);
+      if (!ok) {
+        m->status = ST_FAILED;
+        _pending[slot].seq = 0;
+        showAlert("TX FAILED", 2500);
+      }
+    }
+    saveMsg(m);
+    _dirty = true;
+    return ok;
+  }
+  return false;
+}
 
 void UITask::sendInput() {
   if (_input_len == 0) return;
@@ -282,47 +554,12 @@ void UITask::sendInput() {
 
   if (_input_buf[0] == '/') {   // commands work from any chat too
     _console_len = 0;
+    _console_scroll = 0;
     runCommand(&_input_buf[1]);
-    showAlert(_console_len > 0 ? _console[0] : "OK", 2500);
-    _input_len = 0;
-    _input_buf[0] = 0;
-    return;
+    if (_screen == SCR_CHAT) showAlert(_console_len > 0 ? _console[0] : "OK", 3000);
+  } else {
+    sendText(_input_buf);
   }
-
-  if (_conv_kind == CONV_CHANNEL) {
-    ChannelDetails cd;
-    if (!the_mesh.getChannel(_conv_chan, cd) || !cd.name[0]) {
-      showAlert("CHANNEL GONE", 2000);
-      return;
-    }
-    uint32_t ts = the_mesh.getRTCClock()->getCurrentTimeUnique();
-    Msg* m = addMsg(CONV_CHANNEL, _conv_chan, NULL, _node_prefs->node_name, _input_buf, true);
-    bool ok = the_mesh.sendGroupMessage(ts, cd.channel, _node_prefs->node_name, _input_buf, _input_len);
-    if (m) m->status = ok ? ST_SENT : ST_FAILED;
-    if (!ok) showAlert("TX FAILED: QUEUE FULL", 2500);
-  } else if (_conv_kind == CONV_DM) {
-    Msg* m = addMsg(CONV_DM, 0, _conv_peer, _node_prefs->node_name, _input_buf, true);
-    if (m == NULL) return;
-
-    int slot = -1;
-    for (int i = 0; i < CD_PENDING_SENDS; i++) {
-      if (_pending[i].seq == 0) { slot = i; break; }
-    }
-    if (slot < 0) {
-      m->status = ST_FAILED;
-      showAlert("TOO MANY UNACKED MSGS", 2500);
-    } else {
-      _pending[slot].seq = m->seq;
-      _pending[slot].msg_ts = the_mesh.getRTCClock()->getCurrentTimeUnique();
-      m->status = ST_SENDING;
-      if (!sendDirect(slot, 0)) {
-        m->status = ST_FAILED;
-        _pending[slot].seq = 0;
-        showAlert("TX FAILED", 2500);
-      }
-    }
-  }
-
   _input_len = 0;
   _input_buf[0] = 0;
   _scroll = 0;
@@ -362,7 +599,18 @@ void UITask::checkPending() {
 
     m->status = ST_FAILED;
     p.seq = 0;
+    saveMsg(m);
+    beep(Tones::FAILED);
     _dirty = true;
+  }
+
+  if (_login_pending[0] && (long)(millis() - _login_timeout) >= 0) {
+    memset(_login_pending, 0, sizeof(_login_pending));
+    showAlert("LOGIN TIMED OUT", 2500);
+  }
+  if (_status_timeout && (long)(millis() - _status_timeout) >= 0) {
+    _status_timeout = 0;
+    if (!_status.valid) showAlert("NO STATUS REPLY", 2500);
   }
 }
 
@@ -370,8 +618,14 @@ void UITask::onACKRecv(uint32_t ack_crc) {
   for (int i = 0; i < CD_PENDING_SENDS; i++) {
     if (_pending[i].seq && _pending[i].ack == ack_crc) {
       Msg* m = findMsg(_pending[i].seq);
-      if (m) m->status = ST_DELIVERED;
+      if (m) {
+        m->status = ST_DELIVERED;
+        unsigned long rtt = (millis() - _pending[i].first_sent) / 100;
+        m->rtt_ds = rtt > 65535 ? 65535 : rtt;
+        saveMsg(m);
+      }
       _pending[i].seq = 0;
+      if (_prefs.beep & BEEP_DM) beep(Tones::DELIVERED);
       _dirty = true;
     }
   }
@@ -379,25 +633,73 @@ void UITask::onACKRecv(uint32_t ack_crc) {
 
 /* --------------------------------------- receiving ------------------------------------- */
 
+bool UITask::matchesKeyword(const char* text) const {
+  for (int i = 0; i < CD_KEYWORDS; i++) {
+    if (_prefs.keywords[i][0] && stristr(text, _prefs.keywords[i])) return true;
+  }
+  char at[34];
+  snprintf(at, sizeof(at), "@%s", _node_prefs->node_name);   // a mention always counts
+  return stristr(text, at);
+}
+
 void UITask::onMessageRecv(mesh::Packet *pkt, const ContactInfo &from, uint8_t txt_type, uint32_t sender_timestamp, const char* text) {
   if (!(txt_type == TXT_TYPE_PLAIN || txt_type == TXT_TYPE_SIGNED_PLAIN)) return;   // not CLI traffic
 
-  Msg* m = addMsg(CONV_DM, 0, from.id.pub_key, from.name, text, false);
+  // a room post is signed by its author; say who, not just which room
+  char author[32];
+  bool room = txt_type == TXT_TYPE_SIGNED_PLAIN;
+  if (room) {
+    const uint8_t* pfx = the_mesh.uiLastSignedPrefix();
+    ContactInfo* a = the_mesh.lookupContactByPubKey(pfx, 4);
+    if (a) sanitize(author, sizeof(author), a->name);
+    else snprintf(author, sizeof(author), "%02X%02X%02X%02X", pfx[0], pfx[1], pfx[2], pfx[3]);
+  } else {
+    syncClockFrom(sender_timestamp, from.id.pub_key);
+  }
+
+  Msg* m = addMsg(CONV_DM, 0, from.id.pub_key, room ? author : from.name, text, false);
   if (m == NULL) return;
   m->hops = pkt->isRouteFlood() ? pkt->path_len : 0xFF;
   m->snr4 = (int8_t)(pkt->getSNR() * 4);
+  if (room) m->flags |= MF_ROOM;
+
+  char name[32];
+  sanitize(name, sizeof(name), from.name);
+  bool is_page = !room && strncmp(text, CD_PAGE_PREFIX, strlen(CD_PAGE_PREFIX)) == 0 && strncmp(text, CD_PAGE_ACK, strlen(CD_PAGE_ACK)) != 0;
+  bool is_page_ack = !room && strncmp(text, CD_PAGE_ACK, strlen(CD_PAGE_ACK)) == 0;
 
   bool viewing = _screen == SCR_CHAT && _conv_kind == CONV_DM && memcmp(_conv_peer, from.id.pub_key, sizeof(_conv_peer)) == 0
                  && _display && _display->isOn();
   m->unread = !viewing;
-  if (!viewing) {
-    char name[32];
-    sanitize(name, sizeof(name), from.name);
+
+  if (is_page) {
+    m->flags |= MF_PAGE;
+    saveMsg(m);
+    startPage(m);
+    return;
+  }
+  if (is_page_ack) {
+    // mark our most recent page to them as acknowledged
+    for (uint32_t s = _next_seq - 1; s > 0 && s + _max_msgs >= _next_seq; s--) {
+      Msg* p = findMsg(s);
+      if (p && p->outgoing && (p->flags & MF_PAGE) && p->kind == CONV_DM && memcmp(p->peer, from.id.pub_key, 6) == 0) {
+        p->flags |= MF_ACKED;
+        saveMsg(p);
+        break;
+      }
+    }
     char alert[54];
-    snprintf(alert, sizeof(alert), "INCOMING // %s", name);
+    snprintf(alert, sizeof(alert), "PAGE ACK // %s", name);
+    showAlert(alert, 6000);
+    beep(Tones::DELIVERED);
+  } else if (!viewing) {
+    char alert[54];
+    snprintf(alert, sizeof(alert), room ? "ROOM // %s // %s" : "INCOMING // %s", name, author);
     showAlert(alert, 4000);
     _glitch_until = millis() + 350;
   }
+  if (!is_page_ack && (_prefs.beep & BEEP_DM)) beep(Tones::DM);
+  saveMsg(m);
   if (_display && !_display->isOn() && !hasConnection()) wake();
   _nodes_dirty = true;
   _dirty = true;
@@ -430,17 +732,45 @@ void UITask::onChannelMessageRecv(mesh::Packet *pkt, ChannelDetails& channel_det
   m->hops = pkt->isRouteFlood() ? pkt->path_len : 0xFF;
   m->snr4 = (int8_t)(pkt->getSNR() * 4);
 
+  char chan[34];
+  chanLabel(chan, sizeof(chan), channel_details.name);
+
   bool viewing = _screen == SCR_CHAT && _conv_kind == CONV_CHANNEL && _conv_chan == idx && _display && _display->isOn();
   m->unread = !viewing;
-  if (!viewing) {
-    char name[32];
-    sanitize(name, sizeof(name), channel_details.name);
-    char alert[54];
-    snprintf(alert, sizeof(alert), "INCOMING // #%s // %s", name, m->from);
-    showAlert(alert, 4000);
-    _glitch_until = millis() + 350;
+
+  bool is_page = strncmp(body, CD_PAGE_PREFIX, strlen(CD_PAGE_PREFIX)) == 0 && strncmp(body, CD_PAGE_ACK, strlen(CD_PAGE_ACK)) != 0;
+  bool is_page_ack = strncmp(body, CD_PAGE_ACK, strlen(CD_PAGE_ACK)) == 0;
+  if (is_page) {
+    m->flags |= MF_PAGE;
+    saveMsg(m);
+    startPage(m);
+    return;
   }
-  if (_display && !_display->isOn() && !hasConnection()) wake();
+
+  if (is_page_ack && stristr(body + strlen(CD_PAGE_ACK), _node_prefs->node_name)) {
+    char alert[54];
+    snprintf(alert, sizeof(alert), "PAGE ACK // %s", m->from);
+    showAlert(alert, 6000);
+    beep(Tones::DELIVERED);
+  } else if (matchesKeyword(body)) {
+    m->flags |= MF_KEYWORD;
+    char alert[54];
+    snprintf(alert, sizeof(alert), "KEYWORD // %s // %s", chan, m->from);
+    showAlert(alert, 5000);
+    _glitch_until = millis() + 350;
+    beep(Tones::KEYWORD);
+    if (_display && !_display->isOn()) wake();
+  } else {
+    if (!viewing) {
+      char alert[54];
+      snprintf(alert, sizeof(alert), "INCOMING // %s // %s", chan, m->from);
+      showAlert(alert, 4000);
+      _glitch_until = millis() + 350;
+    }
+    if ((_prefs.beep & BEEP_CHAN) && !isMuted(idx)) beep(Tones::CHANNEL);
+    if (_display && !_display->isOn() && !hasConnection() && !isMuted(idx)) wake();
+  }
+  saveMsg(m);
   _dirty = true;
 }
 
@@ -451,6 +781,7 @@ void UITask::onQueueSizeChanged(int offline_queue_size) {
 
 void UITask::onDiscoveredContact(ContactInfo &contact, bool is_new, uint8_t path_len, const uint8_t* path) {
   _nodes_dirty = true;
+  syncClockFrom(contact.last_advert_timestamp, contact.id.pub_key);
   if (is_new) {
     char name[32];
     sanitize(name, sizeof(name), contact.name);
@@ -459,6 +790,78 @@ void UITask::onDiscoveredContact(ContactInfo &contact, bool is_new, uint8_t path
     showAlert(alert, 3000);
   }
   _dirty = true;
+}
+
+void UITask::onLoginResult(const ContactInfo &contact, bool ok, uint8_t permissions) {
+  if (!_login_pending[0] || memcmp(_login_pending, contact.id.pub_key, 6) != 0) return;
+  memset(_login_pending, 0, sizeof(_login_pending));
+  if (!ok) {
+    showAlert("ACCESS DENIED", 3000);
+    beep(Tones::FAILED);
+    return;
+  }
+  if (!isLoggedIn(contact.id.pub_key)) {
+    int slot = _num_logged_in < CD_ROOM_LOGINS ? _num_logged_in++ : CD_ROOM_LOGINS - 1;
+    memcpy(_logged_in[slot], contact.id.pub_key, 6);
+  }
+  showAlert((permissions & 0x01) ? "ACCESS GRANTED // ADMIN" : "ACCESS GRANTED", 3000);
+  beep(Tones::DELIVERED);
+  if (contact.type == ADV_TYPE_ROOM) openChat(contact.id.pub_key);
+  _dirty = true;
+}
+
+void UITask::onStatusRecv(const ContactInfo &contact, const uint8_t *data, uint8_t len) {
+  if (len < 44) return;
+  StatusInfo& s = _status;
+  memcpy(s.pub, contact.id.pub_key, 6);
+  s.at = millis();
+  memcpy(&s.batt_mv, &data[0], 2);
+  memcpy(&s.queue, &data[2], 2);
+  memcpy(&s.noise, &data[4], 2);
+  memcpy(&s.rssi, &data[6], 2);
+  memcpy(&s.recv, &data[8], 4);
+  memcpy(&s.sent, &data[12], 4);
+  memcpy(&s.air_secs, &data[16], 4);
+  memcpy(&s.up_secs, &data[20], 4);
+  memcpy(&s.flood_tx, &data[24], 4);
+  memcpy(&s.direct_tx, &data[28], 4);
+  memcpy(&s.flood_rx, &data[32], 4);
+  memcpy(&s.direct_rx, &data[36], 4);
+  memcpy(&s.snr4, &data[42], 2);
+  s.valid = true;
+  _status_timeout = 0;
+  showAlert("STATUS RECEIVED", 1500);
+  _dirty = true;
+}
+
+void UITask::onRawRx(float snr, float rssi, const uint8_t raw[], int len) {
+  if (_rf == NULL || len < 2) return;
+  RfEntry& e = _rf[_rf_head];
+  _rf_head = (_rf_head + 1) % CD_RF_LOG;
+  if (_rf_count < CD_RF_LOG) _rf_count++;
+  _rf_total++;
+
+  uint8_t h = raw[0];
+  e.at = millis();
+  e.route = h & PH_ROUTE_MASK;
+  e.type = (h >> PH_TYPE_SHIFT) & PH_TYPE_MASK;
+  int i = 1;
+  if (e.route == ROUTE_TYPE_TRANSPORT_FLOOD || e.route == ROUTE_TYPE_TRANSPORT_DIRECT) i += 4;
+  e.hops = (i < len) ? (raw[i] & 63) : 0;
+  e.snr4 = (int8_t)(snr * 4);
+  e.rssi = (int16_t)rssi;
+  e.len = len > 255 ? 255 : len;
+  if (_screen == SCR_LIST && _tab == TAB_RF) _dirty = true;
+}
+
+void UITask::onFloodRecv(const mesh::Packet *pkt) {
+  // the last hop is whoever we heard it from: a neighbour
+  uint8_t count = pkt->getPathHashCount();
+  if (count > 0) muleNeighbour(pkt->path[(count - 1) * pkt->getPathHashSize()]);
+
+  if (_prefs.mule && (pkt->getPayloadType() == PAYLOAD_TYPE_TXT_MSG || pkt->getPayloadType() == PAYLOAD_TYPE_GRP_TXT)) {
+    muleStore(pkt);
+  }
 }
 
 void UITask::notify(UIEventType t) {
@@ -472,6 +875,246 @@ void UITask::showAlert(const char* msg, int millis_dur) {
   _dirty = true;
 }
 
+/* ---------------------------------------- clock ---------------------------------------- */
+
+void UITask::setClock(uint32_t epoch, ClockSrc src) {
+  rtc_clock.setCurrentTime(epoch);
+  _clock_src = src;
+  _clk_last_rtc = epoch;
+  _clk_last_ms = millis();
+  _dirty = true;
+}
+
+// With no time source, adopt the mesh's time once two different nodes agree on it.
+void UITask::syncClockFrom(uint32_t their_ts, const uint8_t* from) {
+  if (_clock_src != CLK_NONE || their_ts < CLOCK_FLOOR + 86400) return;
+  uint32_t now_ms = millis();
+  if (_clk_cand_ts && memcmp(_clk_cand_from, from, 4) != 0) {
+    uint32_t expect = _clk_cand_ts + (now_ms - _clk_cand_ms) / 1000;
+    int32_t diff = (int32_t)(their_ts - expect);
+    if (diff > -CLOCK_AGREE_SECS && diff < CLOCK_AGREE_SECS) {
+      setClock(their_ts > expect ? their_ts : expect, CLK_MESH);
+      showAlert("CLOCK SYNCED FROM MESH", 3000);
+      return;
+    }
+  }
+  _clk_cand_ts = their_ts;
+  _clk_cand_ms = now_ms;
+  memcpy(_clk_cand_from, from, 4);
+}
+
+// notice when the phone app or GPS sets the clock behind our back
+void UITask::watchClock() {
+  uint32_t now = rtc_clock.getCurrentTime();
+  uint32_t expect = _clk_last_rtc + (millis() - _clk_last_ms) / 1000;
+  if ((int32_t)(now - expect) > 30 && now > CLOCK_FLOOR + 86400) {
+    _clock_src = CLK_SET;
+    _dirty = true;
+  }
+  _clk_last_rtc = now;
+  _clk_last_ms = millis();
+}
+
+/* ------------------------------------- store & forward --------------------------------- */
+// "Mule" mode: remember text packets heard in passing, and re-flood them when the deck
+// arrives somewhere new (a neighbour it has not heard for a while). Carries messages
+// between parts of the mesh that can't hear each other, as you move between them.
+
+void UITask::muleStore(const mesh::Packet* pkt) {
+  if (_mule == NULL) return;
+  uint8_t hash[MAX_HASH_SIZE];
+  pkt->calculatePacketHash(hash);
+
+  int empty = -1, oldest = 0;
+  for (int i = 0; i < CD_MULE_SLOTS; i++) {
+    MuleEntry& e = _mule[i];
+    if (e.len == 0) { if (empty < 0) empty = i; continue; }
+    if (memcmp(e.hash, hash, sizeof(hash)) == 0) return;   // already carrying it
+    if (_mule[oldest].len && e.heard < _mule[oldest].heard) oldest = i;
+  }
+  MuleEntry& e = _mule[empty >= 0 ? empty : oldest];
+  memcpy(e.hash, hash, sizeof(hash));
+  e.len = pkt->writeTo(e.raw);
+  e.heard = millis();
+  e.sends = 0;
+}
+
+void UITask::muleNeighbour(uint8_t hash) {
+  uint32_t now = millis();
+  int found = -1, oldest = 0;
+  for (int i = 0; i < CD_NEIGHBOURS; i++) {
+    if (_neigh[i].last && _neigh[i].hash == hash) { found = i; break; }
+    if (_neigh[i].last < _neigh[oldest].last) oldest = i;
+  }
+  if (found >= 0) {
+    bool stale = now - _neigh[found].last > MULE_NEIGH_STALE;
+    _neigh[found].last = now;
+    if (!stale) return;
+  } else {
+    _neigh[oldest].hash = hash;
+    _neigh[oldest].last = now;
+  }
+  // a neighbour we haven't heard lately: we've moved somewhere new
+  if (_prefs.mule && now - _mule_last_flush > MULE_FLUSH_GAP && now > 60000) {
+    int n = muleFlush(false);
+    if (n > 0) {
+      char a[40];
+      snprintf(a, sizeof(a), "MULE // NEW AREA // RELAYING %d", n);
+      showAlert(a, 3000);
+    }
+  }
+}
+
+int UITask::muleFlush(bool forced) {
+  if (_mule == NULL) return 0;
+  _mule_last_flush = millis();
+  int n = 0;
+  for (int i = 0; i < CD_MULE_SLOTS && n < MULE_PER_FLUSH; i++) {
+    MuleEntry& e = _mule[i];
+    if (e.len == 0) continue;
+    if (millis() - e.heard > MULE_MAX_AGE) { e.len = 0; continue; }
+    if (e.sends >= MULE_MAX_SENDS) continue;
+    if (!forced && millis() - e.heard < 30000) continue;   // the area we're in already heard it
+    if (the_mesh.uiReflood(e.raw, e.len, 1500 + n * 2500 + random(0, 800))) {
+      e.sends++;
+      n++;
+    }
+  }
+  _mule_relayed += n;
+  return n;
+}
+
+int UITask::muleCount() const {
+  if (_mule == NULL) return 0;
+  int n = 0;
+  for (int i = 0; i < CD_MULE_SLOTS; i++) {
+    if (_mule[i].len && millis() - _mule[i].heard < MULE_MAX_AGE && _mule[i].sends < MULE_MAX_SENDS) n++;
+  }
+  return n;
+}
+
+bool UITask::isLoggedIn(const uint8_t* pub) const {
+  for (int i = 0; i < _num_logged_in; i++) if (memcmp(_logged_in[i], pub, 6) == 0) return true;
+  return false;
+}
+
+/* ---------------------------------------- paging --------------------------------------- */
+
+void UITask::startPage(Msg* m) {
+  if (_screen != SCR_PAGE) _page_return = (_screen == SCR_BOOT) ? SCR_LIST : _screen;
+  _page_seq = m->seq;
+  _screen = SCR_PAGE;
+  _page_next_tone = _page_started = millis();
+  if (_display && !_display->isOn()) _display->turnOn();
+  _auto_off = millis() + 0x7FFFFFFF;
+  _dirty = true;
+}
+
+void UITask::ackPage() {
+  Msg* m = findMsg(_page_seq);
+  _audio.stop();
+  _input.setBacklight(_prefs.kbl);
+  _screen = _page_return;
+  _page_seq = 0;
+  _auto_off = millis() + _prefs.dim_secs * 1000UL;
+  _dirty = true;
+  if (m == NULL) return;
+
+  m->flags |= MF_ACKED;
+  m->unread = 0;
+  saveMsg(m);
+
+  // tell whoever paged us, in the same place they paged us from
+  ConvKind kind = _conv_kind;
+  uint8_t chan = _conv_chan, peer[6];
+  memcpy(peer, _conv_peer, 6);
+  char saved_name[32];
+  strcpy(saved_name, _conv_name);
+
+  char ack[64];
+  if (m->kind == CONV_DM) {
+    _conv_kind = CONV_DM;
+    memcpy(_conv_peer, m->peer, 6);
+    snprintf(ack, sizeof(ack), "%s %s", CD_PAGE_ACK, _node_prefs->node_name);
+  } else {
+    _conv_kind = CONV_CHANNEL;
+    _conv_chan = m->chan_idx;
+    snprintf(ack, sizeof(ack), "%s %s", CD_PAGE_ACK, m->from);
+  }
+  bool ok = sendText(ack);
+  _conv_kind = kind;
+  _conv_chan = chan;
+  memcpy(_conv_peer, peer, 6);
+  strcpy(_conv_name, saved_name);
+  showAlert(ok ? "PAGE ACKNOWLEDGED" : "ACK NOT SENT", 2500);
+}
+
+/* --------------------------------------- channels -------------------------------------- */
+
+int UITask::addChannel(const char* name, const uint8_t* secret) {
+  ChannelDetails cd;
+  int free_slot = -1;
+  for (int i = 0; i < MAX_GROUP_CHANNELS; i++) {
+    if (!the_mesh.getChannel(i, cd)) continue;
+    if (cd.name[0] && memcmp(cd.channel.secret, secret, 16) == 0) return i;   // already joined
+    if (!cd.name[0] && free_slot < 0) free_slot = i;
+  }
+  if (free_slot < 0) return -1;
+
+  memset(&cd, 0, sizeof(cd));
+  strncpy(cd.name, name, sizeof(cd.name) - 1);
+  memcpy(cd.channel.secret, secret, 16);
+  if (!the_mesh.uiSetChannel(free_slot, cd)) return -1;
+
+  // anything left over from a channel that used this slot before isn't ours to show
+  for (int i = 0; i < _max_msgs; i++) {
+    if (_msgs[i].seq && _msgs[i].kind == CONV_CHANNEL && _msgs[i].chan_idx == free_slot) {
+      _msgs[i].seq = 0;
+      saveMsg(&_msgs[i]);
+    }
+  }
+  if (free_slot < 64) _prefs.muted &= ~(1ULL << free_slot);
+  refreshChannels();
+  return free_slot;
+}
+
+bool UITask::parseKey(const char* s, uint8_t* secret) {
+  char hex[33];
+  int n = 0;
+  for (; *s && n < 33; s++) {
+    if (isxdigit(*s)) hex[n++] = *s;
+    else if (*s != ' ' && *s != '-' && *s != ':') return false;
+  }
+  if (n != 32) return false;
+  for (int i = 0; i < 16; i++) {
+    char b[3] = { hex[i * 2], hex[i * 2 + 1], 0 };
+    secret[i] = (uint8_t)strtoul(b, NULL, 16);
+  }
+  return true;
+}
+
+void UITask::showChannelKey(int idx) {
+  ChannelDetails cd;
+  if (!the_mesh.getChannel(idx, cd) || !cd.name[0]) { consolePrint("NO SUCH CHANNEL"); return; }
+  char hex[33], label[34];
+  toHex(hex, cd.channel.secret, 16);
+  chanLabel(label, sizeof(label), cd.name);
+  consolePrint("%s", hex);
+  consolePrint("KEY FOR %s", label);
+}
+
+// a channel by name ("farm", "#farm"), or the open/selected one when name is empty
+static int findChannelByName(const char* name) {
+  ChannelDetails cd;
+  const char* want = (name[0] == '#') ? name + 1 : name;
+  for (int i = 0; i < MAX_GROUP_CHANNELS; i++) {
+    if (!the_mesh.getChannel(i, cd) || !cd.name[0]) continue;
+    const char* have = (cd.name[0] == '#') ? cd.name + 1 : cd.name;
+    if (strieq(have, want)) return i;
+  }
+  return -1;
+}
+
 /* -------------------------------------- navigation ------------------------------------- */
 
 void UITask::openChannel(int list_pos) {
@@ -482,33 +1125,41 @@ void UITask::openChannel(int list_pos) {
 
   _conv_kind = CONV_CHANNEL;
   _conv_chan = idx;
-  sanitize(_conv_name, sizeof(_conv_name), cd.name);
+  chanLabel(_conv_name, sizeof(_conv_name), cd.name);
   _screen = SCR_CHAT;
   _scroll = 0;
   markRead(CONV_CHANNEL, idx, NULL);
   _dirty = true;
 }
 
+void UITask::openChat(const uint8_t* pub) {
+  const Node* n = findNode(pub);
+  memcpy(_conv_peer, pub, sizeof(_conv_peer));
+  if (n) strcpy(_conv_name, n->name);
+  _conv_kind = CONV_DM;
+  _screen = SCR_CHAT;
+  _scroll = 0;
+  markRead(CONV_DM, 0, pub);
+  _dirty = true;
+}
+
 void UITask::openNode(const uint8_t* pub) {
-  int i;
-  for (i = 0; i < _num_nodes; i++) {
-    if (memcmp(_nodes[i].pub, pub, sizeof(_nodes[i].pub)) == 0) break;
-  }
-  if (i == _num_nodes) {
+  const Node* n = findNode(pub);
+  if (n == NULL) {
     showAlert("NOT IN CONTACTS", 2000);
     return;
   }
-  const Node& n = _nodes[i];
-  memcpy(_conv_peer, n.pub, sizeof(_conv_peer));
-  strcpy(_conv_name, n.name);
+  memcpy(_conv_peer, n->pub, sizeof(_conv_peer));
+  strcpy(_conv_name, n->name);
   _scroll = 0;
+  _node_mode = NM_VIEW;
 
-  if (n.type == ADV_TYPE_CHAT) {
-    _conv_kind = CONV_DM;
-    _screen = SCR_CHAT;
-    markRead(CONV_DM, 0, n.pub);
+  if (n->type == ADV_TYPE_CHAT) {
+    openChat(n->pub);
+  } else if (n->type == ADV_TYPE_ROOM && isLoggedIn(n->pub)) {
+    openChat(n->pub);
   } else {
-    _screen = SCR_NODE;   // repeaters, rooms and sensors get an info page
+    _screen = SCR_NODE;   // repeaters, sensors and rooms not yet joined get an info page
   }
   _dirty = true;
 }
@@ -518,7 +1169,7 @@ void UITask::wake() {
     _display->turnOn();
     _dirty = true;
   }
-  _auto_off = millis() + _prefs.dim_secs * 1000UL;
+  if (_screen != SCR_PAGE) _auto_off = millis() + _prefs.dim_secs * 1000UL;
 }
 
 void UITask::handleKey(int key) {
@@ -526,9 +1177,16 @@ void UITask::handleKey(int key) {
   wake();
   if (was_off) return;   // the key that wakes the screen does nothing else
 
+  if ((_prefs.beep & BEEP_KEYS) && key < TKEY_UP) beep(Tones::CLICK);
+
   if (_screen == SCR_BOOT) {
     _screen = SCR_LIST;
+    _glitch_until = millis() + 250;
     _dirty = true;
+    return;
+  }
+  if (_screen == SCR_PAGE) {   // any key or a click acknowledges; a drifting trackball doesn't
+    if (key < TKEY_UP || key == TKEY_CLICK || key == TKEY_HOLD) ackPage();
     return;
   }
   if (key == TKEY_HOLD) {   // long-press the trackball: blank the screen
@@ -539,21 +1197,102 @@ void UITask::handleKey(int key) {
   switch (_screen) {
     case SCR_LIST: handleListKey(key); break;
     case SCR_CHAT: handleChatKey(key); break;
-    case SCR_NODE:
-      if (key == TKEY_BACKSPACE || key == TKEY_LEFT || key == TKEY_ESC || key == TKEY_CLICK || key == TKEY_ENTER) {
+    case SCR_NODE: handleNodeKey(key); break;
+    default: break;
+  }
+  _dirty = true;
+}
+
+void UITask::handleNodeKey(int key) {
+  ContactInfo* c = the_mesh.lookupContactByPubKey(_conv_peer, sizeof(_conv_peer));
+  const Node* n = findNode(_conv_peer);
+
+  if (_node_mode == NM_PASSWORD) {
+    if (key == TKEY_ENTER || key == TKEY_CLICK) {
+      _input_buf[_input_len] = 0;
+      uint32_t est = 0;
+      int r = the_mesh.uiLogin(_conv_peer, _input_buf, est);
+      if (r == MSG_SEND_FAILED) {
+        showAlert("LOGIN NOT SENT", 2500);
+      } else {
+        memcpy(_login_pending, _conv_peer, 6);
+        _login_timeout = millis() + est + 4000;
+        showAlert("AUTHENTICATING...", (int)(est + 4000));
+      }
+      _node_mode = NM_VIEW;
+      _input_len = 0;
+      _input_buf[0] = 0;
+    } else if (key == TKEY_ESC || key == TKEY_LEFT) {
+      _node_mode = NM_VIEW;
+      _input_len = 0;
+      _input_buf[0] = 0;
+    } else if (key == TKEY_BACKSPACE) {
+      if (_input_len > 0) _input_buf[--_input_len] = 0;
+    } else if (key >= 32 && key < 127 && _input_len < 15) {
+      _input_buf[_input_len++] = key;
+      _input_buf[_input_len] = 0;
+    }
+    return;
+  }
+
+  if (_node_mode == NM_CONFIRM_DEL) {
+    _node_mode = NM_VIEW;
+    if (key == 'd' || key == 'D') {
+      if (the_mesh.uiRemoveContact(_conv_peer)) {
+        showAlert("CONTACT DELETED", 2000);
+        refreshNodes();
         _screen = SCR_LIST;
-      } else if (key == 'r' || key == 'R') {
-        ContactInfo* c = the_mesh.lookupContactByPubKey(_conv_peer, sizeof(_conv_peer));
-        if (c) {
-          the_mesh.resetPathTo(*c);
-          showAlert("PATH RESET // NEXT TX FLOODS", 2500);
-          _nodes_dirty = true;
+      } else {
+        showAlert("DELETE FAILED", 2000);
+      }
+    }
+    return;
+  }
+
+  switch (key) {
+    case TKEY_BACKSPACE: case TKEY_LEFT: case TKEY_ESC:
+      _screen = SCR_LIST;
+      break;
+    case TKEY_ENTER: case TKEY_CLICK:
+      if (n && (n->type == ADV_TYPE_CHAT || (n->type == ADV_TYPE_ROOM && isLoggedIn(n->pub)))) openChat(n->pub);
+      else if (n && n->type == ADV_TYPE_ROOM) { _node_mode = NM_PASSWORD; _input_len = 0; _input_buf[0] = 0; }
+      else _screen = SCR_LIST;
+      break;
+    case 'r': case 'R':
+      if (c) {
+        the_mesh.resetPathTo(*c);
+        showAlert("PATH RESET // NEXT TX FLOODS", 2500);
+        _nodes_dirty = true;
+      }
+      break;
+    case 's': case 'S':
+      showAlert(the_mesh.uiShareContact(_conv_peer) ? "CONTACT SHARED (ZERO HOP)" : "SHARE FAILED", 2500);
+      break;
+    case 'd': case 'D':
+      _node_mode = NM_CONFIRM_DEL;
+      break;
+    case 'l': case 'L':
+      if (n && (n->type == ADV_TYPE_ROOM || n->type == ADV_TYPE_REPEATER)) {
+        _node_mode = NM_PASSWORD;
+        _input_len = 0;
+        _input_buf[0] = 0;
+      }
+      break;
+    case 't': case 'T':
+      if (n && n->type == ADV_TYPE_REPEATER) {
+        uint32_t est = 0;
+        if (the_mesh.uiRequestStatus(_conv_peer, est) == MSG_SEND_FAILED) {
+          showAlert("REQUEST NOT SENT", 2000);
+        } else {
+          _status.valid = false;
+          memcpy(_status.pub, _conv_peer, 6);
+          _status_timeout = millis() + est + 4000;
+          showAlert("REQUESTING STATUS...", (int)(est + 4000));
         }
       }
       break;
     default: break;
   }
-  _dirty = true;
 }
 
 void UITask::handleListKey(int key) {
@@ -561,18 +1300,29 @@ void UITask::handleListKey(int key) {
   int& sel = _sel[_tab];
 
   if (_tab == TAB_SYS) {   // the SYS tab is a command console
-    if (key == TKEY_LEFT) { _tab = TAB_HEARD; return; }
+    if (key == TKEY_LEFT) { _tab = TAB_RF; return; }
     if (key == TKEY_RIGHT) { _tab = TAB_CHAN; return; }
+    if (key == TKEY_UP) { if (_console_scroll < _console_len - CD_CONSOLE_ROWS) _console_scroll++; return; }
+    if (key == TKEY_DOWN) { if (_console_scroll > 0) _console_scroll--; return; }
     if (key == TKEY_ENTER || key == TKEY_CLICK) {
+      if (_cmd_len == 0 && key == TKEY_CLICK && _last_cmd[0]) {   // click on an empty prompt repeats
+        strcpy(_cmd_buf, _last_cmd);
+        _cmd_len = strlen(_cmd_buf);
+      }
       if (_cmd_len > 0) {
         _cmd_buf[_cmd_len] = 0;
+        strcpy(_last_cmd, _cmd_buf);
         consolePrint("> %s", _cmd_buf);
+        _console_scroll = 0;
         runCommand(_cmd_buf);
         _cmd_len = 0;
         _cmd_buf[0] = 0;
       }
     } else if (key == TKEY_BACKSPACE) {
       if (_cmd_len > 0) _cmd_buf[--_cmd_len] = 0;
+    } else if (key == TKEY_ESC) {
+      _cmd_len = 0;
+      _cmd_buf[0] = 0;
     } else if (key >= 32 && key < 127 && _cmd_len < (int)sizeof(_cmd_buf) - 1) {
       _cmd_buf[_cmd_len++] = key;
       _cmd_buf[_cmd_len] = 0;
@@ -592,20 +1342,23 @@ void UITask::handleListKey(int key) {
         openChannel(sel);
       } else if (_tab == TAB_NODES) {
         openNode(_nodes[sel].pub);
-      } else {
+      } else if (_tab == TAB_HEARD) {
         openNode(heard[sel].pubkey_prefix);
       }
       break;
+    case '/':   // jump to the console from anywhere
+      _tab = TAB_SYS;
+      break;
     default:
       // a letter jumps to the next entry starting with it
-      if (isalnum(key) && count > 0 && _tab != TAB_HEARD) {
+      if (isalnum(key) && count > 0 && (_tab == TAB_CHAN || _tab == TAB_NODES)) {
         for (int step = 1; step <= count; step++) {
           int i = (sel + step) % count;
           const char* name;
           ChannelDetails cd;
           if (_tab == TAB_CHAN) {
             the_mesh.getChannel(_chan_idx[i], cd);
-            name = cd.name;
+            name = (cd.name[0] == '#') ? cd.name + 1 : cd.name;
           } else {
             name = _nodes[i].name;
           }
@@ -666,30 +1419,326 @@ void UITask::consolePrint(const char* fmt, ...) {
   _console_len++;
 }
 
+static bool argOn(const char* a)  { return strcmp(a, "on") == 0 || strcmp(a, "1") == 0; }
+static bool argOff(const char* a) { return strcmp(a, "off") == 0 || strcmp(a, "0") == 0; }
+
 void UITask::runCommand(const char* line) {
-  char cmd[64];
+  char cmd[96];
   strncpy(cmd, line, sizeof(cmd) - 1);
   cmd[sizeof(cmd) - 1] = 0;
   char* arg = strchr(cmd, ' ');
   if (arg) { *arg++ = 0; while (*arg == ' ') arg++; } else { arg = cmd + strlen(cmd); }
   for (char* p = cmd; *p; p++) *p = tolower(*p);
+  bool in_chat = _screen == SCR_CHAT;
+  char argl[64];   // lower-cased copy, for keywords and names
+  strncpy(argl, arg, sizeof(argl) - 1);
+  argl[sizeof(argl) - 1] = 0;
+  for (char* p = argl; *p; p++) *p = tolower(*p);
 
+  /* ---- help ---- */
   if (strcmp(cmd, "help") == 0 || strcmp(cmd, "?") == 0) {
-    consolePrint("advert [flood]  name <x>  ble/gps on|off");
-    consolePrint("theme matrix|amber|gibson|redline");
-    consolePrint("ball 1-5  crt on|off  dim <s>  tz <h>");
-    consolePrint("clear  reboot  off");
+    if (strcmp(argl, "chan") == 0) {
+      consolePrint("join #name     PUBLIC HASHTAG CHANNEL");
+      consolePrint("newchan name   PRIVATE, NEW RANDOM KEY");
+      consolePrint("addchan name <32 hex> JOIN PRIVATE");
+      consolePrint("key [name]     SHOW KEY TO SHARE");
+      consolePrint("delchan name   mute/unmute [name]");
+      consolePrint("chans          LIST ALL CHANNELS");
+    } else if (strcmp(argl, "radio") == 0) {
+      consolePrint("radio [MHz bw sf cr]  preset [name]");
+      consolePrint("tx <dBm>       repeat on|off");
+      consolePrint("mule on|off|flush  STORE & FORWARD");
+      consolePrint("advert [flood]");
+    } else if (strcmp(argl, "alert") == 0) {
+      consolePrint("/page [txt]  ALARM ON THEIR DECK");
+      consolePrint("/sos         PAGE WITH YOUR POSITION");
+      consolePrint("alert <word>  alert -<word>  alert");
+      consolePrint("beep on|off|dm|keys  vol 0-10");
+      consolePrint("kbl 0-255    KEYBOARD BACKLIGHT");
+    } else if (strcmp(argl, "net") == 0) {
+      consolePrint("time HH:MM[:SS]  date YYYY-MM-DD");
+      consolePrint("clock  tz <h>  name <handle>");
+      consolePrint("ble on|off  gps on|off  pos");
+      consolePrint("/loc  SEND YOUR POSITION");
+      consolePrint("NODE PAGE: L LOGIN T STATUS S SHARE");
+      consolePrint("           R RESET PATH  D DELETE");
+    } else if (strcmp(argl, "ui") == 0) {
+      consolePrint("theme matrix|amber|gibson|redline");
+      consolePrint("ball 1-5  crt on|off  dim <secs>");
+      consolePrint("history on|off|wipe  clear");
+      consolePrint("reboot  off");
+    } else {
+      consolePrint("help chan   CHANNELS & PRIVATE KEYS");
+      consolePrint("help alert  PAGING, BEEPS, KEYWORDS");
+      consolePrint("help radio  RF, REPEAT, MULE");
+      consolePrint("help net    CLOCK, GPS, NODES");
+      consolePrint("help ui     LOOK & FEEL");
+      consolePrint(G_UP G_DOWN " SCROLLS. CLICK REPEATS LAST CMD");
+    }
+
+  /* ---- channels ---- */
+  } else if (strcmp(cmd, "join") == 0) {
+    if (!argl[0]) { consolePrint("USAGE: join #name"); }
+    else {
+      char name[32];
+      snprintf(name, sizeof(name), argl[0] == '#' ? "%s" : "#%s", argl);
+      uint8_t hash[32];
+      mesh::Utils::sha256(hash, sizeof(hash), (const uint8_t*)name, strlen(name));
+      int idx = addChannel(name, hash);
+      if (idx < 0) consolePrint("NO FREE CHANNEL SLOTS");
+      else consolePrint("JOINED %s", name);
+    }
+  } else if (strcmp(cmd, "newchan") == 0) {
+    if (!arg[0]) { consolePrint("USAGE: newchan <name>"); }
+    else {
+      uint8_t secret[16];
+      esp_fill_random(secret, sizeof(secret));
+      int idx = addChannel(arg, secret);
+      if (idx < 0) { consolePrint("NO FREE CHANNEL SLOTS"); }
+      else {
+        consolePrint("PRIVATE CHANNEL %s CREATED", arg);
+        consolePrint("GIVE THIS KEY TO YOUR GROUP:");
+        showChannelKey(idx);
+      }
+    }
+  } else if (strcmp(cmd, "addchan") == 0) {
+    char* key = strrchr(arg, ' ');
+    uint8_t secret[16];
+    if (key == NULL) { consolePrint("USAGE: addchan <name> <32 hex key>"); }
+    else {
+      *key++ = 0;
+      if (!parseKey(key, secret)) consolePrint("KEY MUST BE 32 HEX DIGITS");
+      else {
+        int idx = addChannel(arg, secret);
+        if (idx < 0) consolePrint("NO FREE CHANNEL SLOTS");
+        else consolePrint("JOINED PRIVATE CHANNEL %s", arg);
+      }
+    }
+  } else if (strcmp(cmd, "key") == 0) {
+    int idx = argl[0] ? findChannelByName(argl) : (in_chat && _conv_kind == CONV_CHANNEL) ? _conv_chan
+              : (_num_chans ? _chan_idx[_sel[TAB_CHAN] < _num_chans ? _sel[TAB_CHAN] : 0] : -1);
+    if (idx < 0) consolePrint("NO SUCH CHANNEL");
+    else showChannelKey(idx);
+  } else if (strcmp(cmd, "delchan") == 0) {
+    int idx = argl[0] ? findChannelByName(argl) : (in_chat && _conv_kind == CONV_CHANNEL) ? _conv_chan : -1;
+    if (idx < 0) consolePrint("USAGE: delchan <name>");
+    else {
+      ChannelDetails cd;
+      memset(&cd, 0, sizeof(cd));
+      the_mesh.uiSetChannel(idx, cd);
+      for (int i = 0; i < _max_msgs; i++) {
+        if (_msgs[i].seq && _msgs[i].kind == CONV_CHANNEL && _msgs[i].chan_idx == idx) {
+          _msgs[i].seq = 0;
+          saveMsg(&_msgs[i]);
+        }
+      }
+      refreshChannels();
+      if (in_chat && _conv_kind == CONV_CHANNEL && _conv_chan == idx) _screen = SCR_LIST;
+      consolePrint("CHANNEL DELETED");
+    }
+  } else if (strcmp(cmd, "mute") == 0 || strcmp(cmd, "unmute") == 0) {
+    int idx = argl[0] ? findChannelByName(argl) : (in_chat && _conv_kind == CONV_CHANNEL) ? _conv_chan : -1;
+    if (idx < 0 || idx >= 64) consolePrint("USAGE: %s <channel>", cmd);
+    else {
+      if (cmd[0] == 'm') _prefs.muted |= (1ULL << idx); else _prefs.muted &= ~(1ULL << idx);
+      savePrefs();
+      consolePrint(cmd[0] == 'm' ? "MUTED (KEYWORDS STILL ALERT)" : "UNMUTED");
+    }
+  } else if (strcmp(cmd, "chans") == 0) {
+    ChannelDetails cd;
+    for (int i = 0; i < _num_chans; i++) {
+      the_mesh.getChannel(_chan_idx[i], cd);
+      char label[34];
+      chanLabel(label, sizeof(label), cd.name);
+      consolePrint("%2d %-24s%s", _chan_idx[i], label, isMuted(_chan_idx[i]) ? " MUTED" : "");
+    }
+    if (_num_chans == 0) consolePrint("NO CHANNELS");
+
+  /* ---- paging & alerts ---- */
+  } else if (strcmp(cmd, "page") == 0 || strcmp(cmd, "sos") == 0) {
+    if (!in_chat) { consolePrint("OPEN A CHAT, THEN TYPE /%s", cmd); }
+    else {
+      char msg[CD_INPUT_MAX + 1];
+      if (cmd[0] == 's') {
+        LocationProvider* lp = _sensors ? _sensors->getLocationProvider() : NULL;
+        if (lp && lp->isValid()) snprintf(msg, sizeof(msg), "%s SOS %.5f,%.5f %s", CD_PAGE_PREFIX, lp->getLatitude() / 1e6, lp->getLongitude() / 1e6, arg);
+        else if (_node_prefs->node_lat || _node_prefs->node_lon) snprintf(msg, sizeof(msg), "%s SOS ~%.5f,%.5f %s", CD_PAGE_PREFIX, _node_prefs->node_lat, _node_prefs->node_lon, arg);
+        else snprintf(msg, sizeof(msg), "%s SOS %s", CD_PAGE_PREFIX, arg);
+      } else {
+        snprintf(msg, sizeof(msg), "%s %s", CD_PAGE_PREFIX, arg);
+      }
+      consolePrint(sendText(msg, MF_PAGE) ? "PAGE SENT" : "PAGE FAILED");
+    }
+  } else if (strcmp(cmd, "loc") == 0) {
+    LocationProvider* lp = _sensors ? _sensors->getLocationProvider() : NULL;
+    if (!in_chat) consolePrint("OPEN A CHAT, THEN TYPE /loc");
+    else if (lp == NULL || !lp->isValid()) consolePrint("NO GPS FIX");
+    else {
+      char msg[64];
+      snprintf(msg, sizeof(msg), "LOC %.5f,%.5f %s", lp->getLatitude() / 1e6, lp->getLongitude() / 1e6, arg);
+      consolePrint(sendText(msg) ? "POSITION SENT" : "SEND FAILED");
+    }
+  } else if (strcmp(cmd, "info") == 0) {
+    if (in_chat && _conv_kind == CONV_DM) { _screen = SCR_NODE; _node_mode = NM_VIEW; consolePrint("DOSSIER"); }
+    else consolePrint("OPEN A DIRECT CHAT FIRST");
+  } else if (strcmp(cmd, "alert") == 0) {
+    if (argl[0] == '-') {
+      for (int i = 0; i < CD_KEYWORDS; i++) if (strieq(_prefs.keywords[i], argl + 1)) _prefs.keywords[i][0] = 0;
+      savePrefs();
+      consolePrint("REMOVED %s", argl + 1);
+    } else if (argl[0]) {
+      int slot = -1;
+      for (int i = 0; i < CD_KEYWORDS; i++) if (!_prefs.keywords[i][0]) { slot = i; break; }
+      if (slot < 0) consolePrint("4 KEYWORDS MAX. alert -<word> FIRST");
+      else {
+        strncpy(_prefs.keywords[slot], argl, sizeof(_prefs.keywords[slot]) - 1);
+        savePrefs();
+        consolePrint("ALERTING ON \"%s\"", _prefs.keywords[slot]);
+      }
+    } else {
+      char list[48] = "";
+      for (int i = 0; i < CD_KEYWORDS; i++) {
+        if (_prefs.keywords[i][0]) { strcat(list, _prefs.keywords[i]); strcat(list, " "); }
+      }
+      consolePrint("KEYWORDS: %s@%s", list, _node_prefs->node_name);
+    }
+  } else if (strcmp(cmd, "beep") == 0) {
+    if (argOn(argl)) _prefs.beep = BEEP_DM | BEEP_CHAN;
+    else if (argOff(argl)) _prefs.beep = 0;
+    else if (strcmp(argl, "dm") == 0) _prefs.beep = BEEP_DM;
+    else if (strcmp(argl, "keys") == 0) _prefs.beep ^= BEEP_KEYS;
+    savePrefs();
+    consolePrint("BEEP DM:%s CHAN:%s KEYS:%s", (_prefs.beep & BEEP_DM) ? "ON" : "OFF",
+                 (_prefs.beep & BEEP_CHAN) ? "ON" : "OFF", (_prefs.beep & BEEP_KEYS) ? "ON" : "OFF");
+  } else if (strcmp(cmd, "vol") == 0) {
+    if (argl[0]) {
+      int v = atoi(argl);
+      _prefs.volume = v < 0 ? 0 : v > 10 ? 10 : v;
+      _audio.setVolume(_prefs.volume);
+      savePrefs();
+      beep(Tones::DM);
+    }
+    consolePrint("VOLUME %u/10%s", _prefs.volume, _audio.ready() ? "" : " (NO AUDIO)");
+  } else if (strcmp(cmd, "kbl") == 0) {
+    if (argl[0]) {
+      int v = atoi(argl);
+      _prefs.kbl = v < 0 ? 0 : v > 255 ? 255 : v;
+      _input.setBacklight(_prefs.kbl);
+      savePrefs();
+    }
+    consolePrint("KEYBOARD BACKLIGHT %u", _prefs.kbl);
+
+  /* ---- radio ---- */
+  } else if (strcmp(cmd, "radio") == 0) {
+    float f, bw;
+    int sf, cr;
+    if (argl[0]) {
+      if (sscanf(argl, "%f %f %d %d", &f, &bw, &sf, &cr) == 4) {
+        char was[48];
+        snprintf(was, sizeof(was), "WAS radio %.3f %g %u %u", _node_prefs->freq, _node_prefs->bw, _node_prefs->sf, _node_prefs->cr);
+        if (the_mesh.uiSetRadio(f, bw, sf, cr)) consolePrint("%s", was);
+        else consolePrint("OUT OF RANGE");
+      } else {
+        consolePrint("USAGE: radio <MHz> <bw> <sf> <cr>");
+      }
+    }
+    consolePrint("RF %.3f BW%g SF%u CR%u %ddBm", _node_prefs->freq, _node_prefs->bw, _node_prefs->sf, _node_prefs->cr,
+                 _node_prefs->tx_power_dbm);
+  } else if (strcmp(cmd, "preset") == 0) {
+    bool found = false;
+    for (uint8_t i = 0; i < NUM_PRESETS && argl[0]; i++) {
+      if (strcmp(argl, PRESETS[i].name) == 0) {
+        found = the_mesh.uiSetRadio(PRESETS[i].freq, PRESETS[i].bw, PRESETS[i].sf, PRESETS[i].cr);
+        consolePrint(found ? "PRESET %s APPLIED" : "PRESET %s FAILED", PRESETS[i].name);
+        consolePrint("RF %.3f BW%g SF%u CR%u", PRESETS[i].freq, PRESETS[i].bw, PRESETS[i].sf, PRESETS[i].cr);
+        found = true;
+      }
+    }
+    if (!found) {
+      for (uint8_t i = 0; i < NUM_PRESETS; i++) {
+        consolePrint("%-10s %.3f BW%g SF%u CR%u", PRESETS[i].name, PRESETS[i].freq, PRESETS[i].bw, PRESETS[i].sf, PRESETS[i].cr);
+      }
+    }
+  } else if (strcmp(cmd, "tx") == 0) {
+    if (argl[0] && !the_mesh.uiSetTxPower(atoi(argl))) consolePrint("RANGE -9 TO %d", MAX_LORA_TX_POWER);
+    consolePrint("TX POWER %ddBm", _node_prefs->tx_power_dbm);
+  } else if (strcmp(cmd, "repeat") == 0) {
+    if (argOn(argl)) the_mesh.uiSetRepeat(true);
+    else if (argOff(argl)) the_mesh.uiSetRepeat(false);
+    consolePrint("REPEAT %s", _node_prefs->isRepeatEn() ? "ON // FORWARDING PACKETS" : "OFF");
+    if (_node_prefs->isRepeatEn() && !the_mesh.uiRepeatFreqAllowed()) {
+      consolePrint("WARN: NOT AN OFF-GRID FREQ. EXTRA");
+      consolePrint("      FLOOD TRAFFIC FOR EVERYONE.");
+    }
+  } else if (strcmp(cmd, "mule") == 0) {
+    if (argOn(argl)) { _prefs.mule = 1; savePrefs(); }
+    else if (argOff(argl)) { _prefs.mule = 0; savePrefs(); }
+    else if (strcmp(argl, "flush") == 0) consolePrint("RELAYING %d HELD PACKETS", muleFlush(true));
+    consolePrint("MULE %s // HOLDING %d // RELAYED %u", _prefs.mule ? "ON" : "OFF", muleCount(), (unsigned)_mule_relayed);
   } else if (strcmp(cmd, "advert") == 0) {
-    bool flood = strcmp(arg, "flood") == 0;
+    bool flood = strcmp(argl, "flood") == 0;
     bool ok = flood ? the_mesh.advertFlood() : the_mesh.advert();
     consolePrint(ok ? (flood ? "ADVERT FLOODED" : "ADVERT SENT (ZERO HOP)") : "ADVERT FAILED");
+
+  /* ---- net & clock ---- */
+  } else if (strcmp(cmd, "time") == 0 || strcmp(cmd, "date") == 0) {
+    int32_t tz = (int32_t)_node_prefs->tz_offset * 3600;
+    uint32_t local = rtc_clock.getCurrentTime() + tz;
+    int32_t days = local / 86400;
+    uint32_t secs = local % 86400;
+    bool ok = false;
+    if (cmd[0] == 't' && argl[0]) {
+      int h, m, s = 0;
+      if (sscanf(argl, "%d:%d:%d", &h, &m, &s) >= 2 && h >= 0 && h < 24 && m >= 0 && m < 60 && s >= 0 && s < 60) {
+        secs = h * 3600 + m * 60 + s;
+        ok = true;
+      }
+    } else if (cmd[0] == 'd' && argl[0]) {
+      int y, mo, d;
+      if (sscanf(argl, "%d-%d-%d", &y, &mo, &d) == 3 && y >= 2024 && mo >= 1 && mo <= 12 && d >= 1 && d <= 31) {
+        days = daysFromCivil(y, mo, d);
+        ok = true;
+      }
+    }
+    if (ok) {
+      uint32_t epoch = (uint32_t)days * 86400 + secs - tz;
+      if (epoch < rtc_clock.getCurrentTime()) consolePrint("WARN: CLOCK WENT BACKWARDS");
+      setClock(epoch, CLK_SET);
+    } else if (argl[0]) {
+      consolePrint(cmd[0] == 't' ? "USAGE: time HH:MM[:SS]" : "USAGE: date YYYY-MM-DD");
+    }
+    runCommand("clock");
+    return;
+  } else if (strcmp(cmd, "clock") == 0) {
+    uint32_t local = rtc_clock.getCurrentTime() + (int32_t)_node_prefs->tz_offset * 3600;
+    int y; unsigned mo, d;
+    civilFromDays(local / 86400, y, mo, d);
+    uint32_t s = local % 86400;
+    static const char* SRC[] = { "NOT SET", "FROM MESH", "SET" };
+    consolePrint("%04d-%02u-%02u %02u:%02u:%02u UTC%+d", y, mo, d, s / 3600, (s / 60) % 60, s % 60, _node_prefs->tz_offset);
+    consolePrint("CLOCK %s", SRC[_clock_src]);
+  } else if (strcmp(cmd, "tz") == 0) {
+    if (argl[0]) {
+      int tz = atoi(argl);
+      if (tz >= -12 && tz <= 14) {
+        _node_prefs->tz_offset = tz;
+        the_mesh.savePrefs();
+      }
+    }
+    consolePrint("TZ UTC%+d", _node_prefs->tz_offset);
+  } else if (strcmp(cmd, "pos") == 0) {
+    LocationProvider* lp = _sensors ? _sensors->getLocationProvider() : NULL;
+    if (lp == NULL) consolePrint("NO GPS HARDWARE");
+    else if (!getGPSState()) consolePrint("GPS OFF // gps on");
+    else if (!lp->isValid()) consolePrint("NO FIX // %ld SATS", lp->satellitesCount());
+    else consolePrint("%.5f,%.5f %ld SATS", lp->getLatitude() / 1e6, lp->getLongitude() / 1e6, lp->satellitesCount());
   } else if (strcmp(cmd, "ble") == 0) {
-    if (strcmp(arg, "on") == 0) enableBluetooth();
-    else if (strcmp(arg, "off") == 0) disableBluetooth();
+    if (argOn(argl)) enableBluetooth();
+    else if (argOff(argl)) disableBluetooth();
     consolePrint("BLE %s", isBluetoothEnabled() ? "ON" : "OFF");
   } else if (strcmp(cmd, "gps") == 0) {
-    if (strcmp(arg, "on") == 0) setGPS(true);
-    else if (strcmp(arg, "off") == 0) setGPS(false);
+    if (argOn(argl)) setGPS(true);
+    else if (argOff(argl)) setGPS(false);
     consolePrint("GPS %s", getGPSState() ? "ON" : "OFF");
   } else if (strcmp(cmd, "name") == 0) {
     if (*arg) {
@@ -701,9 +1750,11 @@ void UITask::runCommand(const char* line) {
     } else {
       consolePrint("HANDLE %s", _node_prefs->node_name);
     }
+
+  /* ---- ui ---- */
   } else if (strcmp(cmd, "theme") == 0) {
     for (uint8_t i = 0; i < NUM_THEMES; i++) {
-      if (strcmp(arg, THEMES[i].name) == 0) {
+      if (strcmp(argl, THEMES[i].name) == 0) {
         _prefs.theme = i;
         savePrefs();
         applyTheme();
@@ -711,8 +1762,8 @@ void UITask::runCommand(const char* line) {
     }
     consolePrint("THEME %s", THEMES[_prefs.theme].name);
   } else if (strcmp(cmd, "ball") == 0) {
-    if (*arg) {
-      int b = atoi(arg);
+    if (argl[0]) {
+      int b = atoi(argl);
       if (b >= 1 && b <= 5) {
         _prefs.ball = b;
         _input.setSensitivity(b);
@@ -721,29 +1772,34 @@ void UITask::runCommand(const char* line) {
     }
     consolePrint("TRACKBALL SENSITIVITY %u/5", _prefs.ball);
   } else if (strcmp(cmd, "crt") == 0) {
-    if (strcmp(arg, "on") == 0) _prefs.crt = 1;
-    else if (strcmp(arg, "off") == 0) _prefs.crt = 0;
+    if (argOn(argl)) _prefs.crt = 1;
+    else if (argOff(argl)) _prefs.crt = 0;
     savePrefs();
     consolePrint("CRT SCANLINES %s", _prefs.crt ? "ON" : "OFF");
   } else if (strcmp(cmd, "dim") == 0) {
-    if (*arg) {
-      int s = atoi(arg);
+    if (argl[0]) {
+      int s = atoi(argl);
       _prefs.dim_secs = (s < 0) ? 0 : (s > 255) ? 255 : s;
       savePrefs();
     }
     if (_prefs.dim_secs) consolePrint("SCREEN BLANKS AFTER %us", _prefs.dim_secs);
     else consolePrint("SCREEN STAYS ON");
-  } else if (strcmp(cmd, "tz") == 0) {
-    if (*arg) {
-      int tz = atoi(arg);
-      if (tz >= -12 && tz <= 14) {
-        _node_prefs->tz_offset = tz;
-        the_mesh.savePrefs();
-      }
+  } else if (strcmp(cmd, "history") == 0) {
+    if (argOn(argl)) { _prefs.history = 1; savePrefs(); if (!_hist_ok) wipeHistory(); }
+    else if (argOff(argl)) { _prefs.history = 0; savePrefs(); }
+    else if (strcmp(argl, "wipe") == 0) {
+      memset(_msgs, 0, sizeof(Msg) * _max_msgs);
+      memset(_pending, 0, sizeof(_pending));
+      _next_seq = 1;
+      wipeHistory();
+      consolePrint("HISTORY WIPED");
     }
-    consolePrint("TZ UTC%+d", _node_prefs->tz_offset);
+    int n = 0;
+    for (int i = 0; i < _max_msgs; i++) if (_msgs[i].seq) n++;
+    consolePrint("HISTORY %s // %d/%d MSGS", _prefs.history ? "SAVED" : "RAM ONLY", n, _max_msgs);
   } else if (strcmp(cmd, "clear") == 0 || strcmp(cmd, "cls") == 0) {
     _console_len = 0;
+    _console_scroll = 0;
   } else if (strcmp(cmd, "reboot") == 0) {
     shutdown(true);
   } else if (strcmp(cmd, "off") == 0) {
@@ -789,6 +1845,62 @@ void UITask::shutdown(bool restart) {
 
 /* ----------------------------------------- loop ---------------------------------------- */
 
+#ifdef CD_SERIAL_BRIDGE
+// Drive the deck from a PC over USB serial, for testing without touching it.
+// 0x01 dumps the framebuffer, 0x02-0x05 roll the trackball up/down/left/right,
+// 0x06 clicks it, 0x07 holds it; anything else is typed as if on the keyboard.
+void UITask::serialBridge() {
+  for (int n = 0; n < 64 && Serial.available(); n++) {
+    int c = Serial.read();
+    switch (c) {
+      case 0x01: {
+        uint16_t* buf = _display ? _display->buffer() : NULL;
+        if (buf == NULL) { Serial.println("#SHOT none"); break; }
+        if (!_display->isOn()) { _display->turnOn(); }
+        render();
+        Serial.printf("\n#SHOT %d %d\n", CYBERDECK_W, CYBERDECK_H);
+        const uint8_t* p = (const uint8_t*) buf;
+        size_t left = CYBERDECK_W * CYBERDECK_H * 2;
+        while (left > 0) {
+          size_t chunk = left < 4096 ? left : 4096;
+          size_t w = Serial.write(p, chunk);
+          p += w;
+          left -= w;
+          if (w == 0) delay(1);
+        }
+        Serial.println("\n#END");
+        break;
+      }
+      case 0x02: handleKey(TKEY_UP); break;
+      case 0x03: handleKey(TKEY_DOWN); break;
+      case 0x04: handleKey(TKEY_LEFT); break;
+      case 0x05: handleKey(TKEY_RIGHT); break;
+      case 0x06: handleKey(TKEY_CLICK); break;
+      case 0x07: handleKey(TKEY_HOLD); break;
+      case 0x11:     // straight to the SYS console, so typed test input can never become a message
+        if (_display && !_display->isOn()) _display->turnOn();
+        _auto_off = millis() + _prefs.dim_secs * 1000UL;
+        if (_screen == SCR_PAGE) ackPage();
+        _screen = SCR_LIST;
+        _tab = TAB_SYS;
+        _node_mode = NM_VIEW;
+        _cmd_len = 0;
+        _cmd_buf[0] = 0;
+        _dirty = true;
+        break;
+      case 0x10: {   // pretend a page just arrived, to see the pager without a second deck
+        static const uint8_t nobody[6] = { 0 };
+        Msg* m = addMsg(CONV_DM, 0, nobody, "TEST", CD_PAGE_PREFIX " gate left open at north paddock", false);
+        if (m) { m->flags |= MF_PAGE; m->unread = 1; startPage(m); }
+        break;
+      }
+      case '\n': break;
+      default: if (c > 0) handleKey(c); break;
+    }
+  }
+}
+#endif
+
 void UITask::loop() {
   int ev = user_btn.check();
   if (ev == BUTTON_EVENT_CLICK) handleKey(TKEY_CLICK);
@@ -799,6 +1911,9 @@ void UITask::loop() {
     if (key == TKEY_NONE) break;
     handleKey(key);
   }
+#ifdef CD_SERIAL_BRIDGE
+  serialBridge();
+#endif
 
   checkPending();
   if (_nodes_dirty && (long)(millis() - _nodes_refresh_at) >= 0) {
@@ -809,33 +1924,50 @@ void UITask::loop() {
   if (_display == NULL) return;
   unsigned long now = millis();
 
-  if (_display->isOn() && _prefs.dim_secs && _screen != SCR_BOOT && (long)(now - _auto_off) >= 0) {
+  // a page keeps sounding (and the screen on) until someone acknowledges it
+  if (_screen == SCR_PAGE) {
+    Msg* pm = findMsg(_page_seq);
+    if (pm == NULL) { _screen = _page_return; _dirty = true; }
+    else if ((long)(now - _page_next_tone) >= 0) {
+      _page_next_tone = now + PAGE_TONE_EVERY;
+      if (now - _page_started < PAGE_TONE_FOR) beep(Tones::PAGE);
+      _kbl_flash = !_kbl_flash;
+      _input.setBacklight(_kbl_flash ? 255 : 0);
+    }
+    if (!_display->isOn()) _display->turnOn();
+  }
+
+  if ((now - _clk_last_ms) >= 1000) watchClock();
+
+  if (_display->isOn() && _prefs.dim_secs && _screen != SCR_BOOT && _screen != SCR_PAGE && (long)(now - _auto_off) >= 0) {
     _display->turnOff();
   }
   if (!_display->isOn()) return;
 
   if (_screen == SCR_BOOT) {
-    if (now - _boot_started > 4500) {
+    if (now - _boot_started > BOOT_MILLIS) {
       _screen = SCR_LIST;
+      _glitch_until = now + 250;
       _dirty = true;
     } else if ((long)(now - _next_render) >= 0) {
       render();
       _display->pushRows(0, CYBERDECK_H);
-      _next_render = now + 40;
+      _next_render = now + 33;
     }
     return;
   }
 
   bool glitching = (long)(_glitch_until - now) > 0;
+  unsigned long frame_every = (_screen == SCR_PAGE) ? 250 : 1000;
   if (((_dirty || glitching) && now - _last_render >= 40) || (long)(now - _next_render) >= 0) {
     _dirty = false;
     _last_render = now;
-    _next_render = now + 1000;   // clock, alert expiry
+    _next_render = now + frame_every;   // clock, alert expiry, page flashing
     _cursor_on = true;
     _next_blink = now + 500;
     render();
     _display->pushRows(0, CYBERDECK_H);
-  } else if ((long)(now - _next_blink) >= 0 && _display->buffer() != NULL) {
+  } else if ((long)(now - _next_blink) >= 0 && _display->buffer() != NULL && _screen != SCR_PAGE) {
     _cursor_on = !_cursor_on;
     _next_blink = now + 500;
     render();
@@ -865,6 +1997,21 @@ void UITask::text(int x, int y, uint16_t col, const char* s) {
   }
 }
 
+// the 8x16 font blown up, each pixel a block with a dark line under it, like a CRT
+void UITask::bigText(int x, int y, int scale, uint16_t col, const char* s) {
+  Adafruit_GFX& g = _display->gfx();
+  int bh = scale > 2 ? scale - 1 : scale;
+  for (; *s; s++, x += CHAR_W * scale) {
+    const uint8_t* glyph = &SPLEEN_8X16_CP437[(uint8_t)*s * 16];
+    for (int r = 0; r < 16; r++) {
+      uint8_t bits = glyph[r];
+      for (int c = 0; c < 8; c++) {
+        if (bits & (0x80 >> c)) g.fillRect(x + c * scale, y + r * scale, scale, bh, col);
+      }
+    }
+  }
+}
+
 void UITask::textf(int x, int y, uint16_t col, const char* fmt, ...) {
   char buf[COLS + 8];
   va_list args;
@@ -889,7 +2036,7 @@ int UITask::battPercent() const {
 }
 
 void UITask::fmtTime(char* dest, uint32_t epoch, bool with_secs) const {
-  if (epoch < 1600000000UL) {   // clock not set yet
+  if (epoch < 1600000000UL) {
     strcpy(dest, with_secs ? "--:--:--" : "--:--");
     return;
   }
@@ -915,6 +2062,8 @@ void UITask::render() {
 
   if (_screen == SCR_BOOT) {
     drawBoot();
+  } else if (_screen == SCR_PAGE) {
+    drawPage();
   } else {
     drawHeader();
     switch (_screen) {
@@ -923,6 +2072,7 @@ void UITask::render() {
         if (_tab == TAB_CHAN) drawChanList();
         else if (_tab == TAB_NODES) drawNodeList(false);
         else if (_tab == TAB_HEARD) drawNodeList(true);
+        else if (_tab == TAB_RF) drawRf();
         else drawSys();
         break;
       case SCR_CHAT: drawChat(); break;
@@ -947,79 +2097,122 @@ void UITask::render() {
   if ((long)(_glitch_until - millis()) > 0) glitchPass();
 }
 
+// cheap, repeatable noise for the boot effects
+static uint32_t hash32(uint32_t x) {
+  x ^= x >> 16; x *= 0x7feb352d; x ^= x >> 15; x *= 0x846ca68b; x ^= x >> 16;
+  return x;
+}
+
 void UITask::drawBoot() {
-  char lines[16][COLS + 1];
-  int n = 0;
-  char tmp[COLS + 1];
+  Adafruit_GFX& g = _display->gfx();
+  uint32_t t = millis() - _boot_started;
 
-  snprintf(lines[n++], COLS + 1, "MESHCORE//DECK BIOS %s", FIRMWARE_VERSION);
-  snprintf(lines[n++], COLS + 1, "(C) 1995 NOBODY. RIGHTS DISAVOWED.");
-  lines[n++][0] = 0;
-
-  #define BOOT_CHECK(label, ok) do { \
-    snprintf(tmp, sizeof(tmp), "%s ", label); \
-    int l = strlen(tmp); while (l < 31) tmp[l++] = '.'; tmp[l] = 0; \
-    snprintf(lines[n++], COLS + 1, "%s %s", tmp, (ok) ? "[ OK ]" : "[FAIL]"); \
-  } while (0)
-
-  BOOT_CHECK("CPU ESP32-S3 240MHZ", true);
-  char label[COLS + 1];
-  snprintf(label, sizeof(label), "PSRAM %uK", (unsigned)(ESP.getPsramSize() / 1024));
-  BOOT_CHECK(label, ESP.getPsramSize() > 0);
-  snprintf(label, sizeof(label), "LORA %.3f SF%u BW%.1f", _node_prefs->freq, _node_prefs->sf, _node_prefs->bw);
-  BOOT_CHECK(label, true);
-  BOOT_CHECK("KEYBOARD I2C 0x55", _input.hasKeyboard());
-  snprintf(label, sizeof(label), "MSG BUFFER %d", _max_msgs);
-  BOOT_CHECK(label, _max_msgs > 0);
-  lines[n++][0] = 0;
-
-  const uint8_t* pk = the_mesh.self_id.pub_key;
-  snprintf(lines[n++], COLS + 1, "HANDLE   %s", _node_prefs->node_name);
-  snprintf(lines[n++], COLS + 1, "NODE ID  %02X%02X%02X%02X%02X%02X", pk[0], pk[1], pk[2], pk[3], pk[4], pk[5]);
-  snprintf(lines[n++], COLS + 1, "CONTACTS %d  CHANNELS %d", _num_nodes, _num_chans);
-  if (isBluetoothEnabled()) snprintf(lines[n++], COLS + 1, "BLE PIN  %06u", (unsigned)the_mesh.getBLEPin());
-  else snprintf(lines[n++], COLS + 1, "BLE OFF");
-  snprintf(lines[n++], COLS + 1, ">> JACKING IN");
-
-  // type it out at ~250 chars/sec
-  int budget = (millis() - _boot_started) / 4;
-  int y = 2;
-  for (int i = 0; i < n && budget > 0; i++, y += ROW_H) {
-    int len = strlen(lines[i]);
-    int shown = (budget < len) ? budget : len;
-    budget -= len + 6;   // a beat between lines
-    memcpy(tmp, lines[i], shown);
-    tmp[shown] = 0;
-    uint16_t col = (i == 0) ? c_hi : c_fg;
-    if (strstr(tmp, "[FAIL]")) col = c_alert;
-    text(4, y, col, tmp);
-    if (shown < len || i == n - 1) {
-      int cx = 4 + shown * CHAR_W;
-      if (i == n - 1 && shown == len) {   // dots after JACKING IN
-        int dots = ((millis() - _boot_started) / 300) % 4;
-        for (int d = 0; d < dots; d++) text(cx + d * CHAR_W, y, c_fg, ".");
-        cx += dots * CHAR_W;
+  // 1. digital rain, thinning out as the logo resolves
+  if (t < 1700) {
+    int rows = SCR_H / ROW_H + 1;
+    for (int c = 0; c < COLS; c++) {
+      uint32_t h = hash32(c * 7919 + 17);
+      if (t > 900 && (h % 800) < t - 900) continue;   // columns drop out
+      int speed = 6 + (h % 9);                          // rows per second
+      int head = (int)((t * speed) / 1000 + (h >> 8) % rows) % (rows + 10);
+      for (int k = 0; k < 9; k++) {
+        int r = head - k;
+        if (r < 0 || r >= rows) continue;
+        char ch[2] = { (char)(33 + hash32(c * 131 + r * 17 + (t / 90) * (k == 0)) % 90), 0 };
+        uint16_t col = (k == 0) ? c_hi : (k < 4) ? c_fg : c_dim;
+        text(c * CHAR_W, r * ROW_H, col, ch);
       }
-      if ((millis() / 250) % 2) _display->gfx().fillRect(cx, y + 1, CHAR_W - 1, 13, c_fg);
-      break;
     }
+  }
+
+  // 2. the logo, wiped in from the top with a bright scan line
+  if (t > 600) {
+    const char* logo = "MESHCORE";
+    int lx = (SCR_W - 8 * CHAR_W * 3) / 2, ly = 18;
+    g.fillRect(lx - 6, ly - 4, 8 * CHAR_W * 3 + 12, 48 + 40, c_bg);
+    bigText(lx, ly, 3, c_fg, logo);
+    int dx = (SCR_W - 6 * CHAR_W * 2) / 2;
+    bigText(dx, ly + 50, 2, c_hi, "//DECK");
+    int reveal = (int)((t - 600) * 90 / 1000) - 4;   // px of logo shown
+    if (reveal < 88) {
+      g.fillRect(lx - 6, ly + reveal, 8 * CHAR_W * 3 + 12, 88 - reveal, c_bg);
+      if (reveal >= 0) g.drawFastHLine(0, ly + reveal, SCR_W, c_hi);
+    }
+  }
+
+  // 3. power-on self test
+  if (t > 1700) {
+    char label[48];
+    struct { const char* l; bool ok; } checks[6];
+    static char l0[40], l1[40], l2[40], l3[40], l4[40], l5[40];
+    snprintf(l0, sizeof(l0), "RF  %.3f SF%u BW%g", _node_prefs->freq, _node_prefs->sf, _node_prefs->bw);
+    snprintf(l1, sizeof(l1), "MEM PSRAM %uK", (unsigned)(ESP.getPsramSize() / 1024));
+    snprintf(l2, sizeof(l2), "KBD I2C 0x55");
+    snprintf(l3, sizeof(l3), "SND I2S SPEAKER VOL %u", _prefs.volume);
+    int n = 0;
+    for (int i = 0; i < _max_msgs; i++) if (_msgs[i].seq) n++;
+    snprintf(l4, sizeof(l4), "LOG %d MSGS %s", n, _prefs.history ? "RESTORED" : "(RAM)");
+    snprintf(l5, sizeof(l5), "NET %d NODES %d CHANNELS", _num_nodes, _num_chans);
+    checks[0] = { l0, true };
+    checks[1] = { l1, ESP.getPsramSize() > 0 };
+    checks[2] = { l2, _input.hasKeyboard() };
+    checks[3] = { l3, _audio.ready() };
+    checks[4] = { l4, _max_msgs > 0 };
+    checks[5] = { l5, true };
+
+    int shown = (int)(t - 1700) / 260;
+    for (int i = 0; i < 6 && i <= shown; i++) {
+      int y = 112 + i * ROW_H;
+      bool done = i < shown;
+      snprintf(label, sizeof(label), "%-30.30s", checks[i].l);
+      for (char* p = label; *p; p++) if (*p == ' ' && p > label + (int)strlen(checks[i].l)) *p = '.';
+      text(4, y, c_fg, label);
+      if (done) text(4 + 32 * CHAR_W, y, checks[i].ok ? c_hi : c_alert, checks[i].ok ? "[ OK ]" : "[FAIL]");
+      else if ((t / 120) % 2) text(4 + 32 * CHAR_W, y, c_dim, "[ .. ]");
+    }
+
+    // progress bar
+    int pct = (int)((t - 1700) * 100 / (BOOT_MILLIS - 2300));
+    if (pct > 100) pct = 100;
+    g.drawRect(4, 212, SCR_W - 8, 10, c_dim);
+    int w = (SCR_W - 12) * pct / 100;
+    for (int x = 0; x < w; x += 4) g.fillRect(6 + x, 214, 3, 6, c_fg);
+
+    const uint8_t* pk = the_mesh.self_id.pub_key;
+    char foot[64];
+    if (isBluetoothEnabled()) snprintf(foot, sizeof(foot), "%s  ID %02X%02X%02X%02X  BLE PIN %06u", _node_prefs->node_name, pk[0], pk[1], pk[2], pk[3], (unsigned)the_mesh.getBLEPin());
+    else snprintf(foot, sizeof(foot), "%s  ID %02X%02X%02X%02X  BLE OFF", _node_prefs->node_name, pk[0], pk[1], pk[2], pk[3]);
+    stext(4, 228, c_dim, foot);
+  }
+
+  // 4. the handshake
+  if (t > BOOT_MILLIS - 600) {
+    const char* msg = " ACCESS GRANTED ";
+    int w = strlen(msg) * CHAR_W * 2;
+    int x = (SCR_W - w) / 2, y = 128;
+    bool on = ((t / 100) % 2) == 0;
+    g.fillRect(x - 6, y - 6, w + 12, 32 + 12, on ? c_fg : c_bg);
+    g.drawRect(x - 6, y - 6, w + 12, 32 + 12, c_hi);
+    bigText(x, y, 2, on ? c_bg : c_fg, msg);
   }
 }
 
 void UITask::drawHeader() {
   Adafruit_GFX& g = _display->gfx();
   g.fillRect(0, 0, SCR_W, 16, c_fg);
-  text(2, 0, c_bg, G_DARK G_MED G_LIGHT " MESHCORE//DECK");
+  text(2, 0, c_bg, G_DARK "MESHCORE//DECK");
 
   char clock[12];
   fmtTime(clock, rtc_clock.getCurrentTime());
-  char right[48];
+  char right[64];
   int pos = 0;
   int unread = totalUnread();
-  if (unread) pos += snprintf(right + pos, sizeof(right) - pos, "MSG %d  ", unread);
-  if (isBluetoothEnabled()) pos += snprintf(right + pos, sizeof(right) - pos, hasConnection() ? "BLE+  " : "BLE  ");
-  if (getGPSState()) pos += snprintf(right + pos, sizeof(right) - pos, "GPS  ");
-  snprintf(right + pos, sizeof(right) - pos, "%d%%  %s", battPercent(), clock);
+  if (unread) pos += snprintf(right + pos, sizeof(right) - pos, "MSG%d ", unread);
+  if (_node_prefs->isRepeatEn()) pos += snprintf(right + pos, sizeof(right) - pos, "RPT ");
+  if (_prefs.mule) pos += snprintf(right + pos, sizeof(right) - pos, "MULE ");
+  if (isBluetoothEnabled()) pos += snprintf(right + pos, sizeof(right) - pos, hasConnection() ? "BLE+ " : "BLE ");
+  if (getGPSState()) pos += snprintf(right + pos, sizeof(right) - pos, "GPS ");
+  snprintf(right + pos, sizeof(right) - pos, "%d%% %s%s", battPercent(), clock, clockValid() ? "" : "?");
   stext(SCR_W - 3 - strlen(right) * SMALL_W, 4, c_bg, right);
 }
 
@@ -1030,7 +2223,7 @@ void UITask::drawTabs() {
     char label[16];
     int unread = 0;
     if (t == TAB_CHAN) {
-      for (int i = 0; i < _num_chans; i++) unread += unreadFor(CONV_CHANNEL, _chan_idx[i], NULL);
+      for (int i = 0; i < _max_msgs; i++) if (_msgs[i].seq && _msgs[i].unread && _msgs[i].kind == CONV_CHANNEL) unread++;
     } else if (t == TAB_NODES) {
       for (int i = 0; i < _max_msgs; i++) if (_msgs[i].seq && _msgs[i].unread && _msgs[i].kind == CONV_DM) unread++;
     }
@@ -1043,7 +2236,7 @@ void UITask::drawTabs() {
       g.drawRect(x, TABS_Y - 1, w, ROW_H + 1, c_dim);
       text(x, TABS_Y, unread ? c_hi : c_dim, label);
     }
-    x += w + 4;
+    x += w + 3;
   }
   g.drawFastHLine(0, TABS_Y + ROW_H + 1, SCR_W, c_dim);
 }
@@ -1067,7 +2260,7 @@ void UITask::drawChanList() {
 
   if (_num_chans == 0) {
     text(4, BODY_Y + ROW_H, c_dim, "NO CHANNELS YET.");
-    text(4, BODY_Y + 2 * ROW_H, c_dim, "ADD THEM FROM THE PHONE APP.");
+    text(4, BODY_Y + 2 * ROW_H, c_dim, "/ THEN: join #name  OR  newchan");
   }
   int top = listTop(_num_chans, sel, BODY_ROWS);
   for (int r = 0; r < BODY_ROWS && top + r < _num_chans; r++) {
@@ -1075,8 +2268,8 @@ void UITask::drawChanList() {
     int idx = _chan_idx[i];
     ChannelDetails cd;
     the_mesh.getChannel(idx, cd);
-    char name[32];
-    sanitize(name, sizeof(name), cd.name);
+    char name[34];
+    chanLabel(name, sizeof(name), cd.name);
 
     // newest message in this channel
     Msg* last = NULL;
@@ -1088,15 +2281,16 @@ void UITask::drawChanList() {
     bool is_sel = i == sel;
     if (is_sel) g.fillRect(0, y, SCR_W, ROW_H, c_fg);
 
-    textf(0, y, is_sel ? c_bg : c_fg, "%s#%-18.18s", is_sel ? G_RIGHT : " ", name);
-    if (unread) textf(21 * CHAR_W, y, is_sel ? c_bg : c_hi, "%2d NEW", unread);
+    textf(0, y, is_sel ? c_bg : c_fg, "%s%-19.19s", is_sel ? G_RIGHT : " ", name);
+    if (isMuted(idx)) text(20 * CHAR_W, y, is_sel ? c_bg : c_dim, "\x0E");   // a muted note
+    if (unread) textf(22 * CHAR_W, y, is_sel ? c_bg : c_hi, "%2d NEW", unread);
     if (last) {
       char t[8];
       fmtTime(t, last->ts);
       text(35 * CHAR_W, y, is_sel ? c_bg : c_dim, t);
     }
   }
-  drawFooter(G_UP G_DOWN " SELECT   RET OPEN   " G_LEFT G_RIGHT " TAB   A-Z JUMP");
+  drawFooter(G_UP G_DOWN " SELECT  RET OPEN  " G_LEFT G_RIGHT " TAB  / CMD  A-Z JUMP");
 }
 
 void UITask::drawNodeList(bool recent) {
@@ -1129,13 +2323,13 @@ void UITask::drawNodeList(bool recent) {
     uint8_t path_len;
     uint32_t when;
     int unread = 0;
+    bool in = false;
     if (recent) {
       sanitize(name, sizeof(name), heard[i].name);
       path_len = heard[i].path_len;
       when = heard[i].recv_timestamp;
-      for (int n = 0; n < _num_nodes; n++) {
-        if (memcmp(_nodes[n].pub, heard[i].pubkey_prefix, sizeof(_nodes[n].pub)) == 0) { tag = typeTag(_nodes[n].type); break; }
-      }
+      const Node* n = findNode(heard[i].pubkey_prefix);
+      if (n) tag = typeTag(n->type);
     } else {
       const Node& n = _nodes[i];
       strcpy(name, n.name);
@@ -1143,20 +2337,57 @@ void UITask::drawNodeList(bool recent) {
       path_len = n.path_len;
       when = n.lastmod;
       unread = unreadFor(CONV_DM, 0, n.pub);
+      in = isLoggedIn(n.pub);
     }
     fmtAgo(ago, when);
     if (path_len == OUT_PATH_UNKNOWN) strcpy(hops, "FLOOD");
-    else if (path_len == 0) strcpy(hops, "DIRECT");
-    else snprintf(hops, sizeof(hops), "%dHOP", path_len);
+    else if ((path_len & 63) == 0) strcpy(hops, "DIRECT");
+    else snprintf(hops, sizeof(hops), "%dHOP", path_len & 63);
 
     text(0, y, col, is_sel ? G_RIGHT : " ");
     textf(1 * CHAR_W, y, dim, "%-3s", tag);
     textf(5 * CHAR_W, y, col, "%-17.17s", name);
     if (unread) text(23 * CHAR_W, y, is_sel ? c_bg : c_hi, "*");
+    else if (in) text(23 * CHAR_W, y, is_sel ? c_bg : c_hi, "\x0F");
     textf(25 * CHAR_W, y, dim, "%6s", hops);
     textf(35 * CHAR_W, y, dim, "%4s", ago);
   }
-  drawFooter(G_UP G_DOWN " SELECT   RET OPEN   " G_LEFT G_RIGHT " TAB");
+  drawFooter(G_UP G_DOWN " SELECT  RET OPEN  " G_LEFT G_RIGHT " TAB  / CMD");
+}
+
+void UITask::drawRf() {
+  int y = BODY_Y;
+  textf(0, y, c_fg, "NF%4d RSSI%4d SNR%5.1f", radio_driver.getNoiseFloor(), (int)radio_driver.getLastRSSI(), radio_driver.getLastSNR());
+  y += ROW_H;
+  textf(0, y, c_dim, "RX %-6u TX %-6u ERR %-4u", (unsigned)radio_driver.getPacketsRecv(), (unsigned)radio_driver.getPacketsSent(),
+        (unsigned)radio_driver.getPacketsRecvErrors());
+  if (_prefs.mule || _node_prefs->isRepeatEn()) {
+    char m[24];
+    snprintf(m, sizeof(m), "%s%s", _node_prefs->isRepeatEn() ? "RPT " : "", _prefs.mule ? "MULE" : "");
+    text(SCR_W - strlen(m) * CHAR_W, y, c_hi, m);
+  }
+  y += ROW_H + 2;
+  _display->gfx().drawFastHLine(0, y - 2, SCR_W, c_dim);
+  stext(0, y, c_dim, " AGE  TYPE    ROUTE  HOPS   SNR   RSSI  LEN");
+  y += 10;
+
+  if (_rf_count == 0) text(4, y + 4, c_dim, "LISTENING...");
+  static const char* ROUTES[] = { "T-FLD", "FLOOD", "DIRCT", "T-DIR" };
+  for (int k = 0; k < 8 && k < _rf_count; k++) {
+    const RfEntry& e = _rf[(_rf_head - 1 - k + CD_RF_LOG) % CD_RF_LOG];
+    uint32_t age = (millis() - e.at) / 1000;
+    char a[8];
+    if (age < 100) snprintf(a, sizeof(a), "%2us", (unsigned)age);
+    else if (age < 6000) snprintf(a, sizeof(a), "%2um", (unsigned)(age / 60));
+    else strcpy(a, "old");
+    uint16_t col = (e.type == PAYLOAD_TYPE_TXT_MSG || e.type == PAYLOAD_TYPE_GRP_TXT) ? c_hi : c_fg;
+    textf(0, y, k == 0 ? c_hi : col, "%4s %-6s %-5s %3u %5.1f %4d %3u", a, payloadName(e.type), ROUTES[e.route & 3], e.hops,
+          e.snr4 / 4.0f, e.rssi, e.len);
+    y += ROW_H;
+  }
+  char foot[48];
+  snprintf(foot, sizeof(foot), "%u PACKETS HEARD   " G_LEFT G_RIGHT " TAB", (unsigned)_rf_total);
+  drawFooter(foot);
 }
 
 void UITask::drawSys() {
@@ -1168,41 +2399,54 @@ void UITask::drawSys() {
   textf(5 * CHAR_W, y, c_fg, "%-22.22s %02X%02X%02X%02X", _node_prefs->node_name, pk[0], pk[1], pk[2], pk[3]);
   y += ROW_H;
   text(0, y, c_dim, "RF");
-  textf(5 * CHAR_W, y, c_fg, "%.3f BW%.1f SF%u CR%u %ddB", _node_prefs->freq, _node_prefs->bw, _node_prefs->sf,
+  textf(5 * CHAR_W, y, c_fg, "%.3f BW%g SF%u CR%u %ddB", _node_prefs->freq, _node_prefs->bw, _node_prefs->sf,
         _node_prefs->cr, _node_prefs->tx_power_dbm);
   y += ROW_H;
   unsigned long up = millis() / 1000;
   text(0, y, c_dim, "PWR");
-  textf(5 * CHAR_W, y, c_fg, "%.2fV %d%%   UP %luh%02lum", getBattMilliVolts() / 1000.0f, battPercent(), up / 3600, (up / 60) % 60);
-  y += ROW_H;
-  text(0, y, c_dim, "LINK");
-  char ble[24];
-  if (isBluetoothEnabled()) snprintf(ble, sizeof(ble), "BLE %06u %s", (unsigned)the_mesh.getBLEPin(), hasConnection() ? "LINKED" : "IDLE");
+  char ble[16];
+  if (isBluetoothEnabled()) snprintf(ble, sizeof(ble), "BLE %06u", (unsigned)the_mesh.getBLEPin());
   else strcpy(ble, "BLE OFF");
-  textf(5 * CHAR_W, y, c_fg, "%-20s GPS %s", ble, getGPSState() ? "ON" : "OFF");
+  textf(5 * CHAR_W, y, c_fg, "%.2fV %d%% UP%luh%02lum %s", getBattMilliVolts() / 1000.0f, battPercent(), up / 3600, (up / 60) % 60, ble);
   y += ROW_H;
-  text(0, y, c_dim, "NET");
-  textf(5 * CHAR_W, y, c_fg, "%d NODES %d CHAN  SCOPE %s", _num_nodes, _num_chans,
-        _node_prefs->default_scope_name[0] ? _node_prefs->default_scope_name : "*");
+  text(0, y, c_dim, "MODE");
+  textf(5 * CHAR_W, y, c_fg, "RPT:%s MULE:%s CLK:%s", _node_prefs->isRepeatEn() ? "ON" : "OFF", _prefs.mule ? "ON" : "OFF",
+        _clock_src == CLK_NONE ? "?" : _clock_src == CLK_MESH ? "MESH" : "OK");
   y += ROW_H + 3;
   g.drawFastHLine(0, y - 2, SCR_W, c_dim);
 
   if (_console_len == 0) text(0, y, c_dim, "TYPE help FOR COMMANDS");
-  for (int i = 0; i < _console_len; i++) {
-    text(0, y + i * ROW_H, _console[i][0] == '>' ? c_dim : c_hi, _console[i]);
+  int first = _console_len - CD_CONSOLE_ROWS - _console_scroll;
+  if (first < 0) first = 0;
+  for (int r = 0; r < CD_CONSOLE_ROWS && first + r < _console_len; r++) {
+    const char* line = _console[first + r];
+    text(0, y + r * ROW_H, line[0] == '>' ? c_dim : c_hi, line);
+  }
+  if (_console_scroll > 0) {
+    char sc[12];
+    snprintf(sc, sizeof(sc), G_DOWN " +%d", _console_scroll);
+    stext(SCR_W - 3 - strlen(sc) * SMALL_W, y + 1, c_alert, sc);
   }
   drawInput(INPUT_Y, "root@deck:~#", _cmd_buf, _cmd_len);
-  drawFooter("TYPE A COMMAND   RET RUN   " G_LEFT G_RIGHT " TAB");
+  drawFooter("help FOR CMDS  RET RUN  " G_UP G_DOWN " SCROLL  " G_LEFT G_RIGHT " TAB");
 }
 
-void UITask::drawInput(int y, const char* prompt, const char* buf, int len) {
+void UITask::drawInput(int y, const char* prompt, const char* buf, int len, bool masked) {
   Adafruit_GFX& g = _display->gfx();
   g.drawRect(0, y - 2, SCR_W, ROW_H + 2, c_dim);
   text(2, y - 1, c_hi, prompt);
   int px = 2 + (strlen(prompt) + 1) * CHAR_W;
   int room = (SCR_W - px - 2) / CHAR_W - 1;
   const char* shown = (len > room) ? buf + (len - room) : buf;   // keep the end of long input visible
-  text(px, y - 1, c_fg, shown);
+  if (masked) {
+    char stars[CD_INPUT_MAX + 1];
+    int n = strlen(shown);
+    memset(stars, '*', n);
+    stars[n] = 0;
+    text(px, y - 1, c_fg, stars);
+  } else {
+    text(px, y - 1, c_fg, shown);
+  }
   if (_cursor_on) g.fillRect(px + strlen(shown) * CHAR_W, y, CHAR_W - 1, ROW_H - 3, c_fg);
 }
 
@@ -1210,8 +2454,10 @@ void UITask::drawChat() {
   Adafruit_GFX& g = _display->gfx();
 
   // title strip, where the tabs usually are
-  if (_conv_kind == CONV_CHANNEL) textf(0, TABS_Y, c_hi, "#%.30s", _conv_name);
-  else textf(0, TABS_Y, c_hi, "LINK // %.24s", _conv_name);
+  const Node* peer = (_conv_kind == CONV_DM) ? findNode(_conv_peer) : NULL;
+  bool room = peer && peer->type == ADV_TYPE_ROOM;
+  if (_conv_kind == CONV_CHANNEL) textf(0, TABS_Y, c_hi, "%.24s%s", _conv_name, isMuted(_conv_chan) ? " \x0E" : "");
+  else textf(0, TABS_Y, c_hi, room ? "ROOM // %.24s" : "LINK // %.24s", _conv_name);
   int unread_elsewhere = totalUnread();
   if (unread_elsewhere) {
     char u[16];
@@ -1267,6 +2513,7 @@ void UITask::drawChat() {
 
   if (n == 0) {
     text(4, BODY_Y + ROW_H, c_dim, _conv_kind == CONV_CHANNEL ? "NO TRAFFIC YET. SAY SOMETHING." : "LINK OPEN. NO MESSAGES YET.");
+    text(4, BODY_Y + 2 * ROW_H, c_dim, "/page TO RAISE THE ALARM.");
   }
 
   // each line re-derives its text from the message, so only a pointer and offsets were stored
@@ -1288,7 +2535,9 @@ void UITask::drawChat() {
     seg[len] = 0;
 
     uint16_t body_col = m->outgoing ? c_hi : c_fg;
-    if (m->status == ST_FAILED) body_col = c_alert;
+    if (m->status == ST_FAILED || (m->flags & MF_PAGE)) body_col = c_alert;
+    else if (m->flags & MF_KEYWORD) body_col = c_hi;
+    if (m->flags & MF_PAGE) _display->gfx().fillRect(0, y, 2, ROW_H, c_alert);
     if (L.start == 0) {
       // "time from:" prefix in its own colours
       int tlen = strlen(t), plen = tlen + 1 + strlen(m->from) + 1;
@@ -1309,12 +2558,17 @@ void UITask::drawChat() {
     bool last_line = li == 0 || lines[li - 1].m != m;
     int end_x = x + len * CHAR_W;
     if (m->outgoing && last_line) {
-      const char* mark = (m->status == ST_SENDING) ? " ..." : (m->status == ST_DELIVERED) ? " " G_CHECK
-                       : (m->status == ST_FAILED) ? " FAIL" : "";
+      char mark[16] = "";
+      if (m->status == ST_SENDING) strcpy(mark, " ...");
+      else if (m->status == ST_FAILED) strcpy(mark, " FAIL");
+      else if (m->status == ST_DELIVERED && m->rtt_ds) snprintf(mark, sizeof(mark), " " G_CHECK "%u.%us", m->rtt_ds / 10, m->rtt_ds % 10);
+      else if (m->status == ST_DELIVERED) strcpy(mark, " " G_CHECK);
+      if ((m->flags & MF_PAGE) && (m->flags & MF_ACKED)) strcat(mark, " ACK'D");
       if (end_x + (int)strlen(mark) * CHAR_W <= SCR_W) text(end_x, y, m->status == ST_FAILED ? c_alert : c_dim, mark);
+      else if (mark[0]) stext(SCR_W - 2 - strlen(mark) * SMALL_W, y + 5, c_dim, mark);
     } else if (!m->outgoing && last_line && m->hops != 0xFF) {
       char tag[16];
-      snprintf(tag, sizeof(tag), "%dh %+ddB", m->hops, m->snr4 / 4);
+      snprintf(tag, sizeof(tag), "%dh %+ddB", m->hops & 63, m->snr4 / 4);
       int tx = SCR_W - 2 - strlen(tag) * SMALL_W;
       if (end_x + SMALL_W <= tx) stext(tx, y + 5, c_dim, tag);
     }
@@ -1330,20 +2584,18 @@ void UITask::drawChat() {
   drawInput(INPUT_Y, prompt, _input_buf, _input_len);
   char hint[64];
   int max_len = CD_INPUT_MAX - (_conv_kind == CONV_CHANNEL ? strlen(_node_prefs->node_name) + 2 : 0);
-  snprintf(hint, sizeof(hint), "RET SEND  " G_UP G_DOWN " SCROLL  " G_LEFT " BACK  /help CMDS   %3d/%d", _input_len, max_len);
+  snprintf(hint, sizeof(hint), "RET SEND " G_UP G_DOWN " SCROLL " G_LEFT " BACK /help /page /sos %3d/%d", _input_len, max_len);
   drawFooter(hint);
 }
 
 void UITask::drawNode() {
-  int i;
-  for (i = 0; i < _num_nodes; i++) {
-    if (memcmp(_nodes[i].pub, _conv_peer, sizeof(_conv_peer)) == 0) break;
-  }
-  if (i == _num_nodes) { _screen = SCR_LIST; return; }
-  const Node& n = _nodes[i];
+  const Node* np = findNode(_conv_peer);
+  if (np == NULL) { _screen = SCR_LIST; return; }
+  const Node& n = *np;
+  Adafruit_GFX& g = _display->gfx();
 
   textf(0, TABS_Y, c_hi, "DOSSIER // [%s] %.22s", typeTag(n.type), n.name);
-  _display->gfx().drawFastHLine(0, TABS_Y + ROW_H + 1, SCR_W, c_dim);
+  g.drawFastHLine(0, TABS_Y + ROW_H + 1, SCR_W, c_dim);
   int y = BODY_Y;
 
   ContactInfo* c = the_mesh.lookupContactByPubKey(n.pub, sizeof(n.pub));
@@ -1356,7 +2608,7 @@ void UITask::drawNode() {
     text(7 * CHAR_W, y, c_fg, half);
     y += ROW_H;
     text(7 * CHAR_W, y, c_fg, &hex[32]);
-    y += ROW_H + 4;
+    y += ROW_H + 2;
   }
   char ago[8];
   fmtAgo(ago, n.lastmod);
@@ -1365,19 +2617,92 @@ void UITask::drawNode() {
   y += ROW_H;
   text(0, y, c_dim, "ROUTE");
   if (n.path_len == OUT_PATH_UNKNOWN) text(7 * CHAR_W, y, c_fg, "UNKNOWN // FLOODS");
-  else if (n.path_len == 0) text(7 * CHAR_W, y, c_fg, "DIRECT");
-  else textf(7 * CHAR_W, y, c_fg, "%d HOPS VIA REPEATERS", n.path_len);
+  else if ((n.path_len & 63) == 0) text(7 * CHAR_W, y, c_fg, "DIRECT");
+  else textf(7 * CHAR_W, y, c_fg, "%d HOPS VIA REPEATERS", n.path_len & 63);
   y += ROW_H;
   text(0, y, c_dim, "COORD");
   if (n.lat || n.lon) textf(7 * CHAR_W, y, c_fg, "%.5f %.5f", n.lat / 1e6, n.lon / 1e6);
   else text(7 * CHAR_W, y, c_fg, "NOT SHARED");
-  y += ROW_H + 8;
+  y += ROW_H + 4;
 
-  if (n.type == ADV_TYPE_REPEATER) text(0, y, c_dim, "REPEATER: ADMIN FROM THE PHONE APP.");
-  else if (n.type == ADV_TYPE_ROOM) text(0, y, c_dim, "ROOM: JOIN AND POST FROM THE APP.");
-  else if (n.type == ADV_TYPE_SENSOR) text(0, y, c_dim, "SENSOR: TELEMETRY FROM THE APP.");
+  // a repeater's own report, if we've asked for one
+  if (_status.valid && memcmp(_status.pub, n.pub, 6) == 0) {
+    const StatusInfo& s = _status;
+    textf(0, y, c_hi, "BATT %.2fV UP %lud%02luh Q%u", s.batt_mv / 1000.0f, (unsigned long)(s.up_secs / 86400),
+          (unsigned long)((s.up_secs / 3600) % 24), s.queue);
+    y += ROW_H;
+    textf(0, y, c_hi, "NF%d RSSI%d SNR%.1f AIR%lum", s.noise, s.rssi, s.snr4 / 4.0f, (unsigned long)(s.air_secs / 60));
+    y += ROW_H;
+    textf(0, y, c_hi, "RX %lu  TX %lu", (unsigned long)s.recv, (unsigned long)s.sent);
+    y += ROW_H;
+  } else if (n.type == ADV_TYPE_ROOM) {
+    text(0, y, c_dim, isLoggedIn(n.pub) ? "JOINED. RET TO OPEN THE ROOM." : "RET OR L TO LOG IN (BLANK = GUEST)");
+  } else if (n.type == ADV_TYPE_REPEATER) {
+    text(0, y, c_dim, "T FOR LIVE STATUS. L TO LOG IN.");
+  }
 
-  drawFooter("R RESET PATH   " G_LEFT " BACK");
+  if (_node_mode == NM_PASSWORD) {
+    drawInput(INPUT_Y, "PASSWORD:", _input_buf, _input_len, true);
+    drawFooter("RET LOGIN   ESC CANCEL");
+  } else if (_node_mode == NM_CONFIRM_DEL) {
+    text(0, INPUT_Y - 1, c_alert, "PRESS D AGAIN TO DELETE. ANY KEY: NO");
+    drawFooter("THIS FORGETS THE CONTACT AND ITS PATH");
+  } else if (n.type == ADV_TYPE_CHAT) {
+    drawFooter("RET CHAT  S SHARE  R RESET PATH  D DEL  " G_LEFT " BACK");
+  } else if (n.type == ADV_TYPE_REPEATER) {
+    drawFooter("T STATUS  L LOGIN  S SHARE  R PATH  D DEL  " G_LEFT);
+  } else {
+    drawFooter("RET/L LOGIN  S SHARE  R PATH  D DEL  " G_LEFT " BACK");
+  }
+}
+
+void UITask::drawPage() {
+  Adafruit_GFX& g = _display->gfx();
+  const Msg* m = findMsg(_page_seq);
+  bool flash = ((millis() / 400) % 2) == 0;
+  uint16_t bg = flash ? c_alert : c_bg, fg = flash ? c_bg : c_alert;
+
+  g.fillScreen(bg);
+  for (int k = 0; k < 4; k++) g.drawRect(k * 3, k * 3, SCR_W - k * 6, SCR_H - k * 6, fg);
+  bigText((SCR_W - 4 * CHAR_W * 4) / 2, 16, 4, fg, "PAGE");
+  if (m == NULL) return;
+
+  char from[48], when[12];
+  fmtTime(when, m->ts);
+  if (m->kind == CONV_CHANNEL) {
+    ChannelDetails cd;
+    char label[34] = "?";
+    if (the_mesh.getChannel(m->chan_idx, cd)) chanLabel(label, sizeof(label), cd.name);
+    snprintf(from, sizeof(from), "%s IN %s", m->from, label);
+  } else {
+    snprintf(from, sizeof(from), "FROM %s", m->from);
+  }
+  int w = strlen(from) * CHAR_W;
+  text((SCR_W - w) / 2, 92, fg, from);
+
+  // the message, minus the !PAGE marker, wrapped over a few lines
+  const char* body = m->text + strlen(CD_PAGE_PREFIX);
+  while (*body == ' ') body++;
+  if (!*body) body = "(NO MESSAGE)";
+  int y = 120;
+  const int cols = 36;
+  while (*body && y < 190) {
+    int len = strlen(body);
+    if (len > cols) {
+      len = cols;
+      for (int k = cols; k > cols / 2; k--) if (body[k] == ' ') { len = k; break; }
+    }
+    char line[cols + 1];
+    memcpy(line, body, len);
+    line[len] = 0;
+    text((SCR_W - len * CHAR_W) / 2, y, fg, line);
+    body += len;
+    while (*body == ' ') body++;
+    y += ROW_H;
+  }
+  char foot[40];
+  snprintf(foot, sizeof(foot), "%s  //  ANY KEY TO ACKNOWLEDGE", when);
+  stext((SCR_W - strlen(foot) * SMALL_W) / 2, SCR_H - 22, fg, foot);
 }
 
 void UITask::crtPass() {

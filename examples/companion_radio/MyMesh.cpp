@@ -289,6 +289,7 @@ uint8_t MyMesh::getExtraAckTransmitCount() const {
 }
 
 void MyMesh::logRxRaw(float snr, float rssi, const uint8_t raw[], int len) {
+  if (_listener) _listener->onRawRx(snr, rssi, raw, len);
   if (_serial->isConnected() && len + 3 <= MAX_FRAME_SIZE) {
     int i = 0;
     out_frame[i++] = PUSH_CODE_LOG_RX_DATA;
@@ -472,6 +473,9 @@ void MyMesh::queueMessage(const ContactInfo &from, uint8_t txt_type, mesh::Packe
     _serial->writeFrame(frame, 1);
   }
 
+  if (txt_type == TXT_TYPE_SIGNED_PLAIN && extra_len >= 4) memcpy(_last_signed_prefix, extra, 4);
+  else memset(_last_signed_prefix, 0, sizeof(_last_signed_prefix));
+
   if (_listener) {
     _listener->onMessageRecv(pkt, from, txt_type, sender_timestamp, text);
     _listener->onQueueSizeChanged(offline_queue_len);
@@ -481,6 +485,7 @@ void MyMesh::queueMessage(const ContactInfo &from, uint8_t txt_type, mesh::Packe
 bool MyMesh::filterRecvFloodPacket(mesh::Packet* packet) {
   // REVISIT: try to determine which Region (from transport_codes[1]) that Sender is indicating for replies/responses
   //    if unknown, fallback to finding Region from transport_codes[0], the 'scope' used by Sender
+  if (_listener) _listener->onFloodRecv(packet);
   return false;
 }
 
@@ -721,6 +726,7 @@ void MyMesh::onContactResponse(const ContactInfo &contact, const uint8_t *data, 
       i += 6; // pub_key_prefix
     }
     _serial->writeFrame(out_frame, i);
+    if (_listener) _listener->onLoginResult(contact, out_frame[0] == PUSH_CODE_LOGIN_SUCCESS, out_frame[1]);
   } else if (len > 4 && // check for status response
              pending_status &&
              memcmp(&pending_status, contact.id.pub_key, 4) == 0 // legacy matching scheme
@@ -736,6 +742,7 @@ void MyMesh::onContactResponse(const ContactInfo &contact, const uint8_t *data, 
     memcpy(&out_frame[i], &data[4], len - 4);
     i += (len - 4);
     _serial->writeFrame(out_frame, i);
+    if (_listener) _listener->onStatusRecv(contact, &data[4], len - 4);
   } else if (len > 4 && tag == pending_telemetry) {  // check for matching response tag
     pending_telemetry = 0;
 
@@ -2460,6 +2467,91 @@ bool MyMesh::advertFlood() {
   TransportKey default_scope;
   memcpy(&default_scope.key, _prefs.default_scope_key, sizeof(default_scope.key));
   sendFloodScoped(default_scope, pkt, 0);
+  return true;
+}
+
+bool MyMesh::uiSetChannel(int idx, const ChannelDetails& ch) {
+  if (!setChannel(idx, ch)) return false;
+  saveChannels();
+  return true;
+}
+
+bool MyMesh::uiRemoveContact(const uint8_t* pub_prefix) {
+  ContactInfo* c = lookupContactByPubKey(pub_prefix, 6);
+  if (c == NULL) return false;
+  uint8_t key[PUB_KEY_SIZE];
+  memcpy(key, c->id.pub_key, PUB_KEY_SIZE);
+  if (!removeContact(*c)) return false;
+  _store->deleteBlobByKey(key, PUB_KEY_SIZE);
+  dirty_contacts_expiry = futureMillis(LAZY_CONTACTS_WRITE_DELAY);
+  return true;
+}
+
+bool MyMesh::uiShareContact(const uint8_t* pub_prefix) {
+  ContactInfo* c = lookupContactByPubKey(pub_prefix, 6);
+  return c && shareContactZeroHop(*c);
+}
+
+int MyMesh::uiLogin(const uint8_t* pub_prefix, const char* password, uint32_t& est_timeout) {
+  ContactInfo* c = lookupContactByPubKey(pub_prefix, 6);
+  if (c == NULL) return MSG_SEND_FAILED;
+  int result = sendLogin(*c, password, est_timeout);
+  if (result != MSG_SEND_FAILED) {
+    clearPendingReqs();
+    memcpy(&pending_login, c->id.pub_key, 4);   // matched in onContactResponse()
+  }
+  return result;
+}
+
+int MyMesh::uiRequestStatus(const uint8_t* pub_prefix, uint32_t& est_timeout) {
+  ContactInfo* c = lookupContactByPubKey(pub_prefix, 6);
+  if (c == NULL) return MSG_SEND_FAILED;
+  uint32_t tag;
+  int result = sendRequest(*c, REQ_TYPE_GET_STATUS, tag, est_timeout);
+  if (result != MSG_SEND_FAILED) {
+    clearPendingReqs();
+    memcpy(&pending_status, c->id.pub_key, 4);   // legacy matching scheme, as for the app
+  }
+  return result;
+}
+
+bool MyMesh::uiSetRadio(float freq, float bw, uint8_t sf, uint8_t cr) {
+  if (freq < 150.0f || freq > 2500.0f || sf < 5 || sf > 12 || cr < 5 || cr > 8 || bw < 7.0f || bw > 500.0f) return false;
+  _prefs.freq = freq;
+  _prefs.bw = bw;
+  _prefs.sf = sf;
+  _prefs.cr = cr;
+  savePrefs();
+  radio_driver.setParams(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
+  return true;
+}
+
+bool MyMesh::uiSetTxPower(int8_t dbm) {
+  if (dbm < -9 || dbm > MAX_LORA_TX_POWER) return false;
+  _prefs.tx_power_dbm = dbm;
+  savePrefs();
+  radio_driver.setTxPower(_prefs.tx_power_dbm);
+  return true;
+}
+
+void MyMesh::uiSetRepeat(bool on) {
+  _prefs.setRepeatEn(on);
+  savePrefs();
+}
+
+bool MyMesh::uiReflood(const uint8_t* raw, uint8_t len, uint32_t delay_millis) {
+  mesh::Packet* pkt = obtainNewPacket();
+  if (pkt == NULL) return false;
+  if (!pkt->readFrom(raw, len)) {
+    releasePacket(pkt);
+    return false;
+  }
+  if (pkt->hasTransportCodes()) {
+    uint16_t codes[2] = { pkt->transport_codes[0], pkt->transport_codes[1] };
+    sendFlood(pkt, codes, delay_millis, _prefs.path_hash_mode + 1);
+  } else {
+    sendFlood(pkt, delay_millis, _prefs.path_hash_mode + 1);
+  }
   return true;
 }
 

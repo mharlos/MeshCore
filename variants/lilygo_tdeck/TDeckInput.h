@@ -56,4 +56,7 @@ public:
 
   // the next key or trackball step, or TKEY_NONE
   int read();
+
+  // keyboard backlight, 0 (off) - 255; needs keyboard firmware that supports it
+  void setBacklight(uint8_t level);
 };

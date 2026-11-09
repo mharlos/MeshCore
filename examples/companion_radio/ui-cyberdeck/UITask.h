@@ -2,8 +2,12 @@
 
 // MESHCORE//DECK - a standalone, keyboard-driven UI for the LilyGo T-Deck in the
 // style of a 90s movie cyberdeck. It sits on top of the stock companion radio, so
-// the phone app keeps working over BLE alongside it; nothing about how the node
-// talks to the mesh changes.
+// the phone app keeps working over BLE alongside it.
+//
+// Beyond plain messaging it adds: private/hashtag channel management, paging
+// (an alarm on the other deck until acknowledged), keyword alerts and tones,
+// persistent history, on-device radio settings, repeat and "mule"
+// (store-and-forward) modes, room server login, repeater status and an RF log.
 
 #include <MeshCore.h>
 #include <helpers/ui/DisplayDriver.h>
@@ -15,36 +19,50 @@
 #include "../NodePrefs.h"
 #include <CyberDeckDisplay.h>
 #include <TDeckInput.h>
+#include <TDeckAudio.h>
 
 #ifndef CD_MAX_MSGS
-  #define CD_MAX_MSGS        256    // message history kept in PSRAM, across all conversations
+  #define CD_MAX_MSGS        256    // message history, across all conversations
 #endif
 #ifndef CD_PENDING_SENDS
   #define CD_PENDING_SENDS     8    // direct messages awaiting an ACK
 #endif
 #define CD_INPUT_MAX          MAX_TEXT_LEN
-#define CD_CONSOLE_LINES      5
+#define CD_CONSOLE_LINES      32    // console scrollback
+#define CD_CONSOLE_ROWS        6    // console lines on screen
+#define CD_RF_LOG             48
+#define CD_MULE_SLOTS         24
+#define CD_NEIGHBOURS         16
+#define CD_KEYWORDS            4
+#define CD_ROOM_LOGINS         8
+#define CD_PAGE_PREFIX     "!PAGE"
+#define CD_PAGE_ACK        "!PAGE-ACK"
 
 class UITask : public AbstractUITask {
 public:
   enum ConvKind : uint8_t { CONV_NONE = 0, CONV_CHANNEL, CONV_DM };
 
 private:
-  enum Screen : uint8_t { SCR_BOOT, SCR_LIST, SCR_CHAT, SCR_NODE };
-  enum Tab : uint8_t { TAB_CHAN = 0, TAB_NODES, TAB_HEARD, TAB_SYS, TAB_COUNT };
+  enum Screen : uint8_t { SCR_BOOT, SCR_LIST, SCR_CHAT, SCR_NODE, SCR_PAGE };
+  enum Tab : uint8_t { TAB_CHAN = 0, TAB_NODES, TAB_HEARD, TAB_RF, TAB_SYS, TAB_COUNT };
   enum MsgStatus : uint8_t { ST_NONE = 0, ST_SENDING, ST_DELIVERED, ST_FAILED, ST_SENT };
+  enum MsgFlags : uint8_t { MF_PAGE = 1, MF_KEYWORD = 2, MF_ROOM = 4, MF_ACKED = 8 };
+  enum NodeMode : uint8_t { NM_VIEW = 0, NM_PASSWORD, NM_CONFIRM_DEL };
+  enum ClockSrc : uint8_t { CLK_NONE = 0, CLK_MESH, CLK_SET };
 
   struct Msg {
     uint32_t seq;          // 0 = empty slot
     uint32_t ts;           // our clock
     uint8_t  kind;         // ConvKind
     uint8_t  chan_idx;
-    uint8_t  peer[6];      // pub key prefix, for DMs
+    uint8_t  peer[6];      // pub key prefix, for DMs and rooms
     uint8_t  outgoing;
     uint8_t  unread;
     uint8_t  status;       // MsgStatus, outgoing only
     uint8_t  hops;         // 0xFF = direct
     int8_t   snr4;
+    uint8_t  flags;        // MsgFlags
+    uint16_t rtt_ds;       // round trip to the ACK, tenths of a second
     char     from[32];
     char     text[CD_INPUT_MAX + 1];
   };
@@ -53,7 +71,7 @@ private:
     uint32_t seq;          // the Msg being delivered, 0 = free
     uint32_t ack;
     uint32_t msg_ts;
-    unsigned long timeout_at;
+    unsigned long timeout_at, first_sent;
     uint8_t  attempt;
   };
 
@@ -72,15 +90,50 @@ private:
     uint8_t crt;
     uint8_t dim_secs;      // 0 = never
     uint8_t ball;          // trackball sensitivity 1-5
+    uint8_t beep;          // BEEP_* bits
+    uint8_t volume;        // 0-10
+    uint8_t kbl;           // keyboard backlight 0-255
+    uint8_t mule;          // store-and-forward
+    uint8_t history;       // keep messages across reboots
+    uint8_t reserved[6];
+    uint64_t muted;        // channel slots that don't beep
+    char keywords[CD_KEYWORDS][16];
+  };
+
+  struct RfEntry {
+    uint32_t at;           // millis
+    uint8_t  type, route, hops, len;
+    int8_t   snr4;
+    int16_t  rssi;
+  };
+
+  struct MuleEntry {
+    uint8_t  hash[MAX_HASH_SIZE];
+    uint32_t heard;        // millis
+    uint8_t  sends;
+    uint8_t  len;
+    uint8_t  raw[MAX_TRANS_UNIT + 1];
+  };
+
+  struct Neighbour { uint8_t hash; uint32_t last; };
+
+  struct StatusInfo {      // a repeater's answer to a status request
+    uint8_t  pub[6];
+    uint32_t at;
+    uint16_t batt_mv, queue;
+    int16_t  noise, rssi, snr4;
+    uint32_t recv, sent, air_secs, up_secs, flood_tx, direct_tx, flood_rx, direct_rx;
+    bool     valid;
   };
 
   CyberDeckDisplay* _display;
   SensorManager* _sensors;
   NodePrefs* _node_prefs;
   TDeckInput _input;
+  TDeckAudio _audio;
   Prefs _prefs;
 
-  Screen _screen;
+  Screen _screen, _page_return;
   Tab _tab;
   int _sel[TAB_COUNT];
   int _scroll;              // chat scrollback, in lines from the bottom
@@ -90,17 +143,20 @@ private:
   uint8_t _conv_peer[6];
   char _conv_name[32];
 
+  NodeMode _node_mode;
   char _input_buf[CD_INPUT_MAX + 1];
   int  _input_len;
-  char _cmd_buf[64];
+  char _cmd_buf[96];
   int  _cmd_len;
-  char _console[CD_CONSOLE_LINES][54];
-  int  _console_len;
+  char _console[CD_CONSOLE_LINES][48];
+  int  _console_len, _console_scroll;
+  char _last_cmd[96];
 
   Msg* _msgs;
   int _max_msgs;
   uint32_t _next_seq;
   Pending _pending[CD_PENDING_SENDS];
+  bool _hist_ok;
 
   Node* _nodes;
   int _num_nodes;
@@ -109,6 +165,30 @@ private:
 
   int _chan_idx[MAX_GROUP_CHANNELS];   // valid channel slots, in order
   int _num_chans;
+
+  RfEntry* _rf;
+  int _rf_head, _rf_count;
+  uint32_t _rf_total;
+
+  MuleEntry* _mule;
+  Neighbour _neigh[CD_NEIGHBOURS];
+  unsigned long _mule_last_flush;
+  uint32_t _mule_relayed;
+
+  uint8_t _logged_in[CD_ROOM_LOGINS][6];
+  int _num_logged_in;
+  uint8_t _login_pending[6];
+  unsigned long _login_timeout;
+  StatusInfo _status;
+  unsigned long _status_timeout;
+
+  ClockSrc _clock_src;
+  uint32_t _clk_cand_ts, _clk_cand_ms, _clk_last_rtc, _clk_last_ms;
+  uint8_t  _clk_cand_from[4];
+
+  uint32_t _page_seq;       // the page on screen
+  unsigned long _page_next_tone, _page_started;
+  bool _kbl_flash;
 
   unsigned long _boot_started;
   unsigned long _next_render, _last_render, _next_blink, _auto_off, _glitch_until, _alert_until;
@@ -123,6 +203,11 @@ private:
   void loadPrefs();
   void savePrefs();
 
+  // history
+  void loadHistory();
+  void saveMsg(const Msg* m);
+  void wipeHistory();
+
   void refreshNodes();
   void refreshChannels();
   Msg* addMsg(ConvKind kind, uint8_t chan, const uint8_t* peer, const char* from, const char* text, bool outgoing);
@@ -131,12 +216,34 @@ private:
   int  totalUnread() const;
   void markRead(ConvKind kind, uint8_t chan, const uint8_t* peer);
   bool msgInConv(const Msg& m, ConvKind kind, uint8_t chan, const uint8_t* peer) const;
+  const Node* findNode(const uint8_t* pub) const;
 
   void openChannel(int list_pos);
   void openNode(const uint8_t* pub);
+  void openChat(const uint8_t* pub);
   void sendInput();
+  bool sendText(const char* text, uint8_t flags = 0);   // to the open conversation
   bool sendDirect(int slot, uint8_t attempt);
   void checkPending();
+
+  // features
+  int  addChannel(const char* name, const uint8_t* secret);
+  void showChannelKey(int idx);
+  bool parseKey(const char* s, uint8_t* secret);
+  bool isMuted(int chan) const { return chan < 64 && (_prefs.muted >> chan) & 1; }
+  bool matchesKeyword(const char* text) const;
+  void startPage(Msg* m);
+  void ackPage();
+  void syncClockFrom(uint32_t their_ts, const uint8_t* from);
+  void watchClock();
+  void setClock(uint32_t epoch, ClockSrc src);
+  bool clockValid() const { return _clock_src != CLK_NONE; }
+  void muleStore(const mesh::Packet* pkt);
+  void muleNeighbour(uint8_t hash);
+  int  muleFlush(bool forced);
+  int  muleCount() const;
+  bool isLoggedIn(const uint8_t* pub) const;
+  void beep(const Tone* t);
 
   void runCommand(const char* cmd);
   void consolePrint(const char* fmt, ...);
@@ -145,7 +252,11 @@ private:
   void handleKey(int key);
   void handleListKey(int key);
   void handleChatKey(int key);
+  void handleNodeKey(int key);
   void wake();
+#ifdef CD_SERIAL_BRIDGE
+  void serialBridge();
+#endif
 
   // drawing
   void render();
@@ -155,12 +266,15 @@ private:
   void drawFooter(const char* hint);
   void drawChanList();
   void drawNodeList(bool recent);
+  void drawRf();
   void drawSys();
   void drawChat();
   void drawNode();
-  void drawInput(int y, const char* prompt, const char* buf, int len);
+  void drawPage();
+  void drawInput(int y, const char* prompt, const char* buf, int len, bool masked = false);
   void text(int x, int y, uint16_t col, const char* s);      // 8x16
   void textf(int x, int y, uint16_t col, const char* fmt, ...);
+  void bigText(int x, int y, int scale, uint16_t col, const char* s);
   void stext(int x, int y, uint16_t col, const char* s);     // 6x8
   void crtPass();
   void glitchPass();
@@ -185,6 +299,10 @@ public:
   void onQueueSizeChanged(int offline_queue_size) override;
   void onDiscoveredContact(ContactInfo &contact, bool is_new, uint8_t path_len, const uint8_t* path) override;
   void onACKRecv(uint32_t ack_crc) override;
+  void onLoginResult(const ContactInfo &contact, bool ok, uint8_t permissions) override;
+  void onStatusRecv(const ContactInfo &contact, const uint8_t *data, uint8_t len) override;
+  void onFloodRecv(const mesh::Packet *pkt) override;
+  void onRawRx(float snr, float rssi, const uint8_t raw[], int len) override;
 
   // AbstractUITask
   void notify(UIEventType t = UIEventType::none) override;

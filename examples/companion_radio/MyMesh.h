@@ -105,6 +105,11 @@ public:
       virtual void onTraceRecv(mesh::Packet *pkt, uint32_t tag, uint32_t auth_code, uint8_t flags,
                                const uint8_t *path_snrs, const uint8_t *path_hashes, uint8_t path_len) { }
       virtual void onRawDataRecv(mesh::Packet *pkt) { }
+      // for an on-device UI
+      virtual void onLoginResult(const ContactInfo &contact, bool ok, uint8_t permissions) { }
+      virtual void onStatusRecv(const ContactInfo &contact, const uint8_t *data, uint8_t len) { }
+      virtual void onFloodRecv(const mesh::Packet *pkt) { }   // every flood packet heard, before de-duplication
+      virtual void onRawRx(float snr, float rssi, const uint8_t raw[], int len) { }   // everything the radio decodes
       virtual ~Listener() { }
   };
 
@@ -126,6 +131,19 @@ public:
   void enterCLIRescue();
 
   int  getRecentlyHeard(AdvertPath dest[], int max_num);
+
+  // ---- for an on-device UI: the same operations the phone app has, without a frame round-trip ----
+  bool uiSetChannel(int idx, const ChannelDetails& ch);   // an empty name deletes the channel
+  bool uiRemoveContact(const uint8_t* pub_prefix);
+  bool uiShareContact(const uint8_t* pub_prefix);
+  int  uiLogin(const uint8_t* pub_prefix, const char* password, uint32_t& est_timeout);
+  int  uiRequestStatus(const uint8_t* pub_prefix, uint32_t& est_timeout);
+  bool uiSetRadio(float freq, float bw, uint8_t sf, uint8_t cr);
+  bool uiSetTxPower(int8_t dbm);
+  void uiSetRepeat(bool on);
+  bool uiRepeatFreqAllowed() const { return isValidClientRepeatFreq((uint32_t)(_prefs.freq * 1000)); }
+  bool uiReflood(const uint8_t* raw, uint8_t len, uint32_t delay_millis);   // re-send a stored flood packet
+  const uint8_t* uiLastSignedPrefix() const { return _last_signed_prefix; }   // author of the last room post
 
 protected:
   float getAirtimeBudgetFactor() const override;
@@ -244,6 +262,7 @@ private:
   NodePrefs _prefs;
   uint32_t pending_login;
   uint32_t pending_status;
+  uint8_t _last_signed_prefix[4];
   uint32_t pending_telemetry, pending_discovery;   // pending _TELEMETRY_REQ
   uint32_t pending_req;   // pending _BINARY_REQ
   BaseSerialInterface *_serial;
