@@ -77,6 +77,16 @@ def main():
                     time.sleep(0.02)
             s.flush()
             time.sleep(0.15)
+    elif cmd == "sd":
+        s.reset_input_buffer()
+        s.write(b"\x12")
+        end = time.time() + 120
+        buf = b""
+        while time.time() < end and b"#END" not in buf and b"#SD none" not in buf:
+            buf += s.read(4096)
+        text = buf.decode("utf-8", "replace")
+        start = text.find("#SD")
+        print(text[start:] if start >= 0 else text)
     elif cmd == "log":
         end = time.time() + float(args[0] if args else 10)
         while time.time() < end:

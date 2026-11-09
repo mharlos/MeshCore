@@ -35,6 +35,8 @@
 #define CD_NEIGHBOURS         16
 #define CD_KEYWORDS            4
 #define CD_ROOM_LOGINS         8
+#define CD_TILE_CACHE         16    // decoded map tiles, 128KB each in PSRAM
+#define CD_CRUMBS           4096    // breadcrumb trail points kept in RAM
 #define CD_PAGE_PREFIX     "!PAGE"
 #define CD_PAGE_ACK        "!PAGE-ACK"
 
@@ -43,8 +45,9 @@ public:
   enum ConvKind : uint8_t { CONV_NONE = 0, CONV_CHANNEL, CONV_DM };
 
 private:
-  enum Screen : uint8_t { SCR_BOOT, SCR_LIST, SCR_CHAT, SCR_NODE, SCR_PAGE };
-  enum Tab : uint8_t { TAB_CHAN = 0, TAB_NODES, TAB_HEARD, TAB_RF, TAB_SYS, TAB_COUNT };
+  enum Screen : uint8_t { SCR_BOOT, SCR_LIST, SCR_CHAT, SCR_NODE, SCR_PAGE, SCR_GPS };
+  enum Tab : uint8_t { TAB_CHAN = 0, TAB_NODES, TAB_HEARD, TAB_MAP, TAB_RF, TAB_SYS, TAB_COUNT };
+  enum MapStyle : uint8_t { MS_COLOR = 0, MS_NIGHT, MS_PHOSPHOR, MS_COUNT };
   enum MsgStatus : uint8_t { ST_NONE = 0, ST_SENDING, ST_DELIVERED, ST_FAILED, ST_SENT };
   enum MsgFlags : uint8_t { MF_PAGE = 1, MF_KEYWORD = 2, MF_ROOM = 4, MF_ACKED = 8 };
   enum NodeMode : uint8_t { NM_VIEW = 0, NM_PASSWORD, NM_CONFIRM_DEL };
@@ -95,7 +98,10 @@ private:
     uint8_t kbl;           // keyboard backlight 0-255
     uint8_t mule;          // store-and-forward
     uint8_t history;       // keep messages across reboots
-    uint8_t reserved[6];
+    uint8_t map_style;     // MapStyle
+    uint8_t crumb_off;     // 1 = don't record breadcrumbs
+    uint8_t map_nolabels;  // 1 = no node names on the map
+    uint8_t reserved[3];
     uint64_t muted;        // channel slots that don't beep
     char keywords[CD_KEYWORDS][16];
   };
@@ -116,6 +122,17 @@ private:
   };
 
   struct Neighbour { uint8_t hash; uint32_t last; };
+
+  struct Tile {            // a decoded 256x256 map tile, in PSRAM
+    int8_t   z;
+    uint8_t  state;        // 0 empty, 1 loaded, 2 not on the card
+    uint8_t  style;
+    int32_t  x, y;
+    uint32_t used;         // LRU stamp
+    uint16_t* px;
+  };
+
+  struct Crumb { int32_t lat, lon; uint32_t ts; };   // micro-degrees, our clock
 
   struct StatusInfo {      // a repeater's answer to a status request
     uint8_t  pub[6];
@@ -157,6 +174,37 @@ private:
   uint32_t _next_seq;
   Pending _pending[CD_PENDING_SENDS];
   bool _hist_ok;
+  bool _sd_ok;
+  bool sdBegin();
+
+  // map
+  Tile _tiles[CD_TILE_CACHE];
+  uint32_t _tile_clock;
+  uint8_t* _png_buf;        // one tile's file
+  void* _png;               // PNGdec decoder, kept off the stack
+  void* _jpeg;              // JPEGDEC decoder
+  int _map_zmin, _map_zmax; // zoom levels on the card, -1 if none
+  int _map_z;
+  double _map_lat, _map_lon;   // view centre
+  bool _map_follow, _map_pan, _map_inited;
+  int _map_node_sel;        // into _nodes, -1 = none
+  double _home_lat, _home_lon;
+  Crumb* _crumbs;
+  int _crumb_head, _crumb_count;
+  unsigned long _crumb_check;
+  bool _gps_fix_seen;
+
+  void mapInit();
+  Tile* getTile(int z, int32_t x, int32_t y);
+  bool loadTile(Tile& t);
+  void clearTiles();
+  bool myPosition(double& lat, double& lon);
+  void recordCrumb();
+  void loadCrumbs();
+  void clearCrumbs();
+  bool handleMapKey(int key);   // true if the map used the key
+  void drawMap();
+  void drawGps();
 
   Node* _nodes;
   int _num_nodes;

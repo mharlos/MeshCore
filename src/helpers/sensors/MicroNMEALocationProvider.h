@@ -88,7 +88,22 @@ class MicroNMEALocationProvider : public LocationProvider {
         }
     }
 
+#ifdef NMEA_KEEP_RECENT
+    // the last few good sentences, for a UI that shows the raw feed
+    char _recent[NMEA_KEEP_RECENT][84];
+    uint8_t _recent_head = 0;
+    uint32_t _recent_total = 0;
+#endif
+
 public :
+#ifdef NMEA_KEEP_RECENT
+    const MicroNMEA& nmeaState() const { return nmea; }
+    uint32_t sentencesSeen() const { return _recent_total; }
+    const char* recentSentence(int age) const {   // 0 = newest
+        if (age < 0 || age >= NMEA_KEEP_RECENT || (uint32_t)age >= _recent_total) return NULL;
+        return _recent[(_recent_head + NMEA_KEEP_RECENT - 1 - age) % NMEA_KEEP_RECENT];
+    }
+#endif
     MicroNMEALocationProvider(Stream& ser, mesh::RTCClock* clock = NULL, int pin_reset = GPS_RESET, int pin_en = GPS_EN,RefCountedDigitalPin* peripher_power=NULL) :
     nmea(_nmeaBuffer, sizeof(_nmeaBuffer)), _clock(clock), _gps_serial(&ser), _peripher_power(peripher_power), _pin_reset(pin_reset), _pin_en(pin_en) {
         if (_pin_reset != -1) {
@@ -216,6 +231,12 @@ public :
             if ((c == '\0' || c == '\r' || c == '\n') && nmea.getSentence()[0] != '\0') {
                 if (MicroNMEA::testChecksum(nmea.getSentence())) {
                     _nmea_checksum_ok++;
+#ifdef NMEA_KEEP_RECENT
+                    strncpy(_recent[_recent_head], nmea.getSentence(), sizeof(_recent[0]) - 1);
+                    _recent[_recent_head][sizeof(_recent[0]) - 1] = 0;
+                    _recent_head = (_recent_head + 1) % NMEA_KEEP_RECENT;
+                    _recent_total++;
+#endif
                     _last_nmea_ms = millis();
                     _nmea_seen = true;
 

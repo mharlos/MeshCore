@@ -1,5 +1,6 @@
 #include "UITask.h"
 #include <SPIFFS.h>
+#include <SD.h>
 #include <stdarg.h>
 #include <esp_system.h>
 #include <helpers/TxtDataHelpers.h>
@@ -92,7 +93,7 @@ static const RadioPreset PRESETS[] = {
 };
 #define NUM_PRESETS  (sizeof(PRESETS) / sizeof(PRESETS[0]))
 
-static const char* TAB_NAMES[] = { "CHAN", "NODES", "HEARD", "RF", "SYS" };
+static const char* TAB_NAMES[] = { "CHAN", "NODES", "HEARD", "MAP", "RF", "SYS" };
 
 static AdvertPath heard[16];
 static int num_heard = 0;
@@ -192,6 +193,7 @@ UITask::UITask(mesh::MainBoard* board, MultiSerialInterface* serial) : AbstractU
   _num_nodes = _num_chans = 0;
   _next_seq = 1;
   _hist_ok = false;
+  _sd_ok = false;
   memset(_pending, 0, sizeof(_pending));
   memset(_sel, 0, sizeof(_sel));
   memset(_neigh, 0, sizeof(_neigh));
@@ -224,6 +226,21 @@ UITask::UITask(mesh::MainBoard* board, MultiSerialInterface* serial) : AbstractU
   memset(_clk_cand_from, 0, sizeof(_clk_cand_from));
   _page_seq = 0;
   _page_next_tone = _page_started = 0;
+  memset(_tiles, 0, sizeof(_tiles));
+  _tile_clock = 0;
+  _png_buf = NULL;
+  _png = NULL;
+  _jpeg = NULL;
+  _map_zmin = _map_zmax = -1;
+  _map_z = 12;
+  _map_lat = _map_lon = _home_lat = _home_lon = 0;
+  _map_follow = true;
+  _map_pan = _map_inited = false;
+  _map_node_sel = -1;
+  _crumbs = NULL;
+  _crumb_head = _crumb_count = 0;
+  _crumb_check = 0;
+  _gps_fix_seen = false;
   _kbl_flash = false;
   _boot_started = _next_render = _next_blink = _auto_off = _glitch_until = _alert_until = _last_render = _nodes_refresh_at = 0;
 }
@@ -246,6 +263,8 @@ void UITask::begin(DisplayDriver* display, SensorManager* sensors, NodePrefs* no
 
   user_btn.begin();
   _input.begin();
+  sdBegin();
+  loadCrumbs();
   loadPrefs();
   _input.setSensitivity(_prefs.ball);
   _audio.begin();
@@ -268,6 +287,74 @@ void UITask::begin(DisplayDriver* display, SensorManager* sensors, NodePrefs* no
   if (_display) _display->turnOn();
   beep(Tones::BOOT);
 }
+
+/* --------------------------------------- SD card --------------------------------------- */
+// The card shares the display/LoRa bus (SCK 40, MISO 38, MOSI 41); only its select differs.
+
+#ifndef PIN_SD_CS
+  #define PIN_SD_CS  39
+#endif
+static SPIClass sd_spi(HSPI);
+
+bool UITask::sdBegin() {
+  pinMode(PIN_SD_CS, OUTPUT);
+  digitalWrite(PIN_SD_CS, HIGH);
+  pinMode(PIN_TFT_CS, OUTPUT);
+  digitalWrite(PIN_TFT_CS, HIGH);   // keep the others off the bus while the card wakes
+  pinMode(P_LORA_NSS, OUTPUT);
+  digitalWrite(P_LORA_NSS, HIGH);
+  sd_spi.begin(P_LORA_SCLK, P_LORA_MISO, P_LORA_MOSI);
+  _sd_ok = SD.begin(PIN_SD_CS, sd_spi, 20000000) && SD.cardType() != CARD_NONE;
+  return _sd_ok;
+}
+
+#ifdef CD_SERIAL_BRIDGE
+// Summarise a directory tree: files per folder, sizes, a few names. Folders with many
+// sub-folders (map tiles: z/x/y) only have a couple of them opened, to keep it short.
+static void sdWalk(const char* path, int depth, int& lines) {
+  if (lines > 400) return;
+  File dir = SD.open(path);
+  if (!dir || !dir.isDirectory()) return;
+
+  int files = 0, dirs = 0;
+  uint64_t bytes = 0;
+  char samples[3][40];
+  int nsamp = 0;
+  char subs[3][96];
+  int nsub = 0;
+  char last_sub[96] = "";
+  for (File f = dir.openNextFile(); f; f = dir.openNextFile()) {
+    const char* name = f.name();
+    const char* base = strrchr(name, '/') ? strrchr(name, '/') + 1 : name;
+    if (f.isDirectory()) {
+      dirs++;
+      char sub[96];
+      snprintf(sub, sizeof(sub), "%s%s%s", path, strcmp(path, "/") == 0 ? "" : "/", base);
+      if (nsub < 2) strcpy(subs[nsub++], sub);
+      else strcpy(last_sub, sub);
+    } else {
+      files++;
+      bytes += f.size();
+      if (nsamp < 3) snprintf(samples[nsamp++], sizeof(samples[0]), "%s(%u)", base, (unsigned)f.size());
+    }
+    f.close();
+    if (files + dirs > 20000) break;
+  }
+  dir.close();
+
+  Serial.printf("%*s%s  dirs=%d files=%d size=%lluKB", depth * 2, "", path, dirs, files, (unsigned long long)(bytes / 1024));
+  for (int i = 0; i < nsamp; i++) Serial.printf(" %s", samples[i]);
+  Serial.println();
+  lines++;
+
+  if (depth >= 6) return;
+  for (int i = 0; i < nsub; i++) sdWalk(subs[i], depth + 1, lines);
+  if (dirs > 2 && last_sub[0]) {
+    if (dirs > 3) { Serial.printf("%*s... %d more dirs ...\n", (depth + 1) * 2, "", dirs - 3); lines++; }
+    sdWalk(last_sub, depth + 1, lines);
+  }
+}
+#endif
 
 /* ---------------------------------------- prefs ---------------------------------------- */
 
@@ -1198,6 +1285,11 @@ void UITask::handleKey(int key) {
     case SCR_LIST: handleListKey(key); break;
     case SCR_CHAT: handleChatKey(key); break;
     case SCR_NODE: handleNodeKey(key); break;
+    case SCR_GPS:
+      if (key == TKEY_ESC || key == TKEY_BACKSPACE || key == TKEY_LEFT || key == TKEY_CLICK || key == TKEY_ENTER || key == 'g' || key == 'G') {
+        _screen = SCR_LIST;
+      }
+      break;
     default: break;
   }
   _dirty = true;
@@ -1298,6 +1390,8 @@ void UITask::handleNodeKey(int key) {
 void UITask::handleListKey(int key) {
   int count = (_tab == TAB_CHAN) ? _num_chans : (_tab == TAB_NODES) ? _num_nodes : (_tab == TAB_HEARD) ? num_heard : 0;
   int& sel = _sel[_tab];
+
+  if (_tab == TAB_MAP && handleMapKey(key)) return;
 
   if (_tab == TAB_SYS) {   // the SYS tab is a command console
     if (key == TKEY_LEFT) { _tab = TAB_RF; return; }
@@ -1461,6 +1555,9 @@ void UITask::runCommand(const char* line) {
       consolePrint("clock  tz <h>  name <handle>");
       consolePrint("ble on|off  gps on|off  pos");
       consolePrint("pin <6 digits>|random  BLE PAIRING PIN");
+      consolePrint("crumbs on|off|clear  sd");
+      consolePrint("MAP: " G_UP G_DOWN " ZOOM CLICK PAN C ME N/P NODE");
+      consolePrint("     G GPS  S STYLE  B TRAIL  L LABELS");
       consolePrint("/loc  SEND YOUR POSITION");
       consolePrint("NODE PAGE: L LOGIN T STATUS S SHARE");
       consolePrint("           R RESET PATH  D DELETE");
@@ -1753,6 +1850,19 @@ void UITask::runCommand(const char* line) {
     else if (!getGPSState()) consolePrint("GPS OFF // gps on");
     else if (!lp->isValid()) consolePrint("NO FIX // %ld SATS", lp->satellitesCount());
     else consolePrint("%.5f,%.5f %ld SATS", lp->getLatitude() / 1e6, lp->getLongitude() / 1e6, lp->satellitesCount());
+  } else if (strcmp(cmd, "crumbs") == 0) {
+    if (argOn(argl)) { _prefs.crumb_off = 0; savePrefs(); }
+    else if (argOff(argl)) { _prefs.crumb_off = 1; savePrefs(); }
+    else if (strcmp(argl, "clear") == 0) { clearCrumbs(); consolePrint("TRAIL CLEARED"); }
+    consolePrint("TRAIL %s // %d POINTS%s", _prefs.crumb_off ? "PAUSED" : "RECORDING", _crumb_count, _sd_ok ? " (SAVED TO SD)" : "");
+  } else if (strcmp(cmd, "sd") == 0) {
+    if (!_sd_ok) sdBegin();
+    if (!_sd_ok) consolePrint("NO SD CARD");
+    else {
+      if (!_map_inited) mapInit();
+      if (_map_zmax >= 0) consolePrint("SD %.1fGB // MAP ZOOM %d-%d", SD.cardSize() / 1073741824.0, _map_zmin, _map_zmax);
+      else consolePrint("SD %.1fGB // NO /maps FOLDER", SD.cardSize() / 1073741824.0);
+    }
   } else if (strcmp(cmd, "pin") == 0) {
     // stored like the app's "set device PIN": 0 = a fresh random PIN every boot
     bool changed = false;
@@ -1929,6 +2039,15 @@ void UITask::serialBridge() {
         _cmd_buf[0] = 0;
         _dirty = true;
         break;
+      case 0x12: {   // walk the SD card
+        if (!_sd_ok) sdBegin();
+        if (!_sd_ok) { Serial.println("\n#SD none"); break; }
+        Serial.printf("\n#SD type=%d size=%lluMB used=%lluMB\n", SD.cardType(), SD.cardSize() >> 20, SD.usedBytes() >> 20);
+        int lines = 0;
+        sdWalk("/", 0, lines);
+        Serial.println("#END");
+        break;
+      }
       case 0x10: {   // pretend a page just arrived, to see the pager without a second deck
         static const uint8_t nobody[6] = { 0 };
         Msg* m = addMsg(CONV_DM, 0, nobody, "TEST", CD_PAGE_PREFIX " gate left open at north paddock", false);
@@ -1979,6 +2098,11 @@ void UITask::loop() {
   }
 
   if ((now - _clk_last_ms) >= 1000) watchClock();
+  if ((long)(now - _crumb_check) >= 0) {   // breadcrumbs, and keep the map and GPS page live
+    _crumb_check = now + 1000;
+    recordCrumb();
+    if ((_screen == SCR_LIST && _tab == TAB_MAP) || _screen == SCR_GPS) _dirty = true;
+  }
 
   if (_display->isOn() && _prefs.dim_secs && _screen != SCR_BOOT && _screen != SCR_PAGE && (long)(now - _auto_off) >= 0) {
     _display->turnOff();
@@ -2113,11 +2237,13 @@ void UITask::render() {
         if (_tab == TAB_CHAN) drawChanList();
         else if (_tab == TAB_NODES) drawNodeList(false);
         else if (_tab == TAB_HEARD) drawNodeList(true);
+        else if (_tab == TAB_MAP) drawMap();
         else if (_tab == TAB_RF) drawRf();
         else drawSys();
         break;
       case SCR_CHAT: drawChat(); break;
       case SCR_NODE: drawNode(); break;
+      case SCR_GPS: drawGps(); break;
       default: break;
     }
 
