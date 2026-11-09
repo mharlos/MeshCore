@@ -2539,6 +2539,24 @@ void MyMesh::uiSetRepeat(bool on) {
   savePrefs();
 }
 
+void MyMesh::uiSetDefaultScope(const char* region) {
+  if (region[0] == '#') region++;
+  if (region[0] == 0 || strlen(region) >= sizeof(_prefs.default_scope_name)) {
+    memset(_prefs.default_scope_name, 0, sizeof(_prefs.default_scope_name));
+    memset(_prefs.default_scope_key, 0, sizeof(_prefs.default_scope_key));
+  } else {
+    // repeaters derive a plain region name's key as sha256("#name"), see RegionMap::getTransportKeysFor()
+    char tmp[sizeof(_prefs.default_scope_name) + 1];
+    snprintf(tmp, sizeof(tmp), "#%s", region);
+    TransportKeyStore temp;
+    TransportKey key;
+    temp.getAutoKeyFor(0, tmp, key);
+    StrHelper::strncpy(_prefs.default_scope_name, region, sizeof(_prefs.default_scope_name));
+    memcpy(_prefs.default_scope_key, key.key, sizeof(key.key));
+  }
+  savePrefs();
+}
+
 bool MyMesh::uiReflood(const uint8_t* raw, uint8_t len, uint32_t delay_millis) {
   mesh::Packet* pkt = obtainNewPacket();
   if (pkt == NULL) return false;

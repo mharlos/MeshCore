@@ -141,6 +141,8 @@ public:
   bool uiSetRadio(float freq, float bw, uint8_t sf, uint8_t cr);
   bool uiSetTxPower(int8_t dbm);
   void uiSetRepeat(bool on);
+  void uiSetDefaultScope(const char* region);   // "" = unscoped; keyed like an auto hashtag region
+  const char* uiDefaultScope() const { return _prefs.default_scope_name; }
   bool uiRepeatFreqAllowed() const { return isValidClientRepeatFreq((uint32_t)(_prefs.freq * 1000)); }
   bool uiReflood(const uint8_t* raw, uint8_t len, uint32_t delay_millis);   // re-send a stored flood packet
   const uint8_t* uiLastSignedPrefix() const { return _last_signed_prefix; }   // author of the last room post

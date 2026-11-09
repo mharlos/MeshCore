@@ -1448,6 +1448,7 @@ void UITask::runCommand(const char* line) {
       consolePrint("radio [MHz bw sf cr]  preset [name]");
       consolePrint("tx <dBm>       repeat on|off");
       consolePrint("mule on|off|flush  STORE & FORWARD");
+      consolePrint("scope <region>|off  e.g. scope pdx");
       consolePrint("advert [flood]");
     } else if (strcmp(argl, "alert") == 0) {
       consolePrint("/page [txt]  ALARM ON THEIR DECK");
@@ -1675,6 +1676,25 @@ void UITask::runCommand(const char* line) {
     else if (argOff(argl)) { _prefs.mule = 0; savePrefs(); }
     else if (strcmp(argl, "flush") == 0) consolePrint("RELAYING %d HELD PACKETS", muleFlush(true));
     consolePrint("MULE %s // HOLDING %d // RELAYED %u", _prefs.mule ? "ON" : "OFF", muleCount(), (unsigned)_mule_relayed);
+  } else if (strcmp(cmd, "scope") == 0) {
+    if (argOff(argl) || strcmp(argl, "*") == 0 || strcmp(argl, "none") == 0) {
+      the_mesh.uiSetDefaultScope("");
+    } else if (argl[0]) {
+      bool ok = true;
+      for (const char* p = argl[0] == '#' ? argl + 1 : argl; *p; p++) {
+        if (!isalnum(*p) && *p != '-' && *p != '_') ok = false;
+      }
+      if (ok) the_mesh.uiSetDefaultScope(argl);
+      else consolePrint("REGION NAMES: a-z 0-9 - _");
+    }
+    const char* sc = the_mesh.uiDefaultScope();
+    if (sc[0]) {
+      consolePrint("SCOPE %s // FLOODS TAGGED %s", sc, sc);
+      consolePrint("ONLY REPEATERS CARRYING REGION");
+      consolePrint("%s WILL FORWARD. scope off TO UNDO", sc);
+    } else {
+      consolePrint("SCOPE OFF // ALL REPEATERS FORWARD");
+    }
   } else if (strcmp(cmd, "advert") == 0) {
     bool flood = strcmp(argl, "flood") == 0;
     bool ok = flood ? the_mesh.advertFlood() : the_mesh.advert();
@@ -2410,8 +2430,9 @@ void UITask::drawSys() {
   textf(5 * CHAR_W, y, c_fg, "%.2fV %d%% UP%luh%02lum %s", getBattMilliVolts() / 1000.0f, battPercent(), up / 3600, (up / 60) % 60, ble);
   y += ROW_H;
   text(0, y, c_dim, "MODE");
-  textf(5 * CHAR_W, y, c_fg, "RPT:%s MULE:%s CLK:%s", _node_prefs->isRepeatEn() ? "ON" : "OFF", _prefs.mule ? "ON" : "OFF",
-        _clock_src == CLK_NONE ? "?" : _clock_src == CLK_MESH ? "MESH" : "OK");
+  const char* sc = the_mesh.uiDefaultScope();
+  textf(5 * CHAR_W, y, c_fg, "RPT:%s MULE:%s CLK:%s SC:%.6s", _node_prefs->isRepeatEn() ? "ON" : "OFF", _prefs.mule ? "ON" : "OFF",
+        _clock_src == CLK_NONE ? "?" : _clock_src == CLK_MESH ? "MESH" : "OK", sc[0] ? sc : "*");
   y += ROW_H + 3;
   g.drawFastHLine(0, y - 2, SCR_W, c_dim);
 
