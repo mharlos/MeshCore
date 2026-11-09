@@ -2148,14 +2148,22 @@ void UITask::drawBoot() {
   // 2. the logo, wiped in from the top with a bright scan line
   if (t > 600) {
     const char* logo = "MESHCORE";
-    int lx = (SCR_W - 8 * CHAR_W * 3) / 2, ly = 18;
-    g.fillRect(lx - 6, ly - 4, 8 * CHAR_W * 3 + 12, 48 + 40, c_bg);
+    const int lx = (SCR_W - 8 * CHAR_W * 3) / 2, ly = 8, lh = 102;   // logo block: 3x, 2x, then the build line
+    g.fillRect(0, ly - 4, SCR_W, lh + 4, c_bg);
     bigText(lx, ly, 3, c_fg, logo);
     int dx = (SCR_W - 6 * CHAR_W * 2) / 2;
     bigText(dx, ly + 50, 2, c_hi, "//DECK");
+
+    const char* build = "FLOCK AND FURROW BUILD";
+    int bw = (strlen(build) + 6) * CHAR_W;   // with "-= " and " =-" either side
+    int bx = (SCR_W - bw) / 2, by = ly + 85;
+    text(bx, by, c_dim, "-=");
+    text(bx + 3 * CHAR_W, by, c_fg, build);
+    text(bx + bw - 2 * CHAR_W, by, c_dim, "=-");
+
     int reveal = (int)((t - 600) * 90 / 1000) - 4;   // px of logo shown
-    if (reveal < 88) {
-      g.fillRect(lx - 6, ly + reveal, 8 * CHAR_W * 3 + 12, 88 - reveal, c_bg);
+    if (reveal < lh) {
+      g.fillRect(0, ly + reveal, SCR_W, lh - reveal, c_bg);
       if (reveal >= 0) g.drawFastHLine(0, ly + reveal, SCR_W, c_hi);
     }
   }
@@ -2182,7 +2190,7 @@ void UITask::drawBoot() {
 
     int shown = (int)(t - 1700) / 260;
     for (int i = 0; i < 6 && i <= shown; i++) {
-      int y = 112 + i * ROW_H;
+      int y = 115 + i * ROW_H;
       bool done = i < shown;
       snprintf(label, sizeof(label), "%-30.30s", checks[i].l);
       for (char* p = label; *p; p++) if (*p == ' ' && p > label + (int)strlen(checks[i].l)) *p = '.';
