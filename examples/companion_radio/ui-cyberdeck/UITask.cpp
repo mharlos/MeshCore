@@ -1460,6 +1460,7 @@ void UITask::runCommand(const char* line) {
       consolePrint("time HH:MM[:SS]  date YYYY-MM-DD");
       consolePrint("clock  tz <h>  name <handle>");
       consolePrint("ble on|off  gps on|off  pos");
+      consolePrint("pin <6 digits>|random  BLE PAIRING PIN");
       consolePrint("/loc  SEND YOUR POSITION");
       consolePrint("NODE PAGE: L LOGIN T STATUS S SHARE");
       consolePrint("           R RESET PATH  D DELETE");
@@ -1752,6 +1753,26 @@ void UITask::runCommand(const char* line) {
     else if (!getGPSState()) consolePrint("GPS OFF // gps on");
     else if (!lp->isValid()) consolePrint("NO FIX // %ld SATS", lp->satellitesCount());
     else consolePrint("%.5f,%.5f %ld SATS", lp->getLatitude() / 1e6, lp->getLongitude() / 1e6, lp->satellitesCount());
+  } else if (strcmp(cmd, "pin") == 0) {
+    // stored like the app's "set device PIN": 0 = a fresh random PIN every boot
+    bool changed = false;
+    if (strcmp(argl, "random") == 0) {
+      _node_prefs->ble_pin = 0;
+      changed = true;
+    } else if (argl[0]) {
+      long p = atol(argl);
+      if (strlen(argl) == 6 && p >= 100000 && p <= 999999) {
+        _node_prefs->ble_pin = (uint32_t)p;
+        changed = true;
+      } else {
+        consolePrint("PIN MUST BE 6 DIGITS, 100000-999999");
+      }
+    }
+    if (changed) the_mesh.savePrefs();
+    consolePrint("BLE PIN NOW %06u", (unsigned)the_mesh.getBLEPin());
+    if (_node_prefs->ble_pin) consolePrint("FIXED PIN %06u", (unsigned)_node_prefs->ble_pin);
+    else consolePrint("RANDOM PIN EACH BOOT");
+    if (changed) consolePrint("TAKES EFFECT AFTER reboot");
   } else if (strcmp(cmd, "ble") == 0) {
     if (argOn(argl)) enableBluetooth();
     else if (argOff(argl)) disableBluetooth();
