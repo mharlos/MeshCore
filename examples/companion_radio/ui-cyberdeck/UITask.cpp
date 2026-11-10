@@ -247,6 +247,7 @@ UITask::UITask(mesh::MainBoard* board, MultiSerialInterface* serial) : AbstractU
   _map_lat = _map_lon = _home_lat = _home_lon = 0;
   _map_follow = true;
   _map_pan = _map_inited = false;
+  _map_pan_at = 0;
   _map_node_sel = -1;
   _crumbs = NULL;
   _crumb_head = _crumb_count = 0;
@@ -1458,6 +1459,7 @@ void UITask::handleListKey(int key) {
   int count = (_tab == TAB_CHAN) ? _num_chans : (_tab == TAB_NODES) ? _num_nodes : (_tab == TAB_HEARD) ? num_heard : 0;
   int& sel = _sel[_tab];
 
+  if (_tab != TAB_MAP) _map_pan = false;   // never come back to a map that's still panning
   if (_tab == TAB_MAP && handleMapKey(key)) return;
   if (_tab == TAB_RF && (key == 'm' || key == 'M')) { _screen = SCR_MULE; _mule_scroll = 0; return; }
 

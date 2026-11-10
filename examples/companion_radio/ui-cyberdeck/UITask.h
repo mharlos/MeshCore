@@ -212,6 +212,7 @@ private:
   int _map_z;
   double _map_lat, _map_lon;   // view centre
   bool _map_follow, _map_pan, _map_inited;
+  unsigned long _map_pan_at;   // last pan activity: pan mode lets go after a few idle seconds
   int _map_node_sel;        // into _nodes, -1 = none
   double _home_lat, _home_lon;
   Crumb* _crumbs;

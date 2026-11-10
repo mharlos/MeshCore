@@ -34,6 +34,7 @@
 #define CRUMB_GAP_SECS 600      // longer than this between crumbs: don't join them
 
 #define TKEY_CLICK   0x85
+#define MAP_PAN_IDLE_MS  5000
 
 #ifdef CD_SERIAL_BRIDGE
   #define MAP_TRACE(...)  Serial.printf(__VA_ARGS__)
@@ -371,7 +372,11 @@ bool UITask::handleMapKey(int key) {
   int zlo = _map_zmin >= 0 ? _map_zmin : 2;
   int zhi = _map_zmax >= 0 ? _map_zmax + MAX_OVERZOOM : 18;
 
+  // pan mode lets go by itself, so left/right are never stuck moving the map
+  if (_map_pan && millis() - _map_pan_at > MAP_PAN_IDLE_MS) _map_pan = false;
+
   if (_map_pan && (key == TKEY_UP || key == TKEY_DOWN || key == TKEY_LEFT || key == TKEY_RIGHT)) {
+    _map_pan_at = millis();
     double cx = lonToX(_map_lon, _map_z), cy = latToY(_map_lat, _map_z);
     const int step = 48;
     if (key == TKEY_UP) cy -= step;
@@ -393,6 +398,7 @@ bool UITask::handleMapKey(int key) {
       return true;
     case TKEY_CLICK: case TKEY_ENTER:
       _map_pan = !_map_pan;
+      _map_pan_at = millis();
       return true;
     case TKEY_ESC:
       if (_map_pan) _map_pan = false;
@@ -455,6 +461,7 @@ bool UITask::handleMapKey(int key) {
 
 void UITask::drawMap() {
   if (!_map_inited) mapInit();
+  if (_map_pan && millis() - _map_pan_at > MAP_PAN_IDLE_MS) _map_pan = false;
   Adafruit_GFX& g = _display->gfx();
   uint16_t* buf = _display->buffer();
 
@@ -656,7 +663,7 @@ void UITask::drawMap() {
   g.fillRect(0, MAP_Y + MAP_H, SCR_W, CYBERDECK_H - MAP_Y - MAP_H, c_bg);
   drawHeader();
   drawTabs();
-  drawFooter(_map_pan ? "PAN: BALL MOVES  CLICK DONE  C ME  N NODE  G GPS"
+  drawFooter(_map_pan ? "PAN: BALL MOVES MAP  CLICK OR WAIT 5s TO STOP"
                       : "\x18\x19 ZOOM  CLICK PAN  C ME  N NODE  G GPS  S STYLE");
 }
 
