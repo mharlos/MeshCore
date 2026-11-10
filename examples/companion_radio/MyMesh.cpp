@@ -515,6 +515,7 @@ void MyMesh::sendFloodScoped(const ContactInfo& recipient, mesh::Packet* pkt, ui
     auto scope = send_scope.isNull() ? &default_scope : &send_scope;
     sendFloodScoped(*scope, pkt, delay_millis);
   }
+  if (_listener) _listener->onFloodSent(pkt);   // queued, not sent yet: still ours to read
 }
 void MyMesh::sendFloodScoped(const mesh::GroupChannel& channel, mesh::Packet* pkt, uint32_t delay_millis) {
   // TODO: have per-channel send_scope
@@ -527,6 +528,7 @@ void MyMesh::sendFloodScoped(const mesh::GroupChannel& channel, mesh::Packet* pk
     auto scope = send_scope.isNull() ? &default_scope : &send_scope;
     sendFloodScoped(*scope, pkt, delay_millis);
   }
+  if (_listener) _listener->onFloodSent(pkt);
 }
 
 void MyMesh::onMessageRecv(const ContactInfo &from, mesh::Packet *pkt, uint32_t sender_timestamp,
@@ -598,6 +600,7 @@ void MyMesh::onChannelMessageRecv(const mesh::GroupChannel &channel, mesh::Packe
     if (!getChannel(channel_idx, channel_details)) {
       strcpy(channel_details.name, "Unknown");
     }
+    _last_chan_ts = timestamp;
     _listener->onChannelMessageRecv(pkt, channel_details, text);
     _listener->onQueueSizeChanged(offline_queue_len);
   }

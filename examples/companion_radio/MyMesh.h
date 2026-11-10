@@ -110,6 +110,7 @@ public:
       virtual void onStatusRecv(const ContactInfo &contact, const uint8_t *data, uint8_t len) { }
       virtual void onFloodRecv(const mesh::Packet *pkt) { }   // every flood packet heard, before de-duplication
       virtual void onRawRx(float snr, float rssi, const uint8_t raw[], int len) { }   // everything the radio decodes
+      virtual void onFloodSent(const mesh::Packet *pkt) { }   // our own DMs and channel posts, as they're flooded
       virtual ~Listener() { }
   };
 
@@ -146,6 +147,7 @@ public:
   bool uiRepeatFreqAllowed() const { return isValidClientRepeatFreq((uint32_t)(_prefs.freq * 1000)); }
   bool uiReflood(const uint8_t* raw, uint8_t len, uint32_t delay_millis);   // re-send a stored flood packet
   const uint8_t* uiLastSignedPrefix() const { return _last_signed_prefix; }   // author of the last room post
+  uint32_t uiLastChannelTimestamp() const { return _last_chan_ts; }          // sender's clock, last channel post
 
 protected:
   float getAirtimeBudgetFactor() const override;
@@ -265,6 +267,7 @@ private:
   uint32_t pending_login;
   uint32_t pending_status;
   uint8_t _last_signed_prefix[4];
+  uint32_t _last_chan_ts = 0;
   uint32_t pending_telemetry, pending_discovery;   // pending _TELEMETRY_REQ
   uint32_t pending_req;   // pending _BINARY_REQ
   BaseSerialInterface *_serial;

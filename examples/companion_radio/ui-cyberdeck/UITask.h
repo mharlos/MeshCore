@@ -31,7 +31,7 @@
 #define CD_CONSOLE_LINES      32    // console scrollback
 #define CD_CONSOLE_ROWS        6    // console lines on screen
 #define CD_RF_LOG             48
-#define CD_MULE_SLOTS         24
+#define CD_MULE_SLOTS         64
 #define CD_NEIGHBOURS         16
 #define CD_KEYWORDS            4
 #define CD_ROOM_LOGINS         8
@@ -104,6 +104,15 @@ private:
     uint8_t reserved[3];
     uint64_t muted;        // channel slots that don't beep
     char keywords[CD_KEYWORDS][16];
+    // --- added later: an older, shorter file loads with these all zero, so zero = default ---
+    uint64_t mule_chan_set;   // channels whose carry setting was chosen by hand...
+    uint64_t mule_chan_val;   // ...and what was chosen (otherwise: private yes, public/hashtag no)
+    uint8_t  mule_dm_off;     // 1 = don't carry DMs between contacts
+    uint8_t  mule_own_off;    // 1 = don't carry our own posts
+    uint8_t  mule_dist_km10;  // relay again after moving this far, 0.1km units (0 = 3.0km)
+    uint8_t  mule_rate;       // relays per 10 minutes (0 = 20)
+    uint16_t mule_age_min;    // hold messages this long (0 = 6h)
+    int32_t  home_lat, home_lon;   // micro-degrees, 0/0 = not set
   };
 
   struct RfEntry {
@@ -113,10 +122,20 @@ private:
     int16_t  rssi;
   };
 
-  struct MuleEntry {
+  enum MuleKind : uint8_t { MK_DM = 1, MK_CHAN, MK_OWN };
+
+  struct MuleEntry {       // a message carried for delivery elsewhere
     uint8_t  hash[MAX_HASH_SIZE];
-    uint32_t heard;        // millis
-    uint8_t  sends;
+    uint32_t heard;        // millis, when first held
+    uint8_t  kind;         // MuleKind
+    uint8_t  chan;         // channel slot, 0xFF if a DM
+    uint8_t  road_sends;   // relays on the way
+    uint8_t  home_sent;    // relayed at home
+    uint8_t  nvia;
+    uint8_t  via[6];       // neighbours heard carrying it: their areas already have it
+    bool     has_pos;
+    int32_t  got_lat, got_lon;     // where we picked it up
+    int32_t  sent_lat, sent_lon;   // where we last relayed it
     uint8_t  len;
     uint8_t  raw[MAX_TRANS_UNIT + 1];
   };
@@ -220,8 +239,11 @@ private:
 
   MuleEntry* _mule;
   Neighbour _neigh[CD_NEIGHBOURS];
-  unsigned long _mule_last_flush;
+  unsigned long _mule_last_flush, _mule_next_tick;
+  bool _mule_new_area;      // a neighbour we hadn't heard lately just turned up
   uint32_t _mule_relayed;
+  unsigned long _mule_tokens_at;
+  int _mule_tokens;
 
   uint8_t _logged_in[CD_ROOM_LOGINS][6];
   int _num_logged_in;
@@ -260,6 +282,7 @@ private:
   void refreshChannels();
   Msg* addMsg(ConvKind kind, uint8_t chan, const uint8_t* peer, const char* from, const char* text, bool outgoing);
   Msg* findMsg(uint32_t seq);
+  void stampSent(Msg* m, uint32_t sender_ts, bool mark_late);
   int  unreadFor(ConvKind kind, uint8_t chan, const uint8_t* peer) const;
   int  totalUnread() const;
   void markRead(ConvKind kind, uint8_t chan, const uint8_t* peer);
@@ -286,10 +309,20 @@ private:
   void watchClock();
   void setClock(uint32_t epoch, ClockSrc src);
   bool clockValid() const { return _clock_src != CLK_NONE; }
-  void muleStore(const mesh::Packet* pkt);
+  void muleStore(const mesh::Packet* pkt, MuleKind kind, uint8_t chan, int via);
+  void muleConsider(const mesh::Packet* pkt, bool own, int via);
   void muleNeighbour(uint8_t hash);
+  void muleTick();
+  bool muleDue(MuleEntry& e, bool forced, bool& home_send);
+  bool muleRelay(MuleEntry& e, bool home_send);
   int  muleFlush(bool forced);
   int  muleCount() const;
+  bool muleCarriesChan(int idx) const;
+  uint32_t muleMaxAgeMs() const { return (_prefs.mule_age_min ? _prefs.mule_age_min : 360) * 60000UL; }
+  double muleDistM() const { return (_prefs.mule_dist_km10 ? _prefs.mule_dist_km10 : 30) * 100.0; }
+  int  muleRate() const { return _prefs.mule_rate ? _prefs.mule_rate : 20; }
+  void muleStatus();
+  void muleList();
   bool isLoggedIn(const uint8_t* pub) const;
   void beep(const Tone* t);
 
@@ -351,6 +384,7 @@ public:
   void onStatusRecv(const ContactInfo &contact, const uint8_t *data, uint8_t len) override;
   void onFloodRecv(const mesh::Packet *pkt) override;
   void onRawRx(float snr, float rssi, const uint8_t raw[], int len) override;
+  void onFloodSent(const mesh::Packet *pkt) override;
 
   // AbstractUITask
   void notify(UIEventType t = UIEventType::none) override;
