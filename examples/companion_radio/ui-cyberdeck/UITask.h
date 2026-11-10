@@ -31,7 +31,8 @@
 #define CD_CONSOLE_LINES      32    // console scrollback
 #define CD_CONSOLE_ROWS        6    // console lines on screen
 #define CD_RF_LOG             48
-#define CD_MULE_SLOTS         64
+#define CD_MULE_SLOTS        256    // allocated; `mule size` sets how many are used
+#define CD_REPEATERS          24
 #define CD_NEIGHBOURS         16
 #define CD_KEYWORDS            4
 #define CD_ROOM_LOGINS         8
@@ -45,7 +46,7 @@ public:
   enum ConvKind : uint8_t { CONV_NONE = 0, CONV_CHANNEL, CONV_DM };
 
 private:
-  enum Screen : uint8_t { SCR_BOOT, SCR_LIST, SCR_CHAT, SCR_NODE, SCR_PAGE, SCR_GPS };
+  enum Screen : uint8_t { SCR_BOOT, SCR_LIST, SCR_CHAT, SCR_NODE, SCR_PAGE, SCR_GPS, SCR_MULE };
   enum Tab : uint8_t { TAB_CHAN = 0, TAB_NODES, TAB_HEARD, TAB_MAP, TAB_RF, TAB_SYS, TAB_COUNT };
   enum MapStyle : uint8_t { MS_COLOR = 0, MS_NIGHT, MS_PHOSPHOR, MS_COUNT };
   enum MsgStatus : uint8_t { ST_NONE = 0, ST_SENDING, ST_DELIVERED, ST_FAILED, ST_SENT };
@@ -109,10 +110,12 @@ private:
     uint64_t mule_chan_val;   // ...and what was chosen (otherwise: private yes, public/hashtag no)
     uint8_t  mule_dm_off;     // 1 = don't carry DMs between contacts
     uint8_t  mule_own_off;    // 1 = don't carry our own posts
-    uint8_t  mule_dist_km10;  // relay again after moving this far, 0.1km units (0 = 3.0km)
-    uint8_t  mule_rate;       // relays per 10 minutes (0 = 20)
+    uint8_t  mule_size8;      // cache size in eights (0 = 64 messages)
+    uint8_t  mule_rate;       // relays per 10 minutes (0 = 60)
     uint16_t mule_age_min;    // hold messages this long (0 = 6h)
-    int32_t  home_lat, home_lon;   // micro-degrees, 0/0 = not set
+    uint8_t  gps_always;      // 1 = never rest the GPS
+    uint8_t  cpu_full;        // 1 = don't slow the CPU while the screen is off
+    uint8_t  spare[6];
   };
 
   struct RfEntry {
@@ -127,18 +130,21 @@ private:
   struct MuleEntry {       // a message carried for delivery elsewhere
     uint8_t  hash[MAX_HASH_SIZE];
     uint32_t heard;        // millis, when first held
+    uint32_t sent_ts;      // sender's clock, if we could read it
     uint8_t  kind;         // MuleKind
     uint8_t  chan;         // channel slot, 0xFF if a DM
-    uint8_t  road_sends;   // relays on the way
-    uint8_t  home_sent;    // relayed at home
+    uint8_t  sends;        // times we've relayed it
     uint8_t  nvia;
-    uint8_t  via[6];       // neighbours heard carrying it: their areas already have it
-    bool     has_pos;
-    int32_t  got_lat, got_lon;     // where we picked it up
-    int32_t  sent_lat, sent_lon;   // where we last relayed it
+    uint8_t  via[12];      // repeaters known to have it (first byte of their key)
+    char     from[16];     // preview, when we could decrypt it
+    char     text[40];
     uint8_t  len;
     uint8_t  raw[MAX_TRANS_UNIT + 1];
   };
+
+  struct Repeater { uint8_t id; uint32_t last; int8_t snr4; };   // repeaters near us now
+
+  enum GpsMode : uint8_t { GM_OFF = 0, GM_FOLLOW, GM_REST, GM_CHECK };
 
   struct Neighbour { uint8_t hash; uint32_t last; };
 
@@ -239,11 +245,26 @@ private:
 
   MuleEntry* _mule;
   Neighbour _neigh[CD_NEIGHBOURS];
-  unsigned long _mule_last_flush, _mule_next_tick;
-  bool _mule_new_area;      // a neighbour we hadn't heard lately just turned up
-  uint32_t _mule_relayed;
+  Repeater _rpt[CD_REPEATERS];
+  unsigned long _mule_next_tick, _mule_next_probe;
+  uint32_t _mule_relayed, _mule_probe_tag;
   unsigned long _mule_tokens_at;
   int _mule_tokens;
+  int _mule_last_own;       // entry just stored for our own post, for its preview
+  int _mule_scroll;
+
+  // GPS power: rest when still, follow when moving
+  GpsMode _gps_mode;
+  unsigned long _gps_next, _gps_since, _gps_anchor_at;
+  double _gps_anchor_lat, _gps_anchor_lon;
+  bool _gps_asleep, _cpu_low;
+  uint16_t _batt_hist[24];  // mV every 5 minutes, for a drain estimate
+  int _batt_n;
+  unsigned long _batt_next;
+
+  // chat: a message picked with the trackball, to @mention its sender
+  int _chat_sel;
+  uint32_t _chat_sel_seq;
 
   uint8_t _logged_in[CD_ROOM_LOGINS][6];
   int _num_logged_in;
@@ -312,17 +333,24 @@ private:
   void muleStore(const mesh::Packet* pkt, MuleKind kind, uint8_t chan, int via);
   void muleConsider(const mesh::Packet* pkt, bool own, int via);
   void muleNeighbour(uint8_t hash);
+  void muleRepeaterSeen(uint8_t id, int8_t snr4);
+  int  muleRepeatersNear() const;
   void muleTick();
-  bool muleDue(MuleEntry& e, bool forced, bool& home_send);
-  bool muleRelay(MuleEntry& e, bool home_send);
-  int  muleFlush(bool forced);
-  int  muleCount() const;
+  bool muleDue(MuleEntry& e);
+  bool muleRelay(MuleEntry& e);
+  int  muleFlush();
+  int  muleCount(bool due_only = false);
   bool muleCarriesChan(int idx) const;
+  MuleEntry* muleFind(const uint8_t* hash);
+  int  muleSlots() const { int n = (_prefs.mule_size8 ? _prefs.mule_size8 : 8) * 8; return n > CD_MULE_SLOTS ? CD_MULE_SLOTS : n; }
   uint32_t muleMaxAgeMs() const { return (_prefs.mule_age_min ? _prefs.mule_age_min : 360) * 60000UL; }
-  double muleDistM() const { return (_prefs.mule_dist_km10 ? _prefs.mule_dist_km10 : 30) * 100.0; }
-  int  muleRate() const { return _prefs.mule_rate ? _prefs.mule_rate : 20; }
+  int  muleRate() const { return _prefs.mule_rate ? _prefs.mule_rate : 60; }
   void muleStatus();
-  void muleList();
+  void drawMule();
+
+  void gpsTick();
+  void gpsSleep(bool sleep);
+  void powerTick();
   bool isLoggedIn(const uint8_t* pub) const;
   void beep(const Tone* t);
 
@@ -385,6 +413,7 @@ public:
   void onFloodRecv(const mesh::Packet *pkt) override;
   void onRawRx(float snr, float rssi, const uint8_t raw[], int len) override;
   void onFloodSent(const mesh::Packet *pkt) override;
+  void onControlDataRecv(const mesh::Packet *pkt) override;
 
   // AbstractUITask
   void notify(UIEventType t = UIEventType::none) override;

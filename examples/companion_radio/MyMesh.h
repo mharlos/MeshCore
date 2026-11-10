@@ -146,6 +146,7 @@ public:
   const char* uiDefaultScope() const { return _prefs.default_scope_name; }
   bool uiRepeatFreqAllowed() const { return isValidClientRepeatFreq((uint32_t)(_prefs.freq * 1000)); }
   bool uiReflood(const uint8_t* raw, uint8_t len, uint32_t delay_millis);   // re-send a stored flood packet
+  bool uiDiscoverRepeaters(uint32_t& tag);   // zero-hop "who's there?": repeaters in range answer via onControlDataRecv
   const uint8_t* uiLastSignedPrefix() const { return _last_signed_prefix; }   // author of the last room post
   uint32_t uiLastChannelTimestamp() const { return _last_chan_ts; }          // sender's clock, last channel post
 

@@ -178,9 +178,20 @@ def pull(s, remote, local):
           f"{total_bad} failed checksum, {(time.time() - start) / 60:.1f} min", flush=True)
 
 
+def open_port(port, timeout=0.5):
+    # Hold DTR and RTS low from the start: on the ESP32-S3's USB serial, toggling them
+    # (which a plain open/close does on Windows) resets the deck.
+    s = serial.Serial()
+    s.port, s.baudrate, s.timeout = port, 115200, timeout
+    s.dtr = False
+    s.rts = False
+    s.open()
+    return s
+
+
 def main():
     port, cmd, args = sys.argv[1], sys.argv[2], sys.argv[3:]
-    s = serial.Serial(port, 115200, timeout=0.5)
+    s = open_port(port)
     if cmd == "shot":
         shot(s, args[0] if args else "shot.png")
     elif cmd == "keys":

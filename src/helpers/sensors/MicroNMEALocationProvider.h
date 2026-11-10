@@ -98,6 +98,8 @@ class MicroNMEALocationProvider : public LocationProvider {
 public :
 #ifdef NMEA_KEEP_RECENT
     const MicroNMEA& nmeaState() const { return nmea; }
+    Stream* serialPort() { return _gps_serial; }   // for power commands to the receiver
+    uint32_t fixAgeMs() const { return _fix_seen ? (uint32_t)(millis() - _last_fix_ms) : 0xFFFFFFFF; }
     uint32_t sentencesSeen() const { return _recent_total; }
     const char* recentSentence(int age) const {   // 0 = newest
         if (age < 0 || age >= NMEA_KEEP_RECENT || (uint32_t)age >= _recent_total) return NULL;
@@ -263,7 +265,9 @@ public :
             if (!_time_sync_needed && _clock != NULL && (millis() - _last_time_sync) > TIME_SYNC_INTERVAL) {
                 _time_sync_needed = true;
             }
-            if (_time_sync_needed && time_valid > 2) {
+            // only from a fix that's still coming in: a receiver put to sleep leaves its last
+            // fix (and time) behind, and syncing to that would wind the clock back
+            if (_time_sync_needed && time_valid > 2 && _fix_seen && (millis() - _last_fix_ms) < 2000) {
                 if (_clock != NULL) {
                     _clock->setCurrentTime(getTimestamp());
                     _time_sync_needed = false;

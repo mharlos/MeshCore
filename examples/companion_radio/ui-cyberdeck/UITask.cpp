@@ -203,10 +203,20 @@ UITask::UITask(mesh::MainBoard* board, MultiSerialInterface* serial) : AbstractU
   _login_timeout = _status_timeout = 0;
   _rf_head = _rf_count = 0;
   _rf_total = 0;
-  _mule_last_flush = _mule_next_tick = _mule_tokens_at = 0;
-  _mule_new_area = false;
+  _mule_next_tick = _mule_next_probe = _mule_tokens_at = 0;
   _mule_tokens = -1;
-  _mule_relayed = 0;
+  _mule_relayed = _mule_probe_tag = 0;
+  _mule_last_own = -1;
+  _mule_scroll = 0;
+  memset(_rpt, 0, sizeof(_rpt));
+  _gps_mode = GM_OFF;
+  _gps_next = _gps_since = _gps_anchor_at = 0;
+  _gps_anchor_lat = _gps_anchor_lon = 0;
+  _gps_asleep = _cpu_low = false;
+  _batt_n = 0;
+  _batt_next = 0;
+  _chat_sel = -1;
+  _chat_sel_seq = 0;
   _screen = _page_return = SCR_BOOT;
   _tab = TAB_CHAN;
   _scroll = 0;
@@ -689,6 +699,13 @@ bool UITask::sendText(const char* text, uint8_t flags) {
     uint32_t ts = the_mesh.getRTCClock()->getCurrentTimeUnique();
     Msg* m = addMsg(CONV_CHANNEL, _conv_chan, NULL, _node_prefs->node_name, text, true);
     bool ok = the_mesh.sendGroupMessage(ts, cd.channel, _node_prefs->node_name, text, len);
+    if (_mule_last_own >= 0 && _mule) {   // the courier took a copy as it went out
+      MuleEntry& o = _mule[_mule_last_own];
+      strncpy(o.from, _node_prefs->node_name, sizeof(o.from) - 1);
+      strncpy(o.text, text, sizeof(o.text) - 1);
+      o.sent_ts = ts;
+      _mule_last_own = -1;
+    }
     if (m) {
       m->status = ok ? ST_SENT : ST_FAILED;
       m->flags = flags;
@@ -717,6 +734,13 @@ bool UITask::sendText(const char* text, uint8_t flags) {
       _pending[slot].first_sent = millis();
       m->status = ST_SENDING;
       ok = sendDirect(slot, 0);
+      if (_mule_last_own >= 0 && _mule) {   // it flooded, and the courier took a copy
+        MuleEntry& o = _mule[_mule_last_own];
+        snprintf(o.from, sizeof(o.from), ">%.14s", _conv_name);
+        strncpy(o.text, text, sizeof(o.text) - 1);
+        o.sent_ts = _pending[slot].msg_ts;
+        _mule_last_own = -1;
+      }
       if (!ok) {
         m->status = ST_FAILED;
         _pending[slot].seq = 0;
@@ -821,6 +845,8 @@ bool UITask::matchesKeyword(const char* text) const {
   }
   char at[34];
   snprintf(at, sizeof(at), "@%s", _node_prefs->node_name);   // a mention always counts
+  if (stristr(text, at)) return true;
+  snprintf(at, sizeof(at), "@[%s]", _node_prefs->node_name);  // ...in the phone app's form too
   return stristr(text, at);
 }
 
@@ -915,6 +941,16 @@ void UITask::onChannelMessageRecv(mesh::Packet *pkt, ChannelDetails& channel_det
   m->hops = pkt->isRouteFlood() ? pkt->path_len : 0xFF;
   m->snr4 = (int8_t)(pkt->getSNR() * 4);
   stampSent(m, the_mesh.uiLastChannelTimestamp(), true);
+
+  // if the courier picked this up, give its cache entry something readable
+  uint8_t hash[MAX_HASH_SIZE];
+  pkt->calculatePacketHash(hash);
+  MuleEntry* held = muleFind(hash);
+  if (held) {
+    strncpy(held->from, m->from, sizeof(held->from) - 1);
+    strncpy(held->text, m->text, sizeof(held->text) - 1);
+    held->sent_ts = the_mesh.uiLastChannelTimestamp();
+  }
 
   char chan[34];
   chanLabel(chan, sizeof(chan), channel_details.name);
@@ -1038,41 +1074,6 @@ void UITask::onRawRx(float snr, float rssi, const uint8_t raw[], int len) {
   if (_screen == SCR_LIST && _tab == TAB_RF) _dirty = true;
 }
 
-static void muleAddVia(uint8_t* via, uint8_t& nvia, uint8_t hop) {
-  for (int i = 0; i < nvia; i++) if (via[i] == hop) return;
-  if (nvia == 6) { memmove(via, via + 1, 5); nvia = 5; }
-  via[nvia++] = hop;
-}
-
-void UITask::onFloodRecv(const mesh::Packet *pkt) {
-  // the last hop is whoever we heard it from: a neighbour
-  uint8_t count = pkt->getPathHashCount();
-  int hop = count > 0 ? pkt->path[(count - 1) * pkt->getPathHashSize()] : -1;
-  if (hop >= 0) muleNeighbour((uint8_t)hop);
-
-  if (!_prefs.mule || _mule == NULL) return;
-  uint8_t t = pkt->getPayloadType();
-  if (t != PAYLOAD_TYPE_TXT_MSG && t != PAYLOAD_TYPE_GRP_TXT) return;
-
-  // already carrying it: whoever we just heard it from has it, so their area is covered
-  uint8_t hash[MAX_HASH_SIZE];
-  pkt->calculatePacketHash(hash);
-  for (int i = 0; i < CD_MULE_SLOTS; i++) {
-    MuleEntry& e = _mule[i];
-    if (e.len && memcmp(e.hash, hash, sizeof(hash)) == 0) {
-      if (hop >= 0) muleAddVia(e.via, e.nvia, (uint8_t)hop);
-      return;
-    }
-  }
-  muleConsider(pkt, false, hop);
-}
-
-void UITask::onFloodSent(const mesh::Packet *pkt) {
-  if (!_prefs.mule || _mule == NULL || _prefs.mule_own_off) return;
-  uint8_t t = pkt->getPayloadType();
-  if (t == PAYLOAD_TYPE_TXT_MSG || t == PAYLOAD_TYPE_GRP_TXT) muleConsider(pkt, true, -1);
-}
-
 void UITask::notify(UIEventType t) {
   _dirty = true;
 }
@@ -1122,252 +1123,6 @@ void UITask::watchClock() {
   }
   _clk_last_rtc = now;
   _clk_last_ms = millis();
-}
-
-/* ---------------------------------- courier ("mule") ----------------------------------- */
-// Carry messages between parts of the mesh that can't hear each other, as you travel.
-//
-// What: our private channels (Public and #hashtags only if asked), DMs between our
-// contacts, and our own posts. Packets are kept exactly as heard - still encrypted,
-// sender's timestamp and all - and re-flooded unchanged.
-//
-// Where: only where a message is missing. Each held message remembers which neighbours
-// were heard carrying it; while any of them is around, that area has it and we stay
-// quiet. With a GPS fix, a message is relayed again only after moving MULE_DIST from
-// where it was picked up or last relayed (quiet, isolated stretches still get it), and
-// once more on arriving home. Without a fix, a neighbour we hadn't heard in 30 minutes
-// stands in for "somewhere new".
-//
-// How much: at most MULE_ROAD_SENDS relays on the way plus one at home, one relay
-// every few seconds at most, and a budget of muleRate() relays per 10 minutes.
-
-#define MULE_ROAD_SENDS    2
-#define MULE_HOME_RADIUS   1000.0      // metres
-#define MULE_AREA_WINDOW   (10 * 60 * 1000UL)
-#define MULE_TICK_MS       3000
-
-static double geoDist(double lat1, double lon1, double lat2, double lon2) {
-  double p1 = lat1 * M_PI / 180, p2 = lat2 * M_PI / 180;
-  double dp = p2 - p1, dl = (lon2 - lon1) * M_PI / 180;
-  double a = sin(dp / 2) * sin(dp / 2) + cos(p1) * cos(p2) * sin(dl / 2) * sin(dl / 2);
-  return 6371000.0 * 2 * atan2(sqrt(a), sqrt(1 - a));
-}
-
-bool UITask::muleCarriesChan(int idx) const {
-  if (idx < 0 || idx >= 64) return false;
-  if ((_prefs.mule_chan_set >> idx) & 1) return (_prefs.mule_chan_val >> idx) & 1;
-  ChannelDetails cd;
-  if (!the_mesh.getChannel(idx, cd) || !cd.name[0]) return false;
-  return !(cd.name[0] == '#' || strieq(cd.name, "Public"));   // private channels by default
-}
-
-void UITask::muleConsider(const mesh::Packet* pkt, bool own, int via) {
-  if (pkt->getPayloadType() == PAYLOAD_TYPE_GRP_TXT) {
-    int idx = -1;
-    ChannelDetails cd;
-    for (int i = 0; i < MAX_GROUP_CHANNELS; i++) {
-      if (the_mesh.getChannel(i, cd) && cd.name[0] && cd.channel.hash[0] == pkt->payload[0]) { idx = i; break; }
-    }
-    if (own) muleStore(pkt, MK_OWN, idx < 0 ? 0xFF : idx, via);
-    else if (idx >= 0 && muleCarriesChan(idx)) muleStore(pkt, MK_CHAN, idx, via);
-    return;
-  }
-  // a direct message: [dest hash][src hash][mac][ciphertext]
-  if (own) { muleStore(pkt, MK_OWN, 0xFF, via); return; }
-  if (_prefs.mule_dm_off || pkt->payload[0] == the_mesh.self_id.pub_key[0]) return;
-  for (int i = 0; i < _num_nodes; i++) {
-    if (_nodes[i].type == ADV_TYPE_CHAT && _nodes[i].pub[0] == pkt->payload[0]) {
-      muleStore(pkt, MK_DM, 0xFF, via);
-      return;
-    }
-  }
-}
-
-void UITask::muleStore(const mesh::Packet* pkt, MuleKind kind, uint8_t chan, int via) {
-  if (_mule == NULL) return;
-  uint8_t hash[MAX_HASH_SIZE];
-  pkt->calculatePacketHash(hash);
-
-  int empty = -1, oldest = -1;
-  for (int i = 0; i < CD_MULE_SLOTS; i++) {
-    MuleEntry& e = _mule[i];
-    if (e.len == 0) { if (empty < 0) empty = i; continue; }
-    if (memcmp(e.hash, hash, sizeof(hash)) == 0) return;   // already carrying it
-    if (oldest < 0 || e.heard < _mule[oldest].heard) oldest = i;
-  }
-  MuleEntry& e = _mule[empty >= 0 ? empty : oldest];
-  memset(&e, 0, sizeof(e));
-  memcpy(e.hash, hash, sizeof(hash));
-  e.len = pkt->writeTo(e.raw);
-  e.heard = millis();
-  e.kind = kind;
-  e.chan = chan;
-  if (via >= 0) muleAddVia(e.via, e.nvia, (uint8_t)via);
-  double lat, lon;
-  if (myPosition(lat, lon)) {
-    e.has_pos = true;
-    e.got_lat = e.sent_lat = (int32_t)lround(lat * 1e6);
-    e.got_lon = e.sent_lon = (int32_t)lround(lon * 1e6);
-  }
-}
-
-void UITask::muleNeighbour(uint8_t hash) {
-  uint32_t now = millis();
-  int found = -1, oldest = 0;
-  for (int i = 0; i < CD_NEIGHBOURS; i++) {
-    if (_neigh[i].last && _neigh[i].hash == hash) { found = i; break; }
-    if (_neigh[i].last < _neigh[oldest].last) oldest = i;
-  }
-  if (found >= 0) {
-    bool stale = now - _neigh[found].last > MULE_NEIGH_STALE;
-    _neigh[found].last = now;
-    if (!stale) return;
-  } else {
-    _neigh[oldest].hash = hash;
-    _neigh[oldest].last = now;
-  }
-  if (now > 60000) _mule_new_area = true;   // a neighbour we haven't heard lately: somewhere new
-}
-
-bool UITask::muleDue(MuleEntry& e, bool forced, bool& home_send) {
-  home_send = false;
-  if (e.len == 0) return false;
-  unsigned long now = millis();
-  if (now - e.heard > muleMaxAgeMs()) { e.len = 0; return false; }
-
-  // someone around us has been heard carrying it: this area already has it
-  for (int v = 0; v < e.nvia; v++) {
-    for (int i = 0; i < CD_NEIGHBOURS; i++) {
-      if (_neigh[i].last && _neigh[i].hash == e.via[v] && now - _neigh[i].last < MULE_AREA_WINDOW) return false;
-    }
-  }
-
-  double lat, lon;
-  bool fix = myPosition(lat, lon);
-  if (fix && !e.has_pos) {   // picked up before we had a fix: measure from here
-    e.has_pos = true;
-    e.got_lat = e.sent_lat = (int32_t)lround(lat * 1e6);
-    e.got_lon = e.sent_lon = (int32_t)lround(lon * 1e6);
-    return false;
-  }
-  bool home_set = _prefs.home_lat || _prefs.home_lon;
-  bool at_home = fix && home_set && geoDist(lat, lon, _prefs.home_lat / 1e6, _prefs.home_lon / 1e6) < MULE_HOME_RADIUS;
-  if (at_home && !e.home_sent) {
-    bool from_home = e.has_pos && geoDist(e.got_lat / 1e6, e.got_lon / 1e6, _prefs.home_lat / 1e6, _prefs.home_lon / 1e6) < MULE_HOME_RADIUS;
-    if (!from_home) { home_send = true; return true; }
-  }
-  if (e.road_sends >= MULE_ROAD_SENDS) return false;
-  if (forced) return true;
-  if (at_home) return false;   // at home, the home delivery is the one that counts
-  if (fix) return geoDist(lat, lon, e.sent_lat / 1e6, e.sent_lon / 1e6) >= muleDistM();
-  return _mule_new_area && now - e.heard > 60000;   // no fix: go by neighbours
-}
-
-bool UITask::muleRelay(MuleEntry& e, bool home_send) {
-  if (!the_mesh.uiReflood(e.raw, e.len, random(100, 1500))) return false;
-  if (home_send) e.home_sent = 1; else e.road_sends++;
-  double lat, lon;
-  if (myPosition(lat, lon)) {
-    e.sent_lat = (int32_t)lround(lat * 1e6);
-    e.sent_lon = (int32_t)lround(lon * 1e6);
-  }
-  _mule_relayed++;
-  return true;
-}
-
-void UITask::muleTick() {
-  if (!_prefs.mule || _mule == NULL) return;
-  unsigned long now = millis();
-  int rate = muleRate();
-  unsigned long period = 600000UL / rate;
-  if (_mule_tokens < 0) { _mule_tokens = rate; _mule_tokens_at = now; }
-  while (_mule_tokens < rate && now - _mule_tokens_at >= period) { _mule_tokens++; _mule_tokens_at += period; }
-  if (_mule_tokens >= rate) _mule_tokens_at = now;
-
-  // the oldest message that's due goes first; one per tick keeps the channel calm
-  int pick = -1;
-  bool pick_home = false;
-  for (int i = 0; i < CD_MULE_SLOTS; i++) {
-    bool home;
-    if (muleDue(_mule[i], false, home) && (pick < 0 || _mule[i].heard < _mule[pick].heard)) { pick = i; pick_home = home; }
-  }
-  if (pick < 0) { _mule_new_area = false; return; }
-  if (_mule_tokens <= 0) return;
-  if (muleRelay(_mule[pick], pick_home)) {
-    _mule_tokens--;
-    _dirty = true;
-  }
-}
-
-int UITask::muleFlush(bool forced) {
-  if (_mule == NULL) return 0;
-  _mule_last_flush = millis();
-  int n = 0;
-  for (int i = 0; i < CD_MULE_SLOTS && n < 20; i++) {
-    bool home;
-    if (muleDue(_mule[i], forced, home) && the_mesh.uiReflood(_mule[i].raw, _mule[i].len, 1500 + n * 3000 + random(0, 800))) {
-      MuleEntry& e = _mule[i];
-      if (home) e.home_sent = 1; else e.road_sends++;
-      double lat, lon;
-      if (myPosition(lat, lon)) { e.sent_lat = (int32_t)lround(lat * 1e6); e.sent_lon = (int32_t)lround(lon * 1e6); }
-      _mule_relayed++;
-      n++;
-    }
-  }
-  return n;
-}
-
-int UITask::muleCount() const {
-  if (_mule == NULL) return 0;
-  bool home_set = _prefs.home_lat || _prefs.home_lon;
-  int n = 0;
-  for (int i = 0; i < CD_MULE_SLOTS; i++) {
-    const MuleEntry& e = _mule[i];
-    if (e.len && millis() - e.heard < muleMaxAgeMs() && (e.road_sends < MULE_ROAD_SENDS || (home_set && !e.home_sent))) n++;
-  }
-  return n;
-}
-
-void UITask::muleStatus() {
-  int dm = 0, ch = 0, own = 0, n = 0;
-  for (int i = 0; _mule && i < CD_MULE_SLOTS; i++) {
-    const MuleEntry& e = _mule[i];
-    if (!e.len || millis() - e.heard >= muleMaxAgeMs()) continue;
-    n++;
-    if (e.kind == MK_DM) dm++; else if (e.kind == MK_CHAN) ch++; else own++;
-  }
-  consolePrint("MULE %s // HOLDING %d (CH %d DM %d YOU %d)", _prefs.mule ? "ON" : "OFF", n, ch, dm, own);
-  unsigned age = _prefs.mule_age_min ? _prefs.mule_age_min : 360;
-  consolePrint("RELAYED %u  MAX %d/10MIN  HOLD %uH%02uM", (unsigned)_mule_relayed, muleRate(), age / 60, age % 60);
-  int heard = 0;
-  for (int i = 0; i < CD_NEIGHBOURS; i++) if (_neigh[i].last && millis() - _neigh[i].last < MULE_AREA_WINDOW) heard++;
-  double lat, lon;
-  bool fix = myPosition(lat, lon);
-  if (_prefs.home_lat || _prefs.home_lon) {
-    if (fix) consolePrint("HOME %.1fKM AWAY  RELAY EVERY %.1fKM", geoDist(lat, lon, _prefs.home_lat / 1e6, _prefs.home_lon / 1e6) / 1000, muleDistM() / 1000);
-    else consolePrint("HOME SET  RELAY EVERY %.1fKM", muleDistM() / 1000);
-  } else {
-    consolePrint("NO HOME // mule home  EVERY %.1fKM", muleDistM() / 1000);
-  }
-  consolePrint("%d RADIOS NEAR  %s", heard, fix ? "GPS FIX" : "NO FIX: GOING BY NEIGHBOURS");
-}
-
-void UITask::muleList() {
-  int shown = 0;
-  for (int i = 0; _mule && i < CD_MULE_SLOTS; i++) {
-    const MuleEntry& e = _mule[i];
-    if (!e.len || millis() - e.heard >= muleMaxAgeMs()) continue;
-    char what[24] = "DM";
-    ChannelDetails cd;
-    mesh::Packet p;
-    if (e.chan != 0xFF && the_mesh.getChannel(e.chan, cd)) chanLabel(what, sizeof(what), cd.name);
-    else if (p.readFrom(e.raw, e.len)) snprintf(what, sizeof(what), "DM >%02X", p.payload[0]);   // who it's for
-    unsigned m = (millis() - e.heard) / 60000;
-    consolePrint("%s%-14.14s %3uM ROAD %u/%d%s V%u", e.kind == MK_OWN ? "YOU " : "", what, m, e.road_sends, MULE_ROAD_SENDS,
-                 e.home_sent ? " HOME" : "", e.nvia);
-    shown++;
-  }
-  if (!shown) consolePrint("NOTHING HELD");
 }
 
 bool UITask::isLoggedIn(const uint8_t* pub) const {
@@ -1542,6 +1297,10 @@ void UITask::openNode(const uint8_t* pub) {
 }
 
 void UITask::wake() {
+  if (_cpu_low) {   // full speed before the first frame, not a second later
+    setCpuFrequencyMhz(240);
+    _cpu_low = false;
+  }
   if (_display && !_display->isOn()) {
     _display->turnOn();
     _dirty = true;
@@ -1577,6 +1336,24 @@ void UITask::handleKey(int key) {
     case SCR_NODE: handleNodeKey(key); break;
     case SCR_GPS:
       if (key == TKEY_ESC || key == TKEY_BACKSPACE || key == TKEY_LEFT || key == TKEY_CLICK || key == TKEY_ENTER || key == 'g' || key == 'G') {
+        _screen = SCR_LIST;
+      }
+      break;
+    case SCR_MULE:
+      if (key == TKEY_UP) _mule_scroll--;
+      else if (key == TKEY_DOWN) _mule_scroll++;
+      else if (key == 'o' || key == 'O') {
+        _prefs.mule = !_prefs.mule;
+        savePrefs();
+        showAlert(_prefs.mule ? "COURIER ON" : "COURIER OFF // STILL COLLECTING", 2000);
+      } else if (key == 'f' || key == 'F') {
+        char a[32];
+        snprintf(a, sizeof(a), "SENDING %d HELD", muleFlush());
+        showAlert(a, 2000);
+      } else if (key == 'x' || key == 'X') {
+        if (_mule) memset(_mule, 0, sizeof(MuleEntry) * CD_MULE_SLOTS);
+        showAlert("COURIER EMPTIED", 1500);
+      } else if (key == TKEY_ESC || key == TKEY_BACKSPACE || key == TKEY_LEFT || key == TKEY_CLICK || key == TKEY_ENTER) {
         _screen = SCR_LIST;
       }
       break;
@@ -1682,6 +1459,7 @@ void UITask::handleListKey(int key) {
   int& sel = _sel[_tab];
 
   if (_tab == TAB_MAP && handleMapKey(key)) return;
+  if (_tab == TAB_RF && (key == 'm' || key == 'M')) { _screen = SCR_MULE; _mule_scroll = 0; return; }
 
   if (_tab == TAB_SYS) {   // the SYS tab is a command console
     if (key == TKEY_LEFT) { _tab = TAB_RF; return; }
@@ -1753,32 +1531,58 @@ void UITask::handleListKey(int key) {
   }
 }
 
+// "@[name] " for the picked message's sender, as the phone app writes mentions
+static bool insertMention(char* buf, int& len, int max_len, const char* name) {
+  char m[40];
+  snprintf(m, sizeof(m), "%s@[%s] ", (len > 0 && buf[len - 1] != ' ') ? " " : "", name);
+  int n = strlen(m);
+  if (len + n > max_len) return false;
+  memcpy(buf + len, m, n + 1);
+  len += n;
+  return true;
+}
+
 void UITask::handleChatKey(int key) {
+  int max_len = CD_INPUT_MAX;
+  if (_conv_kind == CONV_CHANNEL) max_len -= strlen(_node_prefs->node_name) + 2;   // room for "<name>: "
+
+  // the trackball picks a message (newest first); click/enter @mentions whoever wrote it
+  auto mention = [&]() {
+    Msg* m = findMsg(_chat_sel_seq);
+    if (m == NULL) return;
+    if (m->outgoing) showAlert("THAT ONE'S YOURS", 1200);
+    else if (!insertMention(_input_buf, _input_len, max_len, m->from)) showAlert("NO ROOM FOR THE NAME", 1500);
+    _chat_sel = -1;
+  };
+
   switch (key) {
-    case TKEY_UP:    _scroll++; break;   // clamped when drawn
-    case TKEY_DOWN:  if (_scroll > 0) _scroll--; break;
+    case TKEY_UP:    _chat_sel++; _chat_sel_seq = 0; break;   // clamped, and pinned to a message, when drawn
+    case TKEY_DOWN:  if (_chat_sel >= 0) _chat_sel--; _chat_sel_seq = 0; break;
     case TKEY_LEFT:
     case TKEY_ESC:
-      _screen = SCR_LIST;
+      if (_chat_sel >= 0) _chat_sel = -1;
+      else _screen = SCR_LIST;
       break;
     case TKEY_CLICK:
-      if (_input_len == 0) { _screen = SCR_LIST; break; }
-      sendInput();
+      if (_chat_sel >= 0) mention();
+      else if (_input_len == 0) _screen = SCR_LIST;
+      else sendInput();
       break;
     case TKEY_ENTER:
-      sendInput();
+      if (_chat_sel >= 0 && _input_len == 0) mention();
+      else { _chat_sel = -1; sendInput(); }
       break;
     case TKEY_BACKSPACE:
       if (_input_len > 0) {
         _input_buf[--_input_len] = 0;
+      } else if (_chat_sel >= 0) {
+        _chat_sel = -1;
       } else {
         _screen = SCR_LIST;
       }
       break;
     default:
       if (key >= 32 && key < 127) {
-        int max_len = CD_INPUT_MAX;
-        if (_conv_kind == CONV_CHANNEL) max_len -= strlen(_node_prefs->node_name) + 2;   // room for "<name>: "
         if (_input_len < max_len) {
           _input_buf[_input_len++] = key;
           _input_buf[_input_len] = 0;
@@ -1787,6 +1591,7 @@ void UITask::handleChatKey(int key) {
       break;
   }
   if (_screen == SCR_CHAT) markRead(_conv_kind, _conv_chan, _conv_peer);
+  else _chat_sel = -1;
 }
 
 /* --------------------------------------- console --------------------------------------- */
@@ -1835,13 +1640,13 @@ void UITask::runCommand(const char* line) {
       consolePrint("scope <region>|off  e.g. scope pdx");
       consolePrint("advert [flood]");
     } else if (strcmp(argl, "mule") == 0) {
-      consolePrint("mule on|off   mule = STATUS");
-      consolePrint("mule home     SET HOME HERE (GPS)");
-      consolePrint("mule list     WHAT'S HELD   flush  clear");
-      consolePrint("mule chans    WHICH CHANNELS GET CARRIED");
+      consolePrint("mule          THE COURIER SCREEN");
+      consolePrint("mule on|off   DELIVER (IT ALWAYS COLLECTS)");
+      consolePrint("mule status  flush  clear");
+      consolePrint("mule chans    WHICH CHANNELS RIDE ALONG");
       consolePrint("mule chan <name> on|off|auto");
       consolePrint("mule dm|own on|off  DMS / YOUR POSTS");
-      consolePrint("mule age <min> dist <km> rate <n/10min>");
+      consolePrint("mule size <n> age <min> rate <n/10min>");
     } else if (strcmp(argl, "alert") == 0) {
       consolePrint("/page [txt]  ALARM ON THEIR DECK");
       consolePrint("/sos         PAGE WITH YOUR POSITION");
@@ -1853,6 +1658,7 @@ void UITask::runCommand(const char* line) {
       consolePrint("clock  tz <h>  name <handle>");
       consolePrint("ble on|off  gps on|off  pos");
       consolePrint("pin <6 digits>|random  BLE PAIRING PIN");
+      consolePrint("power  gps live on|off  BATTERY");
       consolePrint("crumbs on|off|clear  sd");
       consolePrint("MAP: " G_UP G_DOWN " ZOOM CLICK PAN C ME N/P NODE");
       consolePrint("     G GPS  S STYLE  B TRAIL  L LABELS");
@@ -2068,41 +1874,37 @@ void UITask::runCommand(const char* line) {
       consolePrint("WARN: NOT AN OFF-GRID FREQ. EXTRA");
       consolePrint("      FLOOD TRAFFIC FOR EVERYONE.");
     }
-  } else if (strcmp(cmd, "mule") == 0) {
+  } else if (strcmp(cmd, "mule") == 0 || strcmp(cmd, "courier") == 0) {
     char sub[16] = "";
-    const char* rest = argl;
     sscanf(argl, "%15s", sub);
-    rest = argl + strlen(sub);
+    const char* rest = argl + strlen(sub);
     while (*rest == ' ') rest++;
     bool show = true;
 
-    if (argOn(sub)) { _prefs.mule = 1; savePrefs(); }
+    if (!sub[0] || strcmp(sub, "show") == 0 || strcmp(sub, "list") == 0) {   // the courier screen
+      _screen = SCR_MULE;
+      _mule_scroll = 0;
+      consolePrint("COURIER SCREEN");
+      return;
+    }
+    if (argOn(sub)) { _prefs.mule = 1; _mule_next_probe = 0; savePrefs(); }
     else if (argOff(sub)) { _prefs.mule = 0; savePrefs(); }
-    else if (strcmp(sub, "flush") == 0) { consolePrint("RELAYING %d NOW", muleFlush(true)); show = false; }
-    else if (strcmp(sub, "clear") == 0) { if (_mule) memset(_mule, 0, sizeof(MuleEntry) * CD_MULE_SLOTS); consolePrint("DROPPED EVERYTHING HELD"); }
-    else if (strcmp(sub, "list") == 0) { muleList(); show = false; }
-    else if (strcmp(sub, "home") == 0) {
-      double lat, lon;
-      if (argOff(rest)) { _prefs.home_lat = _prefs.home_lon = 0; savePrefs(); consolePrint("HOME CLEARED"); }
-      else if (myPosition(lat, lon)) {
-        _prefs.home_lat = (int32_t)lround(lat * 1e6);
-        _prefs.home_lon = (int32_t)lround(lon * 1e6);
-        savePrefs();
-        consolePrint("HOME SET HERE // WITHIN 1KM COUNTS");
-      } else consolePrint("NEED A GPS FIX TO SET HOME");
-    } else if (strcmp(sub, "dm") == 0 || strcmp(sub, "own") == 0) {
+    else if (strcmp(sub, "flush") == 0) { consolePrint("SENDING %d NOW", muleFlush()); show = false; }
+    else if (strcmp(sub, "clear") == 0) { if (_mule) memset(_mule, 0, sizeof(MuleEntry) * CD_MULE_SLOTS); consolePrint("EMPTIED"); }
+    else if (strcmp(sub, "status") == 0) { }
+    else if (strcmp(sub, "dm") == 0 || strcmp(sub, "own") == 0) {
       uint8_t& off = (sub[0] == 'd') ? _prefs.mule_dm_off : _prefs.mule_own_off;
       if (argOn(rest)) off = 0; else if (argOff(rest)) off = 1;
       savePrefs();
       consolePrint(sub[0] == 'd' ? "CARRY DMS BETWEEN CONTACTS: %s" : "CARRY YOUR OWN POSTS: %s", off ? "NO" : "YES");
       show = false;
-    } else if (strcmp(sub, "age") == 0 || strcmp(sub, "dist") == 0 || strcmp(sub, "rate") == 0) {
+    } else if (strcmp(sub, "age") == 0 || strcmp(sub, "size") == 0 || strcmp(sub, "rate") == 0) {
       if (*rest) {
-        float v = atof(rest);
-        if (sub[0] == 'a' && v >= 10 && v <= 1440) _prefs.mule_age_min = (uint16_t)v;                 // minutes
-        else if (sub[0] == 'd' && v >= 0.5f && v <= 25) _prefs.mule_dist_km10 = (uint8_t)(v * 10 + 0.5f);   // km
-        else if (sub[0] == 'r' && v >= 1 && v <= 60) { _prefs.mule_rate = (uint8_t)v; _mule_tokens = -1; }  // per 10 min
-        else consolePrint(sub[0] == 'a' ? "AGE: 10-1440 MINUTES" : sub[0] == 'd' ? "DIST: 0.5-25 KM" : "RATE: 1-60 PER 10 MIN");
+        int v = atoi(rest);
+        if (sub[0] == 'a' && v >= 10 && v <= 1440) _prefs.mule_age_min = v;                         // minutes
+        else if (sub[0] == 's' && v >= 8 && v <= CD_MULE_SLOTS) _prefs.mule_size8 = (v + 7) / 8;    // messages
+        else if (sub[0] == 'r' && v >= 1 && v <= 200) { _prefs.mule_rate = v; _mule_tokens = -1; }   // per 10 min
+        else consolePrint(sub[0] == 'a' ? "AGE: 10-1440 MINUTES" : sub[0] == 's' ? "SIZE: 8-256 MESSAGES" : "RATE: 1-200 PER 10 MIN");
         savePrefs();
       }
     } else if (strcmp(sub, "chans") == 0 || strcmp(sub, "chan") == 0) {
@@ -2249,7 +2051,34 @@ void UITask::runCommand(const char* line) {
   } else if (strcmp(cmd, "gps") == 0) {
     if (argOn(argl)) setGPS(true);
     else if (argOff(argl)) setGPS(false);
-    consolePrint("GPS %s", getGPSState() ? "ON" : "OFF");
+    else if (strncmp(argl, "live", 4) == 0) {
+      if (argOn(argl + 4 + (argl[4] == ' '))) _prefs.gps_always = 1;
+      else if (argOff(argl + 4 + (argl[4] == ' '))) _prefs.gps_always = 0;
+      savePrefs();
+    }
+    static const char* MODES[] = { "OFF (POWERED DOWN)", "FOLLOW (AWAKE)", "REST (ASLEEP)", "CHECKING" };
+    consolePrint("GPS %s // %s", getGPSState() ? "ON" : "OFF", MODES[_gps_mode]);
+    if (_prefs.gps_always) consolePrint("LIVE: NEVER RESTS (gps live off)");
+    else consolePrint("RESTS AFTER 30MIN STILL, CHECKS /10MIN");
+  } else if (strcmp(cmd, "power") == 0) {
+    if (strcmp(argl, "cpu full") == 0) { _prefs.cpu_full = 1; savePrefs(); }
+    else if (strcmp(argl, "cpu save") == 0) { _prefs.cpu_full = 0; savePrefs(); }
+    int mv = getBattMilliVolts();
+    consolePrint("BATT %.2fV %d%%", mv / 1000.0f, battPercent());
+    if (_batt_n >= 3) {   // samples are 5 minutes apart
+      float hours = (_batt_n - 1) * 5 / 60.0f;
+      consolePrint("DRAIN %.0fMV/H OVER %.1fH", (_batt_hist[0] - _batt_hist[_batt_n - 1]) / hours, hours);
+    } else {
+      consolePrint("DRAIN: ASK AGAIN IN %d MIN", (3 - _batt_n) * 5);
+    }
+    static const char* MODES[] = { "OFF", "FOLLOW", "REST", "CHECK" };
+    consolePrint("GPS %s%s  CPU %s", MODES[_gps_mode], _prefs.gps_always ? " (LIVE)" : "",
+                 _prefs.cpu_full ? "FULL" : "80MHZ WHEN DARK");
+    consolePrint("SCREEN OFF AFTER %us  courier %s", _prefs.dim_secs, _prefs.mule ? "ON" : "OFF");
+    static const char* WHY[] = { "?", "POWER ON", "EXT PIN", "SOFTWARE", "PANIC", "INT WDT", "TASK WDT", "WDT",
+                                 "DEEP SLEEP", "BROWNOUT", "SDIO", "USB", "JTAG" };
+    int why = (int)esp_reset_reason();
+    consolePrint("LAST RESTART: %s  UP %lus", why < 13 ? WHY[why] : "?", millis() / 1000);
   } else if (strcmp(cmd, "name") == 0) {
     if (*arg) {
       strncpy(_node_prefs->node_name, arg, sizeof(_node_prefs->node_name) - 1);
@@ -2466,11 +2295,13 @@ void UITask::loop() {
 
   if ((now - _clk_last_ms) >= 1000) watchClock();
   if ((long)(now - _mule_next_tick) >= 0) {
-    _mule_next_tick = now + MULE_TICK_MS;
+    _mule_next_tick = now + 2000;
     muleTick();
   }
   if ((long)(now - _crumb_check) >= 0) {   // breadcrumbs, and keep the map and GPS page live
     _crumb_check = now + 1000;
+    gpsTick();
+    powerTick();
     recordCrumb();
     if ((_screen == SCR_LIST && _tab == TAB_MAP) || _screen == SCR_GPS) _dirty = true;
   }
@@ -2615,6 +2446,7 @@ void UITask::render() {
       case SCR_CHAT: drawChat(); break;
       case SCR_NODE: drawNode(); break;
       case SCR_GPS: drawGps(); break;
+      case SCR_MULE: drawMule(); break;
       default: break;
     }
 
@@ -3018,8 +2850,9 @@ void UITask::drawChat() {
   static Line lines[BODY_ROWS + 200];
   const int max_lines = sizeof(lines) / sizeof(lines[0]);
   int n = 0;
-  int want = BODY_ROWS + _scroll;
+  int want = (_chat_sel >= 0) ? max_lines : BODY_ROWS + _scroll;   // a picked message may be far back
   if (want > max_lines) want = max_lines;
+  int msgs = 0, sel_first = -1, sel_last = -1;
 
   static char full[COLS * 8];
   for (uint32_t s = _next_seq - 1; s > 0 && s + _max_msgs >= _next_seq && n < want; s--) {
@@ -3056,6 +2889,39 @@ void UITask::drawChat() {
       n++;
     }
   }
+  // the picked message (counted newest first): find its lines and keep them on screen
+  if (_chat_sel >= 0) {
+    int ord = -1;
+    const Msg* prev = NULL;
+    if (_chat_sel_seq) {   // stay on the same message even if new ones arrive below it
+      for (int li = 0; li < n; li++) {
+        if (lines[li].m != prev) { prev = lines[li].m; ord++; if (prev->seq == _chat_sel_seq) { _chat_sel = ord; break; } }
+      }
+      ord = -1;
+      prev = NULL;
+    }
+    for (int li = 0; li < n; li++) {
+      if (lines[li].m != prev) { prev = lines[li].m; ord++; msgs = ord + 1; }
+      if (ord == _chat_sel) { if (sel_first < 0) sel_first = li; sel_last = li; }
+    }
+    if (sel_first < 0 && msgs > 0) {   // ran off the oldest end: stay on the oldest
+      _chat_sel = msgs - 1;
+      prev = NULL; ord = -1;
+      for (int li = 0; li < n; li++) {
+        if (lines[li].m != prev) { prev = lines[li].m; ord++; }
+        if (ord == _chat_sel) { if (sel_first < 0) sel_first = li; sel_last = li; }
+      }
+    }
+    if (sel_first >= 0) {
+      _chat_sel_seq = lines[sel_first].m->seq;
+      if (sel_last >= _scroll + BODY_ROWS) _scroll = sel_last - BODY_ROWS + 1;
+      if (sel_first < _scroll) _scroll = sel_first;
+    } else {
+      _chat_sel = -1;
+    }
+  } else {
+    _scroll = 0;
+  }
   if (_scroll > n - BODY_ROWS) _scroll = (n > BODY_ROWS) ? n - BODY_ROWS : 0;
 
   if (n == 0) {
@@ -3069,6 +2935,12 @@ void UITask::drawChat() {
     if (li >= n) continue;
     const Line& L = lines[li];
     const Msg* m = L.m;
+    if (li >= sel_first && li <= sel_last && sel_first >= 0) {   // the picked message gets a bar and a box
+      int yy = BODY_Y + r * ROW_H;
+      _display->gfx().fillRect(0, yy, 3, ROW_H, c_hi);
+      if (li == sel_last) _display->gfx().drawFastHLine(0, yy, SCR_W, c_dim);
+      if (li == sel_first) _display->gfx().drawFastHLine(0, yy + ROW_H - 1, SCR_W, c_dim);
+    }
     char t[8];
     fmtTime(t, m->ts);
     int flen = snprintf(full, sizeof(full), "%s %s: %s", t, m->from, m->text);
@@ -3137,7 +3009,8 @@ void UITask::drawChat() {
   drawInput(INPUT_Y, prompt, _input_buf, _input_len);
   char hint[64];
   int max_len = CD_INPUT_MAX - (_conv_kind == CONV_CHANNEL ? strlen(_node_prefs->node_name) + 2 : 0);
-  snprintf(hint, sizeof(hint), "RET SEND " G_UP G_DOWN " SCROLL " G_LEFT " BACK /help /page /sos %3d/%d", _input_len, max_len);
+  if (sel_first >= 0) snprintf(hint, sizeof(hint), "CLICK/RET @MENTION THEM  " G_UP G_DOWN " PICK  ESC CANCEL  %3d/%d", _input_len, max_len);
+  else snprintf(hint, sizeof(hint), "RET SEND " G_UP G_DOWN " PICK MSG " G_LEFT " BACK /page /sos %3d/%d", _input_len, max_len);
   drawFooter(hint);
 }
 

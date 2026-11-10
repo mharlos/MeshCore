@@ -2560,6 +2560,19 @@ void MyMesh::uiSetDefaultScope(const char* region) {
   savePrefs();
 }
 
+bool MyMesh::uiDiscoverRepeaters(uint32_t& tag) {
+  uint8_t data[10];
+  data[0] = CTL_TYPE_NODE_DISCOVER_REQ | 1;   // prefix-only answers: short, which keeps it quiet
+  data[1] = (1 << ADV_TYPE_REPEATER);
+  getRNG()->random(&data[2], 4);
+  memcpy(&tag, &data[2], 4);
+  memset(&data[6], 0, 4);                     // since = 0: everyone answers
+  mesh::Packet* pkt = createControlData(data, sizeof(data));
+  if (pkt == NULL) return false;
+  sendZeroHop(pkt);
+  return true;
+}
+
 bool MyMesh::uiReflood(const uint8_t* raw, uint8_t len, uint32_t delay_millis) {
   mesh::Packet* pkt = obtainNewPacket();
   if (pkt == NULL) return false;
