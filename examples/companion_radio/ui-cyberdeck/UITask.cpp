@@ -217,6 +217,12 @@ UITask::UITask(mesh::MainBoard* board, MultiSerialInterface* serial) : AbstractU
   _batt_next = 0;
   _chat_sel = -1;
   _chat_sel_seq = 0;
+  _num_admins = 0;
+  _acon_len = _acon_scroll = _acmd_len = 0;
+  _acmd[0] = 0;
+  _aq_sel = 0;
+  _aq_confirm = false;
+  _admin_wait_until = 0;
   _screen = _page_return = SCR_BOOT;
   _tab = TAB_CHAN;
   _scroll = 0;
@@ -852,7 +858,17 @@ bool UITask::matchesKeyword(const char* text) const {
 }
 
 void UITask::onMessageRecv(mesh::Packet *pkt, const ContactInfo &from, uint8_t txt_type, uint32_t sender_timestamp, const char* text) {
-  if (!(txt_type == TXT_TYPE_PLAIN || txt_type == TXT_TYPE_SIGNED_PLAIN)) return;   // not CLI traffic
+  if (txt_type == TXT_TYPE_CLI_DATA) {   // a remote node answering our admin console
+    if (isAdminOf(from.id.pub_key)) {
+      if (memcmp(_conv_peer, from.id.pub_key, 6) != 0) {   // a reply from a node we've since left
+        memcpy(_conv_peer, from.id.pub_key, 6);
+        sanitize(_conv_name, sizeof(_conv_name), from.name);
+      }
+      adminReply(text);
+    }
+    return;
+  }
+  if (!(txt_type == TXT_TYPE_PLAIN || txt_type == TXT_TYPE_SIGNED_PLAIN)) return;   // other CLI traffic
 
   // a room post is signed by its author; say who, not just which room
   char author[32];
@@ -1026,6 +1042,19 @@ void UITask::onLoginResult(const ContactInfo &contact, bool ok, uint8_t permissi
     memcpy(_logged_in[slot], contact.id.pub_key, 6);
   }
   showAlert((permissions & 0x01) ? "ACCESS GRANTED // ADMIN" : "ACCESS GRANTED", 3000);
+  if (permissions & 0x01) {   // admin: remember it, and open the console on a repeater
+    if (!isAdminOf(contact.id.pub_key)) {
+      int slot = _num_admins < CD_ROOM_LOGINS ? _num_admins++ : CD_ROOM_LOGINS - 1;
+      memcpy(_admins[slot], contact.id.pub_key, 6);
+    }
+    if (contact.type == ADV_TYPE_REPEATER) {
+      memcpy(_conv_peer, contact.id.pub_key, 6);
+      sanitize(_conv_name, sizeof(_conv_name), contact.name);
+      _acon_len = 0;
+      openAdmin();
+      return;
+    }
+  }
   beep(Tones::DELIVERED);
   if (contact.type == ADV_TYPE_ROOM) openChat(contact.id.pub_key);
   _dirty = true;
@@ -1335,6 +1364,7 @@ void UITask::handleKey(int key) {
     case SCR_LIST: handleListKey(key); break;
     case SCR_CHAT: handleChatKey(key); break;
     case SCR_NODE: handleNodeKey(key); break;
+    case SCR_ADMIN: handleAdminKey(key); break;
     case SCR_GPS:
       if (key == TKEY_ESC || key == TKEY_BACKSPACE || key == TKEY_LEFT || key == TKEY_CLICK || key == TKEY_ENTER || key == 'g' || key == 'G') {
         _screen = SCR_LIST;
@@ -1437,6 +1467,10 @@ void UITask::handleNodeKey(int key) {
         _input_len = 0;
         _input_buf[0] = 0;
       }
+      break;
+    case 'a': case 'A':
+      if (n && isAdminOf(n->pub)) openAdmin();
+      else showAlert("LOG IN AS ADMIN FIRST (L)", 2000);
       break;
     case 't': case 'T':
       if (n && n->type == ADV_TYPE_REPEATER) {
@@ -2449,6 +2483,7 @@ void UITask::render() {
       case SCR_NODE: drawNode(); break;
       case SCR_GPS: drawGps(); break;
       case SCR_MULE: drawMule(); break;
+      case SCR_ADMIN: drawAdmin(); break;
       default: break;
     }
 
@@ -3078,7 +3113,8 @@ void UITask::drawNode() {
   } else if (n.type == ADV_TYPE_CHAT) {
     drawFooter("RET CHAT  S SHARE  R RESET PATH  D DEL  " G_LEFT " BACK");
   } else if (n.type == ADV_TYPE_REPEATER) {
-    drawFooter("T STATUS  L LOGIN  S SHARE  R PATH  D DEL  " G_LEFT);
+    drawFooter(isAdminOf(n.pub) ? "A ADMIN CONSOLE  T STATUS  S SHARE  R PATH  D DEL"
+                                : "T STATUS  L LOGIN  S SHARE  R PATH  D DEL  " G_LEFT);
   } else {
     drawFooter("RET/L LOGIN  S SHARE  R PATH  D DEL  " G_LEFT " BACK");
   }

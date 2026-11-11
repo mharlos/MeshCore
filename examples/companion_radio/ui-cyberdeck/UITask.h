@@ -36,6 +36,7 @@
 #define CD_NEIGHBOURS         16
 #define CD_KEYWORDS            4
 #define CD_ROOM_LOGINS         8
+#define CD_ADMIN_LINES        40    // remote console scrollback
 #define CD_TILE_CACHE         16    // decoded map tiles, 128KB each in PSRAM
 #define CD_CRUMBS           4096    // breadcrumb trail points kept in RAM
 #define CD_PAGE_PREFIX     "!PAGE"
@@ -46,7 +47,7 @@ public:
   enum ConvKind : uint8_t { CONV_NONE = 0, CONV_CHANNEL, CONV_DM };
 
 private:
-  enum Screen : uint8_t { SCR_BOOT, SCR_LIST, SCR_CHAT, SCR_NODE, SCR_PAGE, SCR_GPS, SCR_MULE };
+  enum Screen : uint8_t { SCR_BOOT, SCR_LIST, SCR_CHAT, SCR_NODE, SCR_PAGE, SCR_GPS, SCR_MULE, SCR_ADMIN };
   enum Tab : uint8_t { TAB_CHAN = 0, TAB_NODES, TAB_HEARD, TAB_MAP, TAB_RF, TAB_SYS, TAB_COUNT };
   enum MapStyle : uint8_t { MS_COLOR = 0, MS_NIGHT, MS_PHOSPHOR, MS_COUNT };
   enum MsgStatus : uint8_t { ST_NONE = 0, ST_SENDING, ST_DELIVERED, ST_FAILED, ST_SENT };
@@ -263,6 +264,17 @@ private:
   int _batt_n;
   unsigned long _batt_next;
 
+  // remote admin console for a repeater or room we're logged into as admin
+  uint8_t _admins[CD_ROOM_LOGINS][6];   // where our login has admin rights
+  int _num_admins;
+  char _acon[CD_ADMIN_LINES][54];
+  int _acon_len, _acon_scroll;
+  char _acmd[96];
+  int _acmd_len;
+  int _aq_sel;              // quick-menu pick while the prompt is empty, -1 = none
+  bool _aq_confirm;         // a risky quick command waiting for a second press
+  unsigned long _admin_wait_until;
+
   // chat: a message picked with the trackball, to @mention its sender
   int _chat_sel;
   uint32_t _chat_sel_seq;
@@ -348,6 +360,14 @@ private:
   int  muleRate() const { return _prefs.mule_rate ? _prefs.mule_rate : 60; }
   void muleStatus();
   void drawMule();
+
+  bool isAdminOf(const uint8_t* pub) const;
+  void openAdmin();
+  void adminPrint(const char* fmt, ...);
+  void adminSend(const char* cmd);
+  void adminReply(const char* text);
+  void handleAdminKey(int key);
+  void drawAdmin();
 
   void gpsTick();
   void gpsSleep(bool sleep);
