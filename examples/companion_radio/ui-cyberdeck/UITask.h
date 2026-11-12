@@ -252,7 +252,8 @@ private:
   Report _reports[CD_REPORTS];
   void notePosition(const uint8_t* pub, const char* text);
   bool contactByName(const char* name, uint8_t* pub_out) const;
-  void addressPage(const char* arg, char* out, size_t n) const;
+  int addressPage(const char* arg, char* out, size_t n);   // returns how many names it addressed
+  bool chanPosterName(const char* word, char* proper);
   unsigned long _nodes_refresh_at;
 
   int _chan_idx[MAX_GROUP_CHANNELS];   // valid channel slots, in order

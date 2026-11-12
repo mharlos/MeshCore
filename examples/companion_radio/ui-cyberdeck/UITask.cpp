@@ -703,9 +703,23 @@ void UITask::notePosition(const uint8_t* pub, const char* text) {
   }
 }
 
-// "/page k1 d2 come in": leading words that are contact names (or end in *) become
-// mentions, so only those pagers ring. "/page come in" pages everyone on the channel.
-void UITask::addressPage(const char* arg, char* out, size_t n) const {
+// someone who has posted in the open channel, by name (any case): the proper spelling
+bool UITask::chanPosterName(const char* word, char* proper) {
+  for (uint32_t s = _next_seq - 1; s > 0 && s + _max_msgs >= _next_seq; s--) {
+    Msg* m = findMsg(s);
+    if (m && m->kind == CONV_CHANNEL && m->chan_idx == _conv_chan && !m->outgoing && strieq(m->from, word)) {
+      strcpy(proper, m->from);
+      return true;
+    }
+  }
+  return false;
+}
+
+// "/page k1 d2 come in": leading words that are contact names, people who've posted in
+// this channel, or end in * become mentions, so only those ring. "/page come in" pages
+// everyone on the channel.
+int UITask::addressPage(const char* arg, char* out, size_t n) {
+  int names = 0;
   size_t o = 0;
   out[0] = 0;
   const char* p = arg;
@@ -718,6 +732,7 @@ void UITask::addressPage(const char* arg, char* out, size_t n) const {
     w[wl] = 0;
     if (w[0] == '@') {   // already a mention
       o += snprintf(out + o, n > o ? n - o : 0, "%s ", w);
+      names++;
     } else {
       bool named = w[wl - 1] == '*' && wl > 1;
       char proper[32];
@@ -728,14 +743,17 @@ void UITask::addressPage(const char* arg, char* out, size_t n) const {
           named = true;
         }
       }
+      if (!named) named = chanPosterName(w, proper);
       if (!named) break;
       o += snprintf(out + o, n > o ? n - o : 0, "@[%s] ", proper);
+      names++;
     }
     p += wl;
   }
   snprintf(out + o, n > o ? n - o : 0, "%s", p);
   size_t L = strlen(out);
   while (L && out[L - 1] == ' ') out[--L] = 0;
+  return names;
 }
 
 const UITask::Node* UITask::findNode(const uint8_t* pub) const {
@@ -1970,12 +1988,32 @@ void UITask::runCommand(const char* line) {
         else snprintf(msg, sizeof(msg), "%s SOS %s", CD_PAGE_PREFIX, arg);
       } else if (_conv_kind == CONV_CHANNEL) {
         char addressed[CD_INPUT_MAX + 1];
-        addressPage(arg, addressed, sizeof(addressed));
+        int names = addressPage(arg, addressed, sizeof(addressed));
         snprintf(msg, sizeof(msg), "%s %s", CD_PAGE_PREFIX, addressed);
+        // say who it went to: a name nobody recognised pages the whole channel
+        char who[48];
+        if (names) {
+          const char* p = addressed;
+          size_t wl = 0;
+          who[0] = 0;
+          for (int k = 0; k < names; k++) {
+            while (*p == ' ') p++;
+            const char* t = p[1] == '[' ? p + 2 : p + 1;
+            const char* e = p[1] == '[' ? strchr(t, ']') : t + strcspn(t, " ");
+            if (!e) break;
+            wl += snprintf(who + wl, sizeof(who) > wl ? sizeof(who) - wl : 0, "%s%.*s", k ? " " : "", (int)(e - t), t);
+            p = (*e == ']') ? e + 1 : e;
+          }
+        }
+        bool ok = sendText(msg, MF_PAGE);
+        if (!ok) consolePrint("PAGE FAILED");
+        else if (names) consolePrint("PAGED %s ONLY", who);
+        else consolePrint("PAGED EVERYONE IN THE CHANNEL");
       } else {
         snprintf(msg, sizeof(msg), "%s %s", CD_PAGE_PREFIX, arg);
+        consolePrint(sendText(msg, MF_PAGE) ? "PAGE SENT" : "PAGE FAILED");
       }
-      consolePrint(sendText(msg, MF_PAGE) ? "PAGE SENT" : "PAGE FAILED");
+      if (cmd[0] == 's') consolePrint(sendText(msg, MF_PAGE) ? "PAGE SENT" : "PAGE FAILED");
     }
   } else if (strcmp(cmd, "where") == 0) {
     // pagers switch GPS on and answer; the answers land on the map
