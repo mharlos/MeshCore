@@ -1037,8 +1037,8 @@ void UITask::onMessageRecv(mesh::Packet *pkt, const ContactInfo &from, uint8_t t
 
   char name[32];
   sanitize(name, sizeof(name), from.name);
-  bool is_page = !room && strncmp(text, CD_PAGE_PREFIX, strlen(CD_PAGE_PREFIX)) == 0 && strncmp(text, CD_PAGE_ACK, strlen(CD_PAGE_ACK)) != 0;
-  bool is_page_ack = !room && strncmp(text, CD_PAGE_ACK, strlen(CD_PAGE_ACK)) == 0;
+  bool is_page = !room && strncasecmp(text, CD_PAGE_PREFIX, strlen(CD_PAGE_PREFIX)) == 0 && strncasecmp(text, CD_PAGE_ACK, strlen(CD_PAGE_ACK)) != 0;
+  bool is_page_ack = !room && strncasecmp(text, CD_PAGE_ACK, strlen(CD_PAGE_ACK)) == 0;
 
   bool viewing = _screen == SCR_CHAT && _conv_kind == CONV_DM && memcmp(_conv_peer, from.id.pub_key, sizeof(_conv_peer)) == 0
                  && _display && _display->isOn();
@@ -1121,9 +1121,9 @@ void UITask::onChannelMessageRecv(mesh::Packet *pkt, ChannelDetails& channel_det
   bool viewing = _screen == SCR_CHAT && _conv_kind == CONV_CHANNEL && _conv_chan == idx && _display && _display->isOn();
   m->unread = !viewing;
 
-  bool is_page = strncmp(body, CD_PAGE_PREFIX, strlen(CD_PAGE_PREFIX)) == 0 && strncmp(body, CD_PAGE_ACK, strlen(CD_PAGE_ACK)) != 0
+  bool is_page = strncasecmp(body, CD_PAGE_PREFIX, strlen(CD_PAGE_PREFIX)) == 0 && strncasecmp(body, CD_PAGE_ACK, strlen(CD_PAGE_ACK)) != 0
                  && pageForMe(body + strlen(CD_PAGE_PREFIX), _node_prefs->node_name);   // a page for someone else is just a message
-  bool is_page_ack = strncmp(body, CD_PAGE_ACK, strlen(CD_PAGE_ACK)) == 0;
+  bool is_page_ack = strncasecmp(body, CD_PAGE_ACK, strlen(CD_PAGE_ACK)) == 0;
   {
     uint8_t who[6];
     if (contactByName(m->from, who)) notePosition(who, body);

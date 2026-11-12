@@ -73,7 +73,7 @@ static const char* stristr(const char* hay, const char* needle) {
 }
 
 static bool isPage(const char* body) {
-  return strncmp(body, PG_PAGE_PREFIX, strlen(PG_PAGE_PREFIX)) == 0 && strncmp(body, PG_PAGE_ACK, strlen(PG_PAGE_ACK)) != 0;
+  return strncasecmp(body, PG_PAGE_PREFIX, strlen(PG_PAGE_PREFIX)) == 0 && strncasecmp(body, PG_PAGE_ACK, strlen(PG_PAGE_ACK)) != 0;   // !page works too
 }
 
 static bool nameMatches(const char* target, int tlen, const char* me) {
