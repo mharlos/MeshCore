@@ -7,15 +7,18 @@
 //
 //   a page arrives (!PAGE)            alarm until the button is pressed; then
 //                                       1 press = "OK", 2 presses = "NEED HELP" (pages the
-//                                       sender back, with position), hold 3 s = SOS
+//                                       sender back, with position), 3 presses = HELP to all
 //   a call home arrives (!HOME)       a different, rising alarm; 1 press = "coming home"
 //                                     On a channel, "!PAGE msg" rings every pager and
 //                                     "!PAGE @[K1] @[D*] msg" only those named (* = prefix)
 //   DM, or a channel post naming us   chirp, LED blinks until a press
 //   1 press                           battery beeps (1-4), clears the blinking LED
 //   2 presses                         "OK" to the farm channel
-//   3 presses                         "Come get me" to the farm channel, with position
-//   hold 3 s, let go                  SOS: pages every deck on the farm channel
+//   3 presses, or hold 3 s            HELP: pages every deck, pager and collar on the farm
+//                                     channel, with position. Tones tell the kid how it went:
+//                                     two-tone = sending, rising x2 = a repeater passed it on,
+//                                     low = nothing heard yet (it retries), a tune played
+//                                     twice = someone answered: help is coming
 //   4 presses                         cancel my SOS / quiet chirps on-off
 //   hold 10 s                         power off
 //   !WHERE (DM) / !WHERE [@[name]]    GPS on; replies with its position now and a fresh fix

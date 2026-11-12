@@ -56,7 +56,8 @@ static const char* T_SENT    = "sent:d=16,o=6,b=200:c,e,g";
 static const char* T_NOHEAR  = "nohear:d=8,o=5,b=160:g,c";
 static const char* T_ARMED   = "armed:d=32,o=7,b=200:c,p,c,p,c";
 static const char* T_SOS     = "sos:d=16,o=6,b=200:c7,g,c7,g,c7";
-static const char* T_HELP    = "help:d=8,o=6,b=140:c,e,g,c7";
+static const char* T_HELP    = "help:d=8,o=6,b=140:c,e,g,c7,p,c,e,g,c7,p,c,e,g,c7";   // someone's coming
+static const char* T_SOS_OUT = "sosout:d=16,o=6,b=180:c,e,g,p,p,c,e,g";            // a repeater passed it on
 static const char* T_ERR     = "err:d=4,o=4,b=120:c";
 static const char* T_ACK     = "ack:d=32,o=8,b=120:c";
 static const char* T_QUIET   = "quiet:d=16,o=6,b=200:g,c";
@@ -265,17 +266,7 @@ void UITask::onClicks(int n) {
     snprintf(msg, sizeof(msg), "OK - all good%s", pos);
     sendToFarm(msg);
   } else if (n == 3) {
-    fmtPos(pos, sizeof(pos), FIX_FRESH_MS);
-    snprintf(msg, sizeof(msg), "Come get me please%s", pos[0] ? pos : " (finding GPS...)");
-    sendToFarm(msg);
-    if (!freshFix(60000)) {   // follow up with a fresh position
-      _want_fix = true;
-      _want_fix_until = millis() + FIX_WAIT_MS;
-      _where_dm = false;
-      _where_chan = farmChannel();
-      strcpy(_want_fix_label, "Here I am");
-      gpsWant(true);
-    }
+    sendSOS();   // I need help: every device on the farm channel alarms
   } else {
     if (_sos) {
       cancelSOS();
@@ -407,7 +398,7 @@ void UITask::onFloodRecv(const mesh::Packet *pkt) {
     _echo_heard = true;   // a repeater passed it on
     _echo_wait = false;
     if (_echo_is_sos) _sos_next_retry = 0;
-    tone(T_SENT, true);
+    tone(_echo_is_sos ? T_SOS_OUT : T_SENT, true);
   }
 }
 
@@ -430,6 +421,18 @@ void UITask::startPage(uint8_t kind, bool dm, const uint8_t* peer, int chan, con
 void UITask::answerPage(int presses) {
   _paging = false;
   _unread = false;
+  if (presses >= 3) {   // help from everyone, not just whoever paged
+    char ack[80];
+    if (_page_dm) {
+      snprintf(ack, sizeof(ack), "%s %s - NEED HELP", PG_PAGE_ACK, _node_prefs->node_name);
+      sendDM(_page_peer, ack);
+    } else {
+      snprintf(ack, sizeof(ack), "%s %s - NEED HELP", PG_PAGE_ACK, _page_from);
+      sendChannel(_page_chan, ack, false);
+    }
+    sendSOS();
+    return;
+  }
   bool help = presses >= 2;
   const char* word = help ? "NEED HELP" : (_page_kind == 2 ? "coming home" : "OK");
   char ack[80];
