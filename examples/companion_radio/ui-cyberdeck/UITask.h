@@ -41,6 +41,8 @@
 #define CD_CRUMBS           4096    // breadcrumb trail points kept in RAM
 #define CD_PAGE_PREFIX     "!PAGE"
 #define CD_PAGE_ACK        "!PAGE-ACK"
+#define CD_WHERE           "!WHERE"   // pagers answer with their position
+#define CD_REPORTS         16         // positions people sent in messages, for the map
 
 class UITask : public AbstractUITask {
 public:
@@ -236,6 +238,14 @@ private:
   Node* _nodes;
   int _num_nodes;
   bool _nodes_dirty;
+
+  // positions found in messages ("@ 45.1,-122.9", SOS pages, !WHERE replies): pagers
+  // keep theirs out of public adverts, so this is how they get on the map
+  struct Report { uint8_t pub[6]; int32_t lat, lon; uint32_t ts; };
+  Report _reports[CD_REPORTS];
+  void notePosition(const uint8_t* pub, const char* text);
+  bool contactByName(const char* name, uint8_t* pub_out) const;
+  void addressPage(const char* arg, char* out, size_t n) const;
   unsigned long _nodes_refresh_at;
 
   int _chan_idx[MAX_GROUP_CHANNELS];   // valid channel slots, in order

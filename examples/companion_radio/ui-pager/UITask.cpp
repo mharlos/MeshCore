@@ -76,6 +76,41 @@ static bool isPage(const char* body) {
   return strncmp(body, PG_PAGE_PREFIX, strlen(PG_PAGE_PREFIX)) == 0 && strncmp(body, PG_PAGE_ACK, strlen(PG_PAGE_ACK)) != 0;
 }
 
+static bool nameMatches(const char* target, int tlen, const char* me) {
+  if (tlen > 0 && target[tlen - 1] == '*') {   // "@[K*]": every name starting with K
+    tlen--;
+    return (int)strlen(me) >= tlen && strncasecmp(me, target, tlen) == 0;
+  }
+  return (int)strlen(me) == tlen && strncasecmp(me, target, tlen) == 0;
+}
+
+// "!PAGE @[K1] @[D*] come home": a page (or !WHERE) for only the names up front.
+// No names up front means everyone.
+static bool forMe(const char* rest, const char* me) {
+  bool any = false;
+  for (const char* p = rest; ; ) {
+    while (*p == ' ') p++;
+    const char* t;
+    int tlen;
+    if (p[0] == '@' && p[1] == '[') {
+      t = p + 2;
+      const char* e = strchr(t, ']');
+      if (!e) break;
+      tlen = e - t;
+      p = e + 1;
+    } else if (p[0] == '@' && p[1] && p[1] != ' ') {
+      t = p + 1;
+      tlen = strcspn(t, " ,:");
+      p = t + tlen;
+    } else {
+      break;
+    }
+    any = true;
+    if (nameMatches(t, tlen, me)) return true;
+  }
+  return !any;
+}
+
 void UITask::begin(DisplayDriver* display, SensorManager* sensors, NodePrefs* node_prefs) {
   _sensors = sensors;
   _node_prefs = node_prefs;
@@ -173,7 +208,7 @@ void UITask::buttonTick() {
     if (held >= HOLD_OFF_MS) {
       _btn_swallow = true;
       shutdown();
-    } else if (held >= HOLD_SOS_MS && !_btn_armed) {
+    } else if (held >= HOLD_SOS_MS && !_btn_armed && !isDog()) {
       _btn_armed = true;
       tone(T_ARMED, true);   // let go now for SOS; keep holding to switch off
     }
@@ -188,6 +223,7 @@ void UITask::buttonTick() {
 
 void UITask::onClicks(int n) {
   char msg[96], pos[40];
+  if (isDog() && n > 1) return;
   if (n == 1) {
     _unread = false;
     _batt_mv = _board->getBattMilliVolts();
@@ -222,7 +258,7 @@ void UITask::onClicks(int n) {
 }
 
 void UITask::onHold() {
-  sendSOS();
+  if (!isDog()) sendSOS();
 }
 
 /* ---------------- GPS ---------------- */
@@ -420,8 +456,22 @@ void UITask::replyWhere() {
 /* ---------------- receiving ---------------- */
 
 bool UITask::mentionsMe(const char* text) const {
+  // the name as a whole word ("K1", "@[K1]"), not inside another one ("OK1", "K10")
   const char* me = _node_prefs->node_name;
-  return me[0] && stristr(text, me) != NULL;
+  size_t n = strlen(me);
+  if (n == 0) return false;
+  for (const char* p = stristr(text, me); p; p = stristr(p + 1, me)) {
+    bool start = p == text || !isalnum((unsigned char)p[-1]);
+    bool end = !isalnum((unsigned char)p[n]);
+    if (start && end) return true;
+  }
+  return false;
+}
+
+// collars (D1, D2...): a dog can't mean to press the button, so it never sends anything
+bool UITask::isDog() const {
+  const char* me = _node_prefs->node_name;
+  return (me[0] == 'D' || me[0] == 'd') && isdigit((unsigned char)me[1]);
 }
 
 void UITask::onMessageRecv(mesh::Packet *pkt, const ContactInfo &from, uint8_t txt_type, uint32_t sender_timestamp, const char* text) {
@@ -476,13 +526,11 @@ void UITask::onChannelMessageRecv(mesh::Packet *pkt, ChannelDetails& channel_det
     return;
   }
   if (isPage(body)) {
-    startPage(false, NULL, idx, from);
+    if (forMe(body + strlen(PG_PAGE_PREFIX), _node_prefs->node_name)) startPage(false, NULL, idx, from);
   } else if (startsWithI(body, PG_PAGE_ACK)) {
     if (_sos && mentionsMe(body + strlen(PG_PAGE_ACK))) { _sos = false; tone(T_HELP, true); gpsWant(false); }
   } else if (startsWithI(body, PG_WHERE)) {
-    const char* who = body + strlen(PG_WHERE);
-    while (*who == ' ') who++;
-    if (!*who || mentionsMe(who)) {
+    if (forMe(body + strlen(PG_WHERE), _node_prefs->node_name)) {
       _where_dm = false;
       _where_chan = idx;
       replyWhere();

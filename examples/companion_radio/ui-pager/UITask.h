@@ -5,7 +5,9 @@
 // Still a full companion radio underneath, so the phone app (BLE) or a PC (USB) can set
 // the name, channels and contacts. On top of that, the button and buzzer do this alone:
 //
-//   a page (!PAGE ...) arrives        alarm until the button is pressed; the press acks it
+//   a page arrives                    alarm until the button is pressed; the press acks it.
+//                                     On a channel, "!PAGE msg" rings every pager and
+//                                     "!PAGE @[K1] @[D*] msg" only those named (* = prefix)
 //   DM, or a channel post naming us   chirp, LED blinks until a press
 //   1 press                           battery beeps (1-4), clears the blinking LED
 //   2 presses                         "OK" to the farm channel
@@ -13,6 +15,9 @@
 //   hold 3 s, let go                  SOS: pages every deck on the farm channel
 //   4 presses                         cancel my SOS / quiet chirps on-off
 //   hold 10 s                         power off
+//   !WHERE (DM) / !WHERE [@[name]]    GPS on; replies with its position now and a fresh fix
+//
+// Named D<digit> (D1, D2): a dog collar. Presses only answer a page; nothing is ever sent.
 //
 // Everything it sends goes to the farm channel: the one named "farm", else the first
 // channel that isn't Public. Without one it sounds an error and sends nothing.
@@ -115,6 +120,7 @@ class UITask : public AbstractUITask {
   void syncClockFrom(uint32_t their_ts, const uint8_t* from);
   bool clockSet() const;
   bool mentionsMe(const char* text) const;
+  bool isDog() const;
 
 public:
   UITask(mesh::MainBoard* board, MultiSerialInterface* serial) : AbstractUITask(board, serial) { }

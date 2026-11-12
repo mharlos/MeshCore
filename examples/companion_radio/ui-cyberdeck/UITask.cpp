@@ -153,6 +153,35 @@ static bool stristr(const char* hay, const char* needle) {
   return false;
 }
 
+// "!PAGE @[K1] @[D*] text": only those named (a trailing * matches a prefix).
+// No names up front means everyone.
+static bool pageForMe(const char* rest, const char* me) {
+  bool any = false;
+  for (const char* p = rest; ; ) {
+    while (*p == ' ') p++;
+    const char* t;
+    int tlen;
+    if (p[0] == '@' && p[1] == '[') {
+      t = p + 2;
+      const char* e = strchr(t, ']');
+      if (!e) break;
+      tlen = e - t;
+      p = e + 1;
+    } else if (p[0] == '@' && p[1] && p[1] != ' ') {
+      t = p + 1;
+      tlen = strcspn(t, " ,:");
+      p = t + tlen;
+    } else {
+      break;
+    }
+    any = true;
+    bool prefix = tlen > 0 && t[tlen - 1] == '*';
+    int cmp = prefix ? tlen - 1 : tlen;
+    if ((prefix ? (int)strlen(me) >= cmp : (int)strlen(me) == cmp) && strncasecmp(me, t, cmp) == 0) return true;
+  }
+  return !any;
+}
+
 static void toHex(char* dest, const uint8_t* src, int len) {
   for (int i = 0; i < len; i++) sprintf(&dest[i * 2], "%02x", src[i]);
 }
@@ -187,6 +216,7 @@ UITask::UITask(mesh::MainBoard* board, MultiSerialInterface* serial) : AbstractU
   _msgs = NULL;
   _max_msgs = 0;
   _nodes = NULL;
+  memset(_reports, 0, sizeof(_reports));
   _rf = NULL;
   _mule = NULL;
   _num_nodes = _num_chans = 0;
@@ -594,6 +624,14 @@ void UITask::refreshNodes() {
     d.lastmod = c.lastmod;
     d.lat = c.gps_lat;
     d.lon = c.gps_lon;
+    for (int r = 0; r < CD_REPORTS; r++) {   // a newer position from a message wins
+      const Report& rp = _reports[r];
+      if (rp.ts && memcmp(rp.pub, d.pub, 6) == 0 && (rp.ts >= d.lastmod || (!d.lat && !d.lon))) {
+        d.lat = rp.lat;
+        d.lon = rp.lon;
+        if (rp.ts > d.lastmod) d.lastmod = rp.ts;
+      }
+    }
   }
   _num_nodes = n;
   qsort(_nodes, _num_nodes, sizeof(Node), [](const void* a, const void* b) -> int {   // most recently heard first
@@ -601,6 +639,92 @@ void UITask::refreshNodes() {
     return (la < lb) ? 1 : (la > lb) ? -1 : 0;
   });
   if (_sel[TAB_NODES] >= _num_nodes) _sel[TAB_NODES] = _num_nodes > 0 ? _num_nodes - 1 : 0;
+}
+
+// a chat contact by its name, as channel posts only carry the name
+bool UITask::contactByName(const char* name, uint8_t* pub_out) const {
+  for (int i = 0; i < _num_nodes; i++) {
+    if (_nodes[i].type == ADV_TYPE_CHAT && strieq(_nodes[i].name, name)) {
+      memcpy(pub_out, _nodes[i].pub, 6);
+      return true;
+    }
+  }
+  return false;
+}
+
+// "@ 45.12345,-122.98765", "SOS ~45.1,-122.9", "LOC 45.1,-122.9 ... (12 min old)"
+void UITask::notePosition(const uint8_t* pub, const char* text) {
+  for (const char* p = text; *p; p++) {
+    if (!(isdigit((unsigned char)*p) || (*p == '-' && isdigit((unsigned char)p[1])))) continue;
+    if (p > text && (isalnum((unsigned char)p[-1]) || p[-1] == '.')) continue;
+    char* e1;
+    double lat = strtod(p, &e1);
+    const char* dot = strchr(p, '.');
+    if (!dot || dot > e1 || e1 - dot < 4 || *e1 != ',') continue;   // want 3+ decimals
+    const char* q = e1 + 1;
+    while (*q == ' ') q++;
+    char* e2;
+    double lon = strtod(q, &e2);
+    dot = strchr(q, '.');
+    if (e2 == q || !dot || dot > e2 || e2 - dot < 4) continue;
+    if (lat < -90 || lat > 90 || lon < -180 || lon > 180 || (lat == 0 && lon == 0)) return;
+
+    uint32_t ts = rtc_clock.getCurrentTime();
+    const char* old = strstr(e2, " min old");
+    if (old) {   // "(12 min old)"
+      const char* d = old;
+      while (d > e2 && isdigit((unsigned char)d[-1])) d--;
+      ts -= 60 * atoi(d);
+    }
+    int slot = 0;
+    for (int i = 0; i < CD_REPORTS; i++) {
+      if (_reports[i].ts && memcmp(_reports[i].pub, pub, 6) == 0) { slot = i; break; }
+      if (_reports[i].ts < _reports[slot].ts) slot = i;   // else the oldest
+    }
+    Report& r = _reports[slot];
+    if (r.ts && memcmp(r.pub, pub, 6) == 0 && r.ts > ts) return;   // already have a newer one
+    memcpy(r.pub, pub, 6);
+    r.lat = (int32_t)(lat * 1e6);
+    r.lon = (int32_t)(lon * 1e6);
+    r.ts = ts;
+    _nodes_dirty = true;
+    return;
+  }
+}
+
+// "/page k1 d2 come in": leading words that are contact names (or end in *) become
+// mentions, so only those pagers ring. "/page come in" pages everyone on the channel.
+void UITask::addressPage(const char* arg, char* out, size_t n) const {
+  size_t o = 0;
+  out[0] = 0;
+  const char* p = arg;
+  while (*p) {
+    while (*p == ' ') p++;
+    size_t wl = strcspn(p, " ");
+    if (wl == 0 || wl > 30) break;
+    char w[32];
+    memcpy(w, p, wl);
+    w[wl] = 0;
+    if (w[0] == '@') {   // already a mention
+      o += snprintf(out + o, n > o ? n - o : 0, "%s ", w);
+    } else {
+      bool named = w[wl - 1] == '*' && wl > 1;
+      char proper[32];
+      strcpy(proper, w);
+      for (int i = 0; !named && i < _num_nodes; i++) {
+        if (_nodes[i].type == ADV_TYPE_CHAT && strieq(_nodes[i].name, w)) {
+          strcpy(proper, _nodes[i].name);
+          named = true;
+        }
+      }
+      if (!named) break;
+      o += snprintf(out + o, n > o ? n - o : 0, "@[%s] ", proper);
+    }
+    p += wl;
+  }
+  snprintf(out + o, n > o ? n - o : 0, "%s", p);
+  size_t L = strlen(out);
+  while (L && out[L - 1] == ' ') out[--L] = 0;
 }
 
 const UITask::Node* UITask::findNode(const uint8_t* pub) const {
@@ -765,6 +889,27 @@ void UITask::sendInput() {
   if (_input_len == 0) return;
   _input_buf[_input_len] = 0;
 
+  // picked a name first, then typed a command: "@[K1] /page come in" -> "/page @[K1] come in"
+  if (_input_buf[0] == '@') {
+    const char* p = _input_buf;
+    while (*p == '@') {
+      const char* e = (p[1] == '[') ? strchr(p, ']') : strchr(p, ' ');
+      if (!e) break;
+      p = e + 1;
+      while (*p == ' ') p++;
+    }
+    if (*p == '/' && p > _input_buf) {
+      char tmp[CD_INPUT_MAX + 2];
+      int ml = p - _input_buf;
+      const char* sp = strchr(p, ' ');
+      int cl = sp ? sp - p : strlen(p);
+      snprintf(tmp, sizeof(tmp), "%.*s %.*s%s", cl, p, ml, _input_buf, sp ? sp + 1 : "");
+      strncpy(_input_buf, tmp, CD_INPUT_MAX);
+      _input_buf[CD_INPUT_MAX] = 0;
+      _input_len = strlen(_input_buf);
+    }
+  }
+
   if (_input_buf[0] == '/') {   // commands work from any chat too
     _console_len = 0;
     _console_scroll = 0;
@@ -884,6 +1029,7 @@ void UITask::onMessageRecv(mesh::Packet *pkt, const ContactInfo &from, uint8_t t
 
   Msg* m = addMsg(CONV_DM, 0, from.id.pub_key, room ? author : from.name, text, false);
   if (m == NULL) return;
+  if (!room) notePosition(from.id.pub_key, text);
   m->hops = pkt->isRouteFlood() ? pkt->path_len : 0xFF;
   m->snr4 = (int8_t)(pkt->getSNR() * 4);
   if (room) m->flags |= MF_ROOM;
@@ -975,8 +1121,13 @@ void UITask::onChannelMessageRecv(mesh::Packet *pkt, ChannelDetails& channel_det
   bool viewing = _screen == SCR_CHAT && _conv_kind == CONV_CHANNEL && _conv_chan == idx && _display && _display->isOn();
   m->unread = !viewing;
 
-  bool is_page = strncmp(body, CD_PAGE_PREFIX, strlen(CD_PAGE_PREFIX)) == 0 && strncmp(body, CD_PAGE_ACK, strlen(CD_PAGE_ACK)) != 0;
+  bool is_page = strncmp(body, CD_PAGE_PREFIX, strlen(CD_PAGE_PREFIX)) == 0 && strncmp(body, CD_PAGE_ACK, strlen(CD_PAGE_ACK)) != 0
+                 && pageForMe(body + strlen(CD_PAGE_PREFIX), _node_prefs->node_name);   // a page for someone else is just a message
   bool is_page_ack = strncmp(body, CD_PAGE_ACK, strlen(CD_PAGE_ACK)) == 0;
+  {
+    uint8_t who[6];
+    if (contactByName(m->from, who)) notePosition(who, body);
+  }
   if (is_page) {
     m->flags |= MF_PAGE;
     saveMsg(m);
@@ -1685,6 +1836,8 @@ void UITask::runCommand(const char* line) {
       consolePrint("mule size <n> age <min> rate <n/10min>");
     } else if (strcmp(argl, "alert") == 0) {
       consolePrint("/page [txt]  ALARM ON THEIR DECK");
+      consolePrint("/page k1 d* txt  ONLY THOSE (IN A CHANNEL)");
+      consolePrint("/where [k1]  PAGERS SEND THEIR POSITION");
       consolePrint("/sos         PAGE WITH YOUR POSITION");
       consolePrint("alert <word>  alert -<word>  alert");
       consolePrint("beep on|off|dm|keys  vol 0-10");
@@ -1804,10 +1957,28 @@ void UITask::runCommand(const char* line) {
         if (lp && lp->isValid()) snprintf(msg, sizeof(msg), "%s SOS %.5f,%.5f %s", CD_PAGE_PREFIX, lp->getLatitude() / 1e6, lp->getLongitude() / 1e6, arg);
         else if (_node_prefs->node_lat || _node_prefs->node_lon) snprintf(msg, sizeof(msg), "%s SOS ~%.5f,%.5f %s", CD_PAGE_PREFIX, _node_prefs->node_lat, _node_prefs->node_lon, arg);
         else snprintf(msg, sizeof(msg), "%s SOS %s", CD_PAGE_PREFIX, arg);
+      } else if (_conv_kind == CONV_CHANNEL) {
+        char addressed[CD_INPUT_MAX + 1];
+        addressPage(arg, addressed, sizeof(addressed));
+        snprintf(msg, sizeof(msg), "%s %s", CD_PAGE_PREFIX, addressed);
       } else {
         snprintf(msg, sizeof(msg), "%s %s", CD_PAGE_PREFIX, arg);
       }
       consolePrint(sendText(msg, MF_PAGE) ? "PAGE SENT" : "PAGE FAILED");
+    }
+  } else if (strcmp(cmd, "where") == 0) {
+    // pagers switch GPS on and answer; the answers land on the map
+    if (!in_chat) consolePrint("OPEN A CHAT, THEN TYPE /where [names]");
+    else {
+      char msg[CD_INPUT_MAX + 1];
+      if (_conv_kind == CONV_CHANNEL) {
+        char addressed[CD_INPUT_MAX + 1];
+        addressPage(arg, addressed, sizeof(addressed));
+        snprintf(msg, sizeof(msg), "%s%s%s", CD_WHERE, addressed[0] ? " " : "", addressed);
+      } else {
+        snprintf(msg, sizeof(msg), "%s", CD_WHERE);
+      }
+      consolePrint(sendText(msg) ? "ASKED - WATCH THE MAP" : "SEND FAILED");
     }
   } else if (strcmp(cmd, "loc") == 0) {
     LocationProvider* lp = _sensors ? _sensors->getLocationProvider() : NULL;
