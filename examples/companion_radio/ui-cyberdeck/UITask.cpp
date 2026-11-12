@@ -1066,7 +1066,8 @@ void UITask::onMessageRecv(mesh::Packet *pkt, const ContactInfo &from, uint8_t t
 
   char name[32];
   sanitize(name, sizeof(name), from.name);
-  bool is_page = !room && strncasecmp(text, CD_PAGE_PREFIX, strlen(CD_PAGE_PREFIX)) == 0 && strncasecmp(text, CD_PAGE_ACK, strlen(CD_PAGE_ACK)) != 0;
+  bool is_page = !room && ((strncasecmp(text, CD_PAGE_PREFIX, strlen(CD_PAGE_PREFIX)) == 0 && strncasecmp(text, CD_PAGE_ACK, strlen(CD_PAGE_ACK)) != 0)
+                            || strncasecmp(text, CD_HOME, strlen(CD_HOME)) == 0);
   bool is_page_ack = !room && strncasecmp(text, CD_PAGE_ACK, strlen(CD_PAGE_ACK)) == 0;
 
   bool viewing = _screen == SCR_CHAT && _conv_kind == CONV_DM && memcmp(_conv_peer, from.id.pub_key, sizeof(_conv_peer)) == 0
@@ -1150,7 +1151,8 @@ void UITask::onChannelMessageRecv(mesh::Packet *pkt, ChannelDetails& channel_det
   bool viewing = _screen == SCR_CHAT && _conv_kind == CONV_CHANNEL && _conv_chan == idx && _display && _display->isOn();
   m->unread = !viewing;
 
-  bool is_page = strncasecmp(body, CD_PAGE_PREFIX, strlen(CD_PAGE_PREFIX)) == 0 && strncasecmp(body, CD_PAGE_ACK, strlen(CD_PAGE_ACK)) != 0
+  bool is_page = ((strncasecmp(body, CD_PAGE_PREFIX, strlen(CD_PAGE_PREFIX)) == 0 && strncasecmp(body, CD_PAGE_ACK, strlen(CD_PAGE_ACK)) != 0)
+                  || strncasecmp(body, CD_HOME, strlen(CD_HOME)) == 0)   // both 5 letters
                  && pageForMe(body + strlen(CD_PAGE_PREFIX), _node_prefs->node_name);   // a page for someone else is just a message
   bool is_page_ack = strncasecmp(body, CD_PAGE_ACK, strlen(CD_PAGE_ACK)) == 0;
   {
@@ -1865,6 +1867,7 @@ void UITask::runCommand(const char* line) {
       consolePrint("mule size <n> age <min> rate <n/10min>");
     } else if (strcmp(argl, "alert") == 0) {
       consolePrint("/page [txt]  ALARM ON THEIR DECK");
+      consolePrint("/home [k1 d*] [txt]  COME-HOME ALARM");
       consolePrint("/page k1 d* txt  ONLY THOSE (IN A CHANNEL)");
       consolePrint("/where [k1]  PAGERS SEND THEIR POSITION");
       consolePrint("/sos         PAGE WITH YOUR POSITION");
@@ -1977,9 +1980,10 @@ void UITask::runCommand(const char* line) {
     if (_num_chans == 0) consolePrint("NO CHANNELS");
 
   /* ---- paging & alerts ---- */
-  } else if (strcmp(cmd, "page") == 0 || strcmp(cmd, "sos") == 0) {
+  } else if (strcmp(cmd, "page") == 0 || strcmp(cmd, "sos") == 0 || strcmp(cmd, "home") == 0) {
     if (!in_chat) { consolePrint("OPEN A CHAT, THEN TYPE /%s", cmd); }
     else {
+      const char* prefix = cmd[0] == 'h' ? CD_HOME : CD_PAGE_PREFIX;   // /home: the recall alarm
       char msg[CD_INPUT_MAX + 1];
       if (cmd[0] == 's') {
         LocationProvider* lp = _sensors ? _sensors->getLocationProvider() : NULL;
@@ -1989,7 +1993,7 @@ void UITask::runCommand(const char* line) {
       } else if (_conv_kind == CONV_CHANNEL) {
         char addressed[CD_INPUT_MAX + 1];
         int names = addressPage(arg, addressed, sizeof(addressed));
-        snprintf(msg, sizeof(msg), "%s %s", CD_PAGE_PREFIX, addressed);
+        snprintf(msg, sizeof(msg), "%s %s", prefix, addressed);
         // say who it went to: a name nobody recognised pages the whole channel
         char who[48];
         if (names) {
@@ -2007,10 +2011,10 @@ void UITask::runCommand(const char* line) {
         }
         bool ok = sendText(msg, MF_PAGE);
         if (!ok) consolePrint("PAGE FAILED");
-        else if (names) consolePrint("PAGED %s ONLY", who);
-        else consolePrint("PAGED EVERYONE IN THE CHANNEL");
+        else if (names) consolePrint("%s %s ONLY", cmd[0] == 'h' ? "CALLED HOME:" : "PAGED", who);
+        else consolePrint("%s EVERYONE IN THE CHANNEL", cmd[0] == 'h' ? "CALLED HOME" : "PAGED");
       } else {
-        snprintf(msg, sizeof(msg), "%s %s", CD_PAGE_PREFIX, arg);
+        snprintf(msg, sizeof(msg), "%s %s", prefix, arg);
         consolePrint(sendText(msg, MF_PAGE) ? "PAGE SENT" : "PAGE FAILED");
       }
       if (cmd[0] == 's') consolePrint(sendText(msg, MF_PAGE) ? "PAGE SENT" : "PAGE FAILED");

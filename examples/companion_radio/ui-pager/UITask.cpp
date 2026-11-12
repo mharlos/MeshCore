@@ -50,6 +50,7 @@ static void onButtonEdge() { }   // waking up is the whole job
 
 // tones (RTTTL)
 static const char* T_PAGE    = "page:d=16,o=7,b=200:c,p,g6,p,c,p,g6,p,c,p,g6";
+static const char* T_HOME    = "home:d=8,o=6,b=160:c,e,g,c7,p,c,e,g,c7";   // rising: come home
 static const char* T_DM      = "dm:d=4,o=6,b=200:32e,32g,32b,16c7";
 static const char* T_SENT    = "sent:d=16,o=6,b=200:c,e,g";
 static const char* T_NOHEAR  = "nohear:d=8,o=5,b=160:g,c";
@@ -81,8 +82,11 @@ static const char* stristr(const char* hay, const char* needle) {
   return NULL;
 }
 
-static bool isPage(const char* body) {
-  return strncasecmp(body, PG_PAGE_PREFIX, strlen(PG_PAGE_PREFIX)) == 0 && strncasecmp(body, PG_PAGE_ACK, strlen(PG_PAGE_ACK)) != 0;   // !page works too
+// 1 = a page, 2 = a call home, 0 = neither (any case: !page works too)
+static uint8_t pageKind(const char* body) {
+  if (strncasecmp(body, PG_HOME, strlen(PG_HOME)) == 0) return 2;
+  if (strncasecmp(body, PG_PAGE_PREFIX, strlen(PG_PAGE_PREFIX)) == 0 && strncasecmp(body, PG_PAGE_ACK, strlen(PG_PAGE_ACK)) != 0) return 1;
+  return 0;
 }
 
 static bool nameMatches(const char* target, int tlen, const char* me) {
@@ -199,10 +203,17 @@ void UITask::buttonTick() {
       _btn_pressed_at = now;
       _btn_armed = false;
       _btn_swallow = false;
-      if (_paging) {          // any press answers a page
-        ackPage();
-        _btn_swallow = true;
-        _clicks = 0;
+      if (_paging) {
+        _paging = false;
+        if (isDog()) {          // the owner's press: answered, done
+          answerPage(1);
+          _btn_swallow = true;
+          _clicks = 0;
+        } else {                // silence it, then count presses for the answer
+          _answering = true;
+          _clicks = 0;
+          tone(T_ACK, true);
+        }
       }
     } else {
       uint32_t held = now - _btn_pressed_at;
@@ -237,6 +248,11 @@ void UITask::buttonTick() {
 
 void UITask::onClicks(int n) {
   char msg[96], pos[40];
+  if (_answering) {
+    _answering = false;
+    answerPage(n);
+    return;
+  }
   if (isDog() && n > 1) return;
   if (n == 1) {
     _unread = false;
@@ -272,6 +288,7 @@ void UITask::onClicks(int n) {
 }
 
 void UITask::onHold() {
+  _answering = false;   // holding while answering a page: that's an SOS
   if (!isDog()) sendSOS();
 }
 
@@ -396,8 +413,10 @@ void UITask::onFloodRecv(const mesh::Packet *pkt) {
 
 /* ---------------- paging ---------------- */
 
-void UITask::startPage(bool dm, const uint8_t* peer, int chan, const char* from) {
+void UITask::startPage(uint8_t kind, bool dm, const uint8_t* peer, int chan, const char* from) {
   _paging = true;
+  _answering = false;
+  _page_kind = kind;
   _page_dm = dm;
   if (peer) memcpy(_page_peer, peer, 6);
   _page_chan = chan;
@@ -407,17 +426,41 @@ void UITask::startPage(bool dm, const uint8_t* peer, int chan, const char* from)
   _page_next_tone = _page_started;
 }
 
-void UITask::ackPage() {
+// answer whoever paged us, where they paged us from: 1 press OK, 2+ presses need help
+void UITask::answerPage(int presses) {
   _paging = false;
   _unread = false;
-  char ack[64];
+  bool help = presses >= 2;
+  const char* word = help ? "NEED HELP" : (_page_kind == 2 ? "coming home" : "OK");
+  char ack[80];
   bool ok;
   if (_page_dm) {
-    snprintf(ack, sizeof(ack), "%s %s", PG_PAGE_ACK, _node_prefs->node_name);
+    snprintf(ack, sizeof(ack), "%s %s - %s", PG_PAGE_ACK, _node_prefs->node_name, word);
     ok = sendDM(_page_peer, ack);
   } else {
-    snprintf(ack, sizeof(ack), "%s %s", PG_PAGE_ACK, _page_from);
+    snprintf(ack, sizeof(ack), "%s %s - %s", PG_PAGE_ACK, _page_from, word);
     ok = sendChannel(_page_chan, ack, false);
+  }
+  if (help) {
+    // and set off their alarm: a page back to just them, with where we are
+    char pos[40], msg[110];
+    fmtPos(pos, sizeof(pos), FIX_FRESH_MS);
+    if (_page_dm) {
+      snprintf(msg, sizeof(msg), "%s %s needs help%s", PG_PAGE_PREFIX, _node_prefs->node_name, pos);
+      ok = sendDM(_page_peer, msg) && ok;
+    } else {
+      snprintf(msg, sizeof(msg), "%s @[%s] %s needs help%s", PG_PAGE_PREFIX, _page_from, _node_prefs->node_name, pos);
+      ok = sendChannel(_page_chan, msg, false) && ok;
+    }
+    if (!freshFix(60000)) {   // a fresh position to the same place when GPS has one
+      _want_fix = true;
+      _want_fix_until = millis() + FIX_WAIT_MS;
+      _where_dm = _page_dm;
+      memcpy(_where_peer, _page_peer, 6);
+      _where_chan = _page_chan;
+      strcpy(_want_fix_label, "Here I am");
+      gpsWant(true);
+    }
   }
   tone(ok ? T_SENT : T_ERR, true);
 }
@@ -496,8 +539,8 @@ void UITask::onMessageRecv(mesh::Packet *pkt, const ContactInfo &from, uint8_t t
   }
   syncClockFrom(sender_timestamp, from.id.pub_key);
 
-  if (isPage(text)) {
-    startPage(true, from.id.pub_key, -1, from.name);
+  if (pageKind(text)) {
+    startPage(pageKind(text), true, from.id.pub_key, -1, from.name);
   } else if (startsWithI(text, PG_PAGE_ACK)) {
     if (_sos) { _sos = false; tone(T_HELP, true); gpsWant(false); }
     else tone(T_ACK);
@@ -539,8 +582,8 @@ void UITask::onChannelMessageRecv(mesh::Packet *pkt, ChannelDetails& channel_det
     if (mentionsMe(body)) { _unread = true; tone(T_DM); }
     return;
   }
-  if (isPage(body)) {
-    if (forMe(body + strlen(PG_PAGE_PREFIX), _node_prefs->node_name)) startPage(false, NULL, idx, from);
+  if (pageKind(body)) {   // "!PAGE" and "!HOME" are both 5 letters
+    if (forMe(body + strlen(PG_PAGE_PREFIX), _node_prefs->node_name)) startPage(pageKind(body), false, NULL, idx, from);
   } else if (startsWithI(body, PG_PAGE_ACK)) {
     if (_sos && mentionsMe(body + strlen(PG_PAGE_ACK))) { _sos = false; tone(T_HELP, true); gpsWant(false); }
   } else if (startsWithI(body, PG_WHERE)) {
@@ -613,7 +656,7 @@ void UITask::loop() {
   gpsTick();
 
   if (_paging && (now - _page_started) < PAGE_TONE_FOR && (long)(now - _page_next_tone) >= 0) {
-    tone(T_PAGE, true);
+    tone(_page_kind == 2 ? T_HOME : T_PAGE, true);
     _page_next_tone = now + PAGE_TONE_EVERY;
   }
 

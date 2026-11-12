@@ -41,7 +41,8 @@
 #define CD_CRUMBS           4096    // breadcrumb trail points kept in RAM
 #define CD_PAGE_PREFIX     "!PAGE"
 #define CD_PAGE_ACK        "!PAGE-ACK"
-#define CD_WHERE           "!WHERE"   // pagers answer with their position
+#define CD_WHERE           "!WHERE"
+#define CD_HOME            "!HOME"    // a page that means "come home" (pagers play a recall tone)   // pagers answer with their position
 #define CD_REPORTS         16         // positions people sent in messages, for the map
 
 class UITask : public AbstractUITask {

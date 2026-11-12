@@ -5,7 +5,10 @@
 // Still a full companion radio underneath, so the phone app (BLE) or a PC (USB) can set
 // the name, channels and contacts. On top of that, the button and buzzer do this alone:
 //
-//   a page arrives                    alarm until the button is pressed; the press acks it.
+//   a page arrives (!PAGE)            alarm until the button is pressed; then
+//                                       1 press = "OK", 2 presses = "NEED HELP" (pages the
+//                                       sender back, with position), hold 3 s = SOS
+//   a call home arrives (!HOME)       a different, rising alarm; 1 press = "coming home"
 //                                     On a channel, "!PAGE msg" rings every pager and
 //                                     "!PAGE @[K1] @[D*] msg" only those named (* = prefix)
 //   DM, or a channel post naming us   chirp, LED blinks until a press
@@ -37,6 +40,7 @@
 #define PG_PAGE_PREFIX   "!PAGE"
 #define PG_PAGE_ACK      "!PAGE-ACK"
 #define PG_WHERE         "!WHERE"
+#define PG_HOME          "!HOME"
 
 class UITask : public AbstractUITask {
   SensorManager* _sensors = NULL;
@@ -52,6 +56,8 @@ class UITask : public AbstractUITask {
 
   // an unanswered page
   bool _paging = false;
+  uint8_t _page_kind = 1;        // 1 = page, 2 = call home
+  bool _answering = false;       // alarm silenced by a press; counting presses for the answer
   uint32_t _page_started = 0, _page_next_tone = 0;
   bool _page_dm = false;
   uint8_t _page_peer[6];
@@ -112,8 +118,8 @@ class UITask : public AbstractUITask {
   bool sendDM(const uint8_t* pub_prefix, const char* text);
   void sendToFarm(const char* text, bool is_sos = false);
 
-  void startPage(bool dm, const uint8_t* peer, int chan, const char* from);
-  void ackPage();
+  void startPage(uint8_t kind, bool dm, const uint8_t* peer, int chan, const char* from);
+  void answerPage(int presses);
   void sendSOS();
   void cancelSOS();
   void replyWhere();
