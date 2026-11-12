@@ -285,6 +285,9 @@ UITask::UITask(mesh::MainBoard* board, MultiSerialInterface* serial) : AbstractU
   _map_pan = _map_inited = false;
   _map_pan_at = 0;
   _map_node_sel = -1;
+  _map_pick = false;
+  _map_pick_by = 0;
+  _map_pick_sel = _map_pick_top = 0;
   _crumbs = NULL;
   _crumb_head = _crumb_count = 0;
   _crumb_check = 0;
@@ -612,6 +615,10 @@ void UITask::refreshNodes() {
   _nodes_refresh_at = millis() + 2000;
   if (_nodes == NULL) { _num_nodes = 0; return; }
 
+  uint8_t sel_pub[6];
+  bool had_sel = _map_node_sel >= 0 && _map_node_sel < _num_nodes;
+  if (had_sel) memcpy(sel_pub, _nodes[_map_node_sel].pub, 6);
+
   ContactInfo c;
   int n = 0;
   for (int i = 0; i < the_mesh.getTotalContactSlots() && n < MAX_CONTACTS; i++) {
@@ -639,6 +646,10 @@ void UITask::refreshNodes() {
     return (la < lb) ? 1 : (la > lb) ? -1 : 0;
   });
   if (_sel[TAB_NODES] >= _num_nodes) _sel[TAB_NODES] = _num_nodes > 0 ? _num_nodes - 1 : 0;
+  if (had_sel) {   // the list re-sorts as nodes are heard; the map keeps the same node
+    _map_node_sel = -1;
+    for (int i = 0; i < _num_nodes; i++) if (memcmp(_nodes[i].pub, sel_pub, 6) == 0) { _map_node_sel = i; break; }
+  }
 }
 
 // a chat contact by its name, as channel posts only carry the name
@@ -1644,7 +1655,7 @@ void UITask::handleListKey(int key) {
   int count = (_tab == TAB_CHAN) ? _num_chans : (_tab == TAB_NODES) ? _num_nodes : (_tab == TAB_HEARD) ? num_heard : 0;
   int& sel = _sel[_tab];
 
-  if (_tab != TAB_MAP) _map_pan = false;   // never come back to a map that's still panning
+  if (_tab != TAB_MAP) _map_pan = _map_pick = false;   // never come back to a map that's still panning
   if (_tab == TAB_MAP && handleMapKey(key)) return;
   if (_tab == TAB_RF && (key == 'm' || key == 'M')) { _screen = SCR_MULE; _mule_scroll = 0; return; }
 
@@ -1849,7 +1860,7 @@ void UITask::runCommand(const char* line) {
       consolePrint("pin <6 digits>|random  BLE PAIRING PIN");
       consolePrint("power  gps live on|off  BATTERY");
       consolePrint("crumbs on|off|clear  sd");
-      consolePrint("MAP: " G_UP G_DOWN " ZOOM CLICK PAN C ME N/P NODE");
+      consolePrint("MAP: " G_UP G_DOWN " ZOOM CLICK PAN C ME N NODE LIST");
       consolePrint("     G GPS  S STYLE  B TRAIL  L LABELS");
       consolePrint("/loc  SEND YOUR POSITION");
       consolePrint("NODE PAGE: L LOGIN T STATUS S SHARE");

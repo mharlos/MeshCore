@@ -372,6 +372,8 @@ bool UITask::handleMapKey(int key) {
   int zlo = _map_zmin >= 0 ? _map_zmin : 2;
   int zhi = _map_zmax >= 0 ? _map_zmax + MAX_OVERZOOM : 18;
 
+  if (_map_pick) return mapPickKey(key);
+
   // pan mode lets go by itself, so left/right are never stuck moving the map
   if (_map_pan && millis() - _map_pan_at > MAP_PAN_IDLE_MS) _map_pan = false;
 
@@ -420,19 +422,16 @@ bool UITask::handleMapKey(int key) {
       }
       return true;
     }
-    case 'n': case 'N': case 'p': case 'P': {
-      int dir = (key == 'n' || key == 'N') ? 1 : -1;
-      for (int step = 1; step <= _num_nodes; step++) {
-        int i = ((_map_node_sel < 0 ? (dir > 0 ? -1 : 0) : _map_node_sel) + dir * step + _num_nodes * 2) % _num_nodes;
-        if (_nodes[i].lat || _nodes[i].lon) {
-          _map_node_sel = i;
-          _map_lat = _nodes[i].lat / 1e6;
-          _map_lon = _nodes[i].lon / 1e6;
-          _map_follow = false;
-          return true;
-        }
+    case 'n': case 'N': {
+      double rl, rn;
+      bool hr;
+      if (mapPickList(NULL, rl, rn, hr) == 0) {
+        showAlert("NO NODES HAVE SHARED A POSITION", 2500);
+        return true;
       }
-      showAlert("NO NODES HAVE SHARED A POSITION", 2500);
+      _map_pan = false;
+      _map_pick = true;
+      _map_pick_sel = _map_pick_top = 0;
       return true;
     }
     case 'g': case 'G':
@@ -663,8 +662,132 @@ void UITask::drawMap() {
   g.fillRect(0, MAP_Y + MAP_H, SCR_W, CYBERDECK_H - MAP_Y - MAP_H, c_bg);
   drawHeader();
   drawTabs();
-  drawFooter(_map_pan ? "PAN: BALL MOVES MAP  CLICK OR WAIT 5s TO STOP"
-                      : "\x18\x19 ZOOM  CLICK PAN  C ME  N NODE  G GPS  S STYLE");
+  drawFooter(_map_pick ? "\x18\x19 PICK  RET SHOW ON MAP  \x1b\x1a DIST/HOPS  ESC CLOSE"
+             : _map_pan ? "PAN: BALL MOVES MAP  CLICK OR WAIT 5s TO STOP"
+                        : "\x18\x19 ZOOM  CLICK PAN  C ME  N NODES  G GPS  S STYLE");
+  if (_map_pick) drawMapPick();
+}
+
+/* ------------------------------------- node picker ------------------------------------- */
+
+#define PICK_ROW_H   12
+#define PICK_ROWS    ((MAP_H - 16) / PICK_ROW_H)
+
+static int hopsOf(uint8_t path_len) { return path_len == OUT_PATH_UNKNOWN ? 99 : (path_len & 63); }
+
+// nodes with a position, sorted; returns the count (out may be NULL to just count)
+int UITask::mapPickList(int* out, double& ref_lat, double& ref_lon, bool& have_ref) {
+  have_ref = myPosition(ref_lat, ref_lon);
+  if (!have_ref && _crumb_count) {
+    const Crumb& c = _crumbs[(_crumb_head + CD_CRUMBS - 1) % CD_CRUMBS];
+    ref_lat = c.lat / 1e6; ref_lon = c.lon / 1e6;
+    have_ref = true;
+  }
+  if (!have_ref) { ref_lat = _map_lat; ref_lon = _map_lon; }   // from the middle of the map
+
+  static int idx[MAX_CONTACTS];
+  static float dist[MAX_CONTACTS];
+  int n = 0;
+  for (int i = 0; i < _num_nodes && n < MAX_CONTACTS; i++) {
+    if (!_nodes[i].lat && !_nodes[i].lon) continue;
+    dist[i] = (float)distM(ref_lat, ref_lon, _nodes[i].lat / 1e6, _nodes[i].lon / 1e6);
+    idx[n++] = i;
+  }
+  if (out == NULL) return n;
+  // insertion sort: small lists, and stable
+  for (int a = 1; a < n; a++) {
+    int v = idx[a], b = a - 1;
+    while (b >= 0) {
+      int w = idx[b];
+      bool after;
+      if (_map_pick_by == 1) {
+        int hv = hopsOf(_nodes[v].path_len), hw = hopsOf(_nodes[w].path_len);
+        after = hw > hv || (hw == hv && dist[w] > dist[v]);
+      } else {
+        after = dist[w] > dist[v];
+      }
+      if (!after) break;
+      idx[b + 1] = w;
+      b--;
+    }
+    idx[b + 1] = v;
+  }
+  memcpy(out, idx, n * sizeof(int));
+  return n;
+}
+
+bool UITask::mapPickKey(int key) {
+  static int list[MAX_CONTACTS];
+  double rl, rn;
+  bool hr;
+  int n = mapPickList(list, rl, rn, hr);
+  if (n == 0) { _map_pick = false; return true; }
+  if (_map_pick_sel >= n) _map_pick_sel = n - 1;
+  switch (key) {
+    case TKEY_UP:   if (_map_pick_sel > 0) _map_pick_sel--; break;
+    case TKEY_DOWN: if (_map_pick_sel < n - 1) _map_pick_sel++; break;
+    case TKEY_LEFT: case TKEY_RIGHT: case 'h': case 'H': case 'd': case 'D':
+      _map_pick_by = (key == 'h' || key == 'H') ? 1 : (key == 'd' || key == 'D') ? 0 : !_map_pick_by;
+      _map_pick_sel = _map_pick_top = 0;
+      break;
+    case TKEY_CLICK: case TKEY_ENTER: {
+      const Node& nd = _nodes[list[_map_pick_sel]];
+      _map_node_sel = list[_map_pick_sel];
+      _map_lat = nd.lat / 1e6;
+      _map_lon = nd.lon / 1e6;
+      _map_follow = false;
+      _map_pick = false;
+      break;
+    }
+    case TKEY_ESC: case TKEY_BACKSPACE: case 'n': case 'N':
+      _map_pick = false;
+      break;
+    default:
+      break;   // swallow everything else while the list is up
+  }
+  if (_map_pick_sel < _map_pick_top) _map_pick_top = _map_pick_sel;
+  if (_map_pick_sel >= _map_pick_top + PICK_ROWS) _map_pick_top = _map_pick_sel - PICK_ROWS + 1;
+  return true;
+}
+
+void UITask::drawMapPick() {
+  Adafruit_GFX& g = _display->gfx();
+  static int list[MAX_CONTACTS];
+  double rl, rn;
+  bool have_ref;
+  int n = mapPickList(list, rl, rn, have_ref);
+
+  g.fillRect(0, MAP_Y, SCR_W, MAP_H, c_bg);
+  g.drawRect(0, MAP_Y, SCR_W, MAP_H, c_dim);
+  char head[60];
+  snprintf(head, sizeof(head), "NODES ON THE MAP: %d  //  BY %s%s", n, _map_pick_by ? "HOPS" : "DISTANCE",
+           have_ref ? "" : " (FROM MAP)");
+  stext(4, MAP_Y + 3, c_hi, head);
+  g.drawFastHLine(1, MAP_Y + 13, SCR_W - 2, c_dim);
+
+  for (int r = 0; r < PICK_ROWS && _map_pick_top + r < n; r++) {
+    int li = _map_pick_top + r;
+    const Node& nd = _nodes[list[li]];
+    int y = MAP_Y + 16 + r * PICK_ROW_H;
+    bool sel = li == _map_pick_sel;
+    if (sel) g.fillRect(1, y - 1, SCR_W - 2, PICK_ROW_H, c_fg);
+    uint16_t col = sel ? c_bg : (nd.type == ADV_TYPE_CHAT ? c_hi : c_fg);
+
+    char dist[12], hops[8], ago[8], line[64];
+    double d = distM(rl, rn, nd.lat / 1e6, nd.lon / 1e6);
+    char ds[10];
+    fmtDist(ds, sizeof(ds), d);
+    snprintf(dist, sizeof(dist), "%s %s", ds, compass(bearingDeg(rl, rn, nd.lat / 1e6, nd.lon / 1e6)));
+    int h = hopsOf(nd.path_len);
+    if (h == 99) strcpy(hops, "FLOOD");
+    else if (h == 0) strcpy(hops, "DIRECT");
+    else snprintf(hops, sizeof(hops), "%d HOP", h);
+    fmtAgo(ago, nd.lastmod);
+    snprintf(line, sizeof(line), "%s %-14.14s %-11s %-6s %s", nodeTag(nd.type), nd.name, dist, hops, ago);
+    stext(4, y, col, line);
+  }
+  if (_map_pick_top > 0) stext(SCR_W - 10, MAP_Y + 16, c_alert, "\x18");
+  if (_map_pick_top + PICK_ROWS < n) stext(SCR_W - 10, MAP_Y + 16 + (PICK_ROWS - 1) * PICK_ROW_H, c_alert, "\x19");
 }
 
 void UITask::drawGps() {

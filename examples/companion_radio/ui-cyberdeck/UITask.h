@@ -217,6 +217,13 @@ private:
   bool _map_follow, _map_pan, _map_inited;
   unsigned long _map_pan_at;   // last pan activity: pan mode lets go after a few idle seconds
   int _map_node_sel;        // into _nodes, -1 = none
+  // N on the map: a list of nodes with a position, nearest (or fewest hops) first
+  bool _map_pick;
+  uint8_t _map_pick_by;     // 0 = distance, 1 = hops
+  int _map_pick_sel, _map_pick_top;
+  int mapPickList(int* out, double& ref_lat, double& ref_lon, bool& have_ref);
+  bool mapPickKey(int key);
+  void drawMapPick();
   double _home_lat, _home_lon;
   Crumb* _crumbs;
   int _crumb_head, _crumb_count;
