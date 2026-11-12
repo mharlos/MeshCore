@@ -40,4 +40,5 @@ public:
 
   virtual void notify(UIEventType t = UIEventType::none) = 0;
   virtual void loop() = 0;
+  virtual bool isBusy() { return false; }   // true: don't let the MCU sleep after this loop()
 };

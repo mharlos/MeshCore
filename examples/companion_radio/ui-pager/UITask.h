@@ -137,6 +137,7 @@ public:
   // from AbstractUITask
   void notify(UIEventType t = UIEventType::none) override;
   void loop() override;
+  bool isBusy() override;
 
   void shutdown(bool restart = false);
 };

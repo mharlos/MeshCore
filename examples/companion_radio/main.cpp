@@ -305,7 +305,11 @@ void loop() {
   external_watchdog.loop();
 #endif
 
-  if (!the_mesh.hasPendingWork()) {
+  bool ui_busy = false;
+#ifdef DISPLAY_CLASS
+  ui_busy = ui_task.isBusy();   // e.g. a button press still being counted, or a tune playing
+#endif
+  if (!the_mesh.hasPendingWork() && !ui_busy) {
 #if defined(NRF52_PLATFORM)
     board.sleep(0); // nrf ignores seconds param, sleeps whenever possible
 #endif

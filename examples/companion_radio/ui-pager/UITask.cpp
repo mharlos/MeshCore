@@ -8,6 +8,15 @@
 
 extern MicroNMEALocationProvider nmea;
 
+// Between radio packets the nRF52 sleeps until an interrupt. The button gets one of its
+// own, and a slow tick wakes us for LED blinks and timeouts.
+#ifdef NRF52_PLATFORM
+  #include <utility/SoftwareTimer.h>
+  static SoftwareTimer wake_tick;
+  static void onWakeTick(TimerHandle_t) { }
+#endif
+static void onButtonEdge() { }   // waking up is the whole job
+
 #ifndef USER_BTN_PRESSED
   #define USER_BTN_PRESSED LOW
 #endif
@@ -123,6 +132,11 @@ void UITask::begin(DisplayDriver* display, SensorManager* sensors, NodePrefs* no
   // the press that switched us on may still be held: it mustn't count as a hold (SOS)
   _btn_down = _btn_swallow = digitalRead(PIN_USER_BTN) == USER_BTN_PRESSED;
   _btn_changed = millis();
+  attachInterrupt(digitalPinToInterrupt(PIN_USER_BTN), onButtonEdge, CHANGE);
+#endif
+#ifdef NRF52_PLATFORM
+  wake_tick.begin(200, onWakeTick);
+  wake_tick.start();
 #endif
 #ifdef PIN_STATUS_LED
   pinMode(PIN_STATUS_LED, OUTPUT);
@@ -582,6 +596,15 @@ void UITask::shutdown(bool restart) {
 #endif
   if (restart) _board->reboot();
   else _board->powerOff();
+}
+
+// stay awake while a press is being counted or held, a tune plays, or the LED is lit
+bool UITask::isBusy() {
+  if (_btn_down || _clicks || _led_state) return true;
+#ifdef PIN_BUZZER
+  if (buzzer.isPlaying()) return true;
+#endif
+  return false;
 }
 
 void UITask::loop() {
