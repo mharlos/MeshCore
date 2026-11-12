@@ -1853,7 +1853,7 @@ void MyMesh::handleCmdFrame(size_t len) {
     memcpy(&pin, &cmd_frame[1], 4);
 
     // ensure pin is zero, or a valid 6 digit pin
-    if (pin == 0 || (pin >= 100000 && pin <= 999999)) {
+    if (pin <= 999999) {   // any 6-digit PIN, leading zeros included; 0 = back to the default
       _prefs.ble_pin = pin;
       savePrefs();
       writeOKFrame();

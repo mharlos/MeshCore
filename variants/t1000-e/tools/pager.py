@@ -22,8 +22,8 @@ import serial
 
 CMD_APP_START, CMD_SET_DEVICE_TIME, CMD_SEND_SELF_ADVERT, CMD_SET_ADVERT_NAME = 1, 6, 7, 8
 CMD_REBOOT, CMD_GET_BATT, CMD_GET_CHANNEL, CMD_SET_CHANNEL = 19, 20, 31, 32
-CMD_SET_DEVICE_PIN, CMD_FACTORY_RESET = 37, 51
-RESP_OK, RESP_ERR, RESP_SELF_INFO, RESP_BATT, RESP_CHANNEL = 0, 1, 5, 12, 18
+CMD_SET_DEVICE_PIN, CMD_FACTORY_RESET, CMD_DEVICE_QUERY = 37, 51, 22
+RESP_OK, RESP_ERR, RESP_SELF_INFO, RESP_BATT, RESP_CHANNEL, RESP_DEVICE_INFO = 0, 1, 5, 12, 18, 13
 
 
 def open_port(port):
@@ -81,6 +81,11 @@ def info(s):
     b = recv(s, (RESP_BATT,))
     if b:
         print(f"batt   {struct.unpack('<H', b[1:3])[0]} mV")
+    send(s, bytes([CMD_DEVICE_QUERY, 3]))
+    d = recv(s, (RESP_DEVICE_INFO,))
+    if d:
+        pin = struct.unpack("<I", d[4:8])[0]
+        print(f"pin    {pin:06d}" if pin else "pin    build default")
 
 
 def chans(s):

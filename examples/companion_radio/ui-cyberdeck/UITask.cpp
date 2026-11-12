@@ -2068,11 +2068,11 @@ void UITask::runCommand(const char* line) {
       changed = true;
     } else if (argl[0]) {
       long p = atol(argl);
-      if (strlen(argl) == 6 && p >= 100000 && p <= 999999) {
+      if (strlen(argl) == 6 && strspn(argl, "0123456789") == 6 && p >= 1) {   // leading zeros are fine
         _node_prefs->ble_pin = (uint32_t)p;
         changed = true;
       } else {
-        consolePrint("PIN MUST BE 6 DIGITS, 100000-999999");
+        consolePrint("PIN MUST BE 6 DIGITS, NOT 000000");
       }
     }
     if (changed) the_mesh.savePrefs();
