@@ -4,6 +4,7 @@ r"""Drive a T-Deck running the cyberdeck UI (built with CD_SERIAL_BRIDGE) over U
   deck.py COM13 shot out.png             save a screenshot
   deck.py COM13 keys "hello" enter       type text, then press keys
   deck.py COM13 log 10                   print serial output for 10 seconds
+  deck.py COM13 msgs [out.txt]           dump the message history
   deck.py COM13 sd                       summarise the SD card
   deck.py COM13 pull /maps C:\maps        copy a folder tree off the SD card (rerun to resume)
 
@@ -228,6 +229,23 @@ def main():
         text = buf.decode("utf-8", "replace")
         start = text.find("#SD")
         print(text[start:] if start >= 0 else text)
+    elif cmd == "msgs":
+        # message history, oldest first: seq|ts|kind|chan|out|hops|snr4|flags|status|from|text
+        s.reset_input_buffer()
+        s.write(b"\x15")
+        end = time.time() + 30
+        buf = b""
+        while time.time() < end and b"#END" not in buf:
+            buf += s.read(4096)
+        text = buf.decode("utf-8", "replace")
+        start = text.find("#MSGS")
+        out = text[start:text.find("#END")] if start >= 0 else text
+        if args:
+            with open(args[0], "w", encoding="utf-8") as f:
+                f.write(out)
+            print("saved", args[0], out.count("\n") - 1, "messages")
+        else:
+            print(out)
     elif cmd == "pull":
         pull(s, args[0] if args else "/maps", args[1] if len(args) > 1 else "maps")
     elif cmd == "log":

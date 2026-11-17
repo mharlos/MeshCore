@@ -2504,6 +2504,26 @@ void UITask::serialBridge() {
         Serial.println("#END");
         break;
       }
+      case 0x15: {   // dump the message history, oldest first: seq|ts|kind|chan|out|hops|snr4|flags|status|from|text
+        Serial.printf("\n#MSGS %d\n", _max_msgs);
+        uint32_t first = _next_seq > (uint32_t)_max_msgs ? _next_seq - _max_msgs : 1;
+        for (uint32_t s = first; s < _next_seq; s++) {
+          Msg* m = findMsg(s);
+          if (m == NULL) continue;
+          ChannelDetails cd;
+          const char* chan = (m->kind == CONV_CHANNEL && the_mesh.getChannel(m->chan_idx, cd)) ? cd.name : "";
+          Serial.printf("%lu|%lu|%d|%s|%d|%d|%d|%d|%d|%s|", (unsigned long)m->seq, (unsigned long)m->ts, m->kind, chan,
+                        m->outgoing, m->hops, m->snr4, m->flags, m->status, m->from);
+          for (const char* p = m->text; *p; p++) {
+            if ((uint8_t)*p == 0xFE) Serial.print("{U}");   // stood for a non-ASCII character (emoji...)
+            else if (*p == '|') Serial.print("/");
+            else Serial.write(*p);
+          }
+          Serial.println();
+        }
+        Serial.println("#END");
+        break;
+      }
       case 0x10: {   // pretend a page just arrived, to see the pager without a second deck
         static const uint8_t nobody[6] = { 0 };
         Msg* m = addMsg(CONV_DM, 0, nobody, "TEST", CD_PAGE_PREFIX " gate left open at north paddock", false);
