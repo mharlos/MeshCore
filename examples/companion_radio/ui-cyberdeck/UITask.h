@@ -41,8 +41,11 @@
 #define CD_CRUMBS           4096    // breadcrumb trail points kept in RAM
 #define CD_PAGE_PREFIX     "!PAGE"
 #define CD_PAGE_ACK        "!PAGE-ACK"
-#define CD_WHERE           "!WHERE"
-#define CD_HOME            "!HOME"    // a page that means "come home" (pagers play a recall tone)   // pagers answer with their position
+#define CD_WHERE           "!WHERE"   // pagers answer with their position
+#define CD_HOME            "!HOME"    // a page that means "come home" (pagers play a recall tone)
+#define CD_MSG_ROUTES      64         // the repeaters each recent message came through
+#define CD_LIVE_ROUTES     48         // recent flood packets' routes, for the map's live layer
+#define CD_OUT_TRACK        8         // our channel posts, listening for repeaters passing them on
 #define CD_REPORTS         16         // positions people sent in messages, for the map
 
 class UITask : public AbstractUITask {
@@ -251,7 +254,7 @@ private:
   // keep theirs out of public adverts, so this is how they get on the map
   struct Report { uint8_t pub[6]; int32_t lat, lon; uint32_t ts; };
   Report _reports[CD_REPORTS];
-  void notePosition(const uint8_t* pub, const char* text);
+  void notePosition(const uint8_t* pub, const char* text, uint32_t when = 0);   // when: 0 = now
   bool contactByName(const char* name, uint8_t* pub_out) const;
   int addressPage(const char* arg, char* out, size_t n);   // returns how many names it addressed
   bool chanPosterName(const char* word, char* proper);
@@ -297,6 +300,49 @@ private:
   // chat: a message picked with the trackball, to @mention its sender
   int _chat_sel;
   uint32_t _chat_sel_seq;
+
+  // text: UTF-8 with emoji (UITaskText.cpp)
+  struct Gl { uint8_t bytes, cells; int16_t emoji; uint8_t ch; };
+  static Gl glyphAt(const char* s);
+  static int cellsOf(const char* s, int nbytes = -1);
+  static int wrapBytes(const char* s, int nbytes, int width_cells);
+  static void keepText(char* dest, size_t dest_size, const char* src);
+  void drawEmoji(int x, int y, int idx);
+  bool _emoji_open;
+  int _emoji_sel;
+  char _emoji_filter[12];
+  int emojiList(uint8_t* out);
+  void openEmojiPicker();
+  void handleEmojiKey(int key, int max_len);
+  void drawEmojiPicker();
+  enum PrettyStyle : uint8_t { PS_TO_ME = 1, PS_TO_OTHER = 2, PS_SYSTEM = 4, PS_ALERT = 8, PS_POS = 16 };
+  void prettyMsg(const Msg* m, char* who, size_t wn, char* body, size_t bn, uint8_t& style);
+  bool mentionsName(const char* text, const char* name) const;
+  // T on a picked message: just that conversation
+  bool _thread_on;
+  char _thread_a[32], _thread_b[32];
+  bool inThread(const Msg& m) const;
+  void startThread(const Msg* m);
+
+  // routes: the repeaters a packet came through, by their key prefixes
+  struct Route { uint32_t key; uint32_t at; uint8_t hsize, n; uint8_t path[30]; };
+  Route _msg_routes[CD_MSG_ROUTES];   // key = message seq
+  Route _live[CD_LIVE_ROUTES];        // key = 0; at = millis
+  int _msg_route_head, _live_head;
+  uint32_t _map_route_seq;            // a message's route drawn on the map, 0 = none
+  int32_t _route_from_lat, _route_from_lon;   // where that message's sender is, if known
+  bool _route_from_ok;
+  bool _map_live_off;                 // hide the live routes layer
+  void noteRoute(Route* ring, int size, int& head, uint32_t key, const mesh::Packet* pkt);
+  const Route* routeFor(uint32_t seq) const;
+  bool hashPos(const uint8_t* h, int hs, int32_t& lat, int32_t& lon, const char** name = NULL) const;
+  void showMsgOnMap(const Msg* m);
+
+  // "heard": repeaters heard passing on our channel posts
+  struct OutTrack { uint32_t seq; uint8_t hash[MAX_HASH_SIZE]; uint8_t hops[8]; uint8_t n; };
+  OutTrack _out[CD_OUT_TRACK];
+  int _out_head;
+  uint32_t _capture_seq;              // the post being sent right now
 
   uint8_t _logged_in[CD_ROOM_LOGINS][6];
   int _num_logged_in;

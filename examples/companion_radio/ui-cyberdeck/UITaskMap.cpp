@@ -404,7 +404,11 @@ bool UITask::handleMapKey(int key) {
       return true;
     case TKEY_ESC:
       if (_map_pan) _map_pan = false;
-      else _map_node_sel = -1;
+      else { _map_node_sel = -1; _map_route_seq = 0; }
+      return true;
+    case 'r': case 'R':
+      _map_live_off = !_map_live_off;
+      showAlert(_map_live_off ? "LIVE ROUTES HIDDEN" : "LIVE ROUTES SHOWN", 1000);
       return true;
     case 'c': case 'C': {
       double lat, lon;
@@ -527,6 +531,60 @@ void UITask::drawMap() {
     }
   }
 
+  // a route as a line through the repeaters we can place; unknown hops are skipped
+  auto drawPath = [&](const Route& r, bool from_ok, double from_lat, double from_lon, bool to_me, uint16_t col, bool thick) {
+    int px = 0, py = 0, hops_shown = 0;
+    bool have = false;
+    auto point = [&](double la, double lo) {
+      int x, y;
+      project(la, lo, x, y);
+      if (have && (inMap(x, y, 600) || inMap(px, py, 600))) {
+        g.drawLine(px, py, x, y, col);
+        if (thick) { g.drawLine(px + 1, py, x + 1, y, col); g.drawLine(px, py + 1, x, y + 1, col); }
+      }
+      px = x; py = y; have = true;
+    };
+    if (from_ok) point(from_lat, from_lon);
+    for (int k = 0; k < r.n; k++) {
+      int32_t la, lo;
+      if (!hashPos(&r.path[k * r.hsize], r.hsize, la, lo)) continue;
+      point(la / 1e6, lo / 1e6);
+      if (thick && inMap(px, py, 4)) g.fillCircle(px, py, 3, col);
+      hops_shown++;
+    }
+    if (to_me && have) point(me_lat, me_lon);
+    return hops_shown;
+  };
+
+  // routes end at us: our fix, or failing that the last breadcrumb
+  bool me_ok = have_fix;
+  if (!me_ok && _crumbs && _crumb_count) {
+    const Crumb& c = _crumbs[(_crumb_head + CD_CRUMBS - 1) % CD_CRUMBS];
+    me_lat = c.lat / 1e6; me_lon = c.lon / 1e6; me_ok = true;
+  }
+
+  // live layer: where packets have been going in the last 10 minutes, newest brightest
+  uint32_t now_ms = millis();
+  if (!_map_live_off) {
+    for (int i = 0; i < CD_LIVE_ROUTES; i++) {
+      const Route& r = _live[(_live_head + i) % CD_LIVE_ROUTES];   // oldest first
+      if (r.n == 0 || now_ms - r.at > 600000UL) continue;
+      drawPath(r, false, 0, 0, me_ok, (now_ms - r.at < 120000UL) ? c_alert : c_dim, false);
+    }
+  }
+  // a message picked in a chat (M): its sender and the way it came
+  if (_map_route_seq) {
+    const Route* r = routeFor(_map_route_seq);
+    static Route none = { 0, 0, 1, 0, {0} };
+    int shown = drawPath(r ? *r : none, _route_from_ok, _route_from_lat / 1e6, _route_from_lon / 1e6, me_ok, c_hi, true);
+    char l[40];
+    if (r && r->n) snprintf(l, sizeof(l), "ROUTE: %d HOPS, %d ON THE MAP", r->n, shown);
+    else snprintf(l, sizeof(l), r ? "ROUTE: HEARD DIRECT" : "ROUTE: NOT KNOWN");
+    int w = strlen(l) * SMALL_W + 4;
+    g.fillRect(SCR_W - w - 2, MAP_Y + 2, w, 11, 0);
+    stext(SCR_W - w, MAP_Y + 4, c_hi, l);
+  }
+
   // contacts with a position
   for (int i = 0; i < _num_nodes; i++) {
     const Node& n = _nodes[i];
@@ -534,6 +592,15 @@ void UITask::drawMap() {
     int x, y;
     project(n.lat / 1e6, n.lon / 1e6, x, y);
     if (!inMap(x, y, 4)) continue;
+    if (n.type == ADV_TYPE_REPEATER && !_map_live_off) {   // a ring around repeaters busy lately
+      uint32_t best = 0xFFFFFFFF;
+      for (int k = 0; k < CD_LIVE_ROUTES; k++) {
+        const Route& r = _live[k];
+        if (r.n == 0 || now_ms - r.at > 600000UL || now_ms - r.at >= best) continue;
+        for (int h = 0; h < r.n; h++) if (memcmp(&r.path[h * r.hsize], n.pub, r.hsize) == 0) { best = now_ms - r.at; break; }
+      }
+      if (best < 600000UL) g.drawCircle(x, y, 10, best < 120000UL ? c_alert : c_dim);
+    }
     uint16_t col = (n.type == ADV_TYPE_CHAT) ? c_hi : (n.type == ADV_TYPE_REPEATER) ? c_fg : c_alert;
     switch (n.type) {
       case ADV_TYPE_CHAT:
@@ -664,7 +731,7 @@ void UITask::drawMap() {
   drawTabs();
   drawFooter(_map_pick ? "\x18\x19 PICK  RET SHOW ON MAP  \x1b\x1a DIST/HOPS  ESC CLOSE"
              : _map_pan ? "PAN: BALL MOVES MAP  CLICK OR WAIT 5s TO STOP"
-                        : "\x18\x19 ZOOM  CLICK PAN  C ME  N NODES  G GPS  S STYLE");
+                        : "\x18\x19 ZOOM CLICK PAN C ME N NODES R LIVE G GPS S STYLE");
   if (_map_pick) drawMapPick();
 }
 
@@ -859,4 +926,94 @@ void UITask::drawGps() {
   textf(0, y, c_fg, "FIX %s  %ld SATS", lp->isValid() ? "YES" : "NO", lp->satellitesCount());
   drawFooter("G / ESC BACK");
 #endif
+}
+
+/* --------------------------------------- routes ---------------------------------------- */
+
+// remember the repeaters a flood packet came through (first is nearest its sender)
+void UITask::noteRoute(Route* ring, int size, int& head, uint32_t key, const mesh::Packet* pkt) {
+  if (!pkt->isRouteFlood()) return;
+  int hs = pkt->getPathHashSize(), n = pkt->getPathHashCount();
+  if (n * hs > (int)sizeof(ring[0].path)) n = sizeof(ring[0].path) / hs;
+  Route& r = ring[head];
+  head = (head + 1) % size;
+  r.key = key;
+  r.at = millis();
+  r.hsize = hs;
+  r.n = n;
+  memcpy(r.path, pkt->path, n * hs);
+}
+
+const UITask::Route* UITask::routeFor(uint32_t seq) const {
+  for (int i = 0; i < CD_MSG_ROUTES; i++) if (_msg_routes[i].key == seq) return &_msg_routes[i];
+  return NULL;
+}
+
+// a repeater we know the position of, by the first bytes of its key
+bool UITask::hashPos(const uint8_t* h, int hs, int32_t& lat, int32_t& lon, const char** name) const {
+  if (hs < 1 || hs > 6) return false;
+  int found = -1;
+  for (int i = 0; i < _num_nodes; i++) {
+    const Node& n = _nodes[i];
+    if (n.type != ADV_TYPE_REPEATER || (!n.lat && !n.lon) || memcmp(n.pub, h, hs) != 0) continue;
+    if (found >= 0) return false;   // two match: can't tell which
+    found = i;
+  }
+  if (found < 0) return false;
+  lat = _nodes[found].lat;
+  lon = _nodes[found].lon;
+  if (name) *name = _nodes[found].name;
+  return true;
+}
+
+// M on a message: the map, centred on whoever sent it, with the way it came
+void UITask::showMsgOnMap(const Msg* m) {
+  uint8_t pub[6];
+  bool have_pub = false;
+  if (m->kind == CONV_DM) { memcpy(pub, m->peer, 6); have_pub = true; }
+  else if (!m->outgoing) have_pub = contactByName(m->from, pub);
+  if (m->outgoing) { showAlert("THAT ONE'S YOURS", 1500); return; }
+
+  // positions they sent before a restart: look back through what they've written, oldest first
+  if (have_pub) {
+    for (uint32_t s = _next_seq > (uint32_t)_max_msgs ? _next_seq - _max_msgs : 1; s < _next_seq; s++) {
+      Msg* h = findMsg(s);
+      if (h == NULL || h->outgoing || h->kind != m->kind) continue;
+      bool same = (m->kind == CONV_DM) ? memcmp(h->peer, m->peer, 6) == 0 : strcmp(h->from, m->from) == 0;
+      if (same) notePosition(pub, h->text, h->ts);
+    }
+  }
+  refreshNodes();
+  _route_from_ok = false;
+  _map_node_sel = -1;
+  if (have_pub) {
+    for (int i = 0; i < _num_nodes; i++) {
+      if (memcmp(_nodes[i].pub, pub, 6) == 0 && (_nodes[i].lat || _nodes[i].lon)) {
+        _route_from_ok = true;
+        _route_from_lat = _nodes[i].lat;
+        _route_from_lon = _nodes[i].lon;
+        _map_node_sel = i;
+        break;
+      }
+    }
+  }
+  _map_route_seq = m->seq;
+  const Route* r = routeFor(m->seq);
+
+  double lat = 0, lon = 0;
+  bool centre = false;
+  if (_route_from_ok) { lat = _route_from_lat / 1e6; lon = _route_from_lon / 1e6; centre = true; }
+  else if (r) {
+    for (int k = 0; k < r->n && !centre; k++) {
+      int32_t la, lo;
+      if (hashPos(&r->path[k * r->hsize], r->hsize, la, lo)) { lat = la / 1e6; lon = lo / 1e6; centre = true; }
+    }
+  }
+  if (!centre && !m->outgoing) { showAlert("NO POSITION FOR THEM OR THEIR ROUTE", 2500); _map_route_seq = 0; return; }
+  if (centre) { _map_lat = lat; _map_lon = lon; _map_follow = false; }
+  if (!_route_from_ok && !m->outgoing) showAlert("SENDER NOT PLACED // SHOWING ROUTE", 2000);
+  _screen = SCR_LIST;
+  _tab = TAB_MAP;
+  _map_pan = _map_pick = false;
+  _dirty = true;
 }

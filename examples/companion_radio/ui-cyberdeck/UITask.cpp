@@ -217,6 +217,16 @@ UITask::UITask(mesh::MainBoard* board, MultiSerialInterface* serial) : AbstractU
   _max_msgs = 0;
   _nodes = NULL;
   memset(_reports, 0, sizeof(_reports));
+  _emoji_open = _thread_on = _map_live_off = false;
+  _emoji_sel = 0;
+  _emoji_filter[0] = _thread_a[0] = _thread_b[0] = 0;
+  memset(_msg_routes, 0, sizeof(_msg_routes));
+  memset(_live, 0, sizeof(_live));
+  _msg_route_head = _live_head = 0;
+  _map_route_seq = 0;
+  memset(_out, 0, sizeof(_out));
+  _out_head = 0;
+  _capture_seq = 0;
   _rf = NULL;
   _mule = NULL;
   _num_nodes = _num_chans = 0;
@@ -653,7 +663,9 @@ void UITask::refreshNodes() {
 }
 
 // a chat contact by its name, as channel posts only carry the name
-bool UITask::contactByName(const char* name, uint8_t* pub_out) const {
+bool UITask::contactByName(const char* name_in, uint8_t* pub_out) const {
+  char name[32];
+  sanitize(name, sizeof(name), name_in);   // node names are stored plain
   for (int i = 0; i < _num_nodes; i++) {
     if (_nodes[i].type == ADV_TYPE_CHAT && strieq(_nodes[i].name, name)) {
       memcpy(pub_out, _nodes[i].pub, 6);
@@ -664,7 +676,7 @@ bool UITask::contactByName(const char* name, uint8_t* pub_out) const {
 }
 
 // "@ 45.12345,-122.98765", "SOS ~45.1,-122.9", "LOC 45.1,-122.9 ... (12 min old)"
-void UITask::notePosition(const uint8_t* pub, const char* text) {
+void UITask::notePosition(const uint8_t* pub, const char* text, uint32_t when) {
   for (const char* p = text; *p; p++) {
     if (!(isdigit((unsigned char)*p) || (*p == '-' && isdigit((unsigned char)p[1])))) continue;
     if (p > text && (isalnum((unsigned char)p[-1]) || p[-1] == '.')) continue;
@@ -680,7 +692,7 @@ void UITask::notePosition(const uint8_t* pub, const char* text) {
     if (e2 == q || !dot || dot > e2 || e2 - dot < 4) continue;
     if (lat < -90 || lat > 90 || lon < -180 || lon > 180 || (lat == 0 && lon == 0)) return;
 
-    uint32_t ts = rtc_clock.getCurrentTime();
+    uint32_t ts = when ? when : rtc_clock.getCurrentTime();
     const char* old = strstr(e2, " min old");
     if (old) {   // "(12 min old)"
       const char* d = old;
@@ -787,8 +799,8 @@ UITask::Msg* UITask::addMsg(ConvKind kind, uint8_t chan, const uint8_t* peer, co
   if (peer) memcpy(m.peer, peer, sizeof(m.peer));
   m.outgoing = outgoing;
   m.hops = 0xFF;
-  sanitize(m.from, sizeof(m.from), from);
-  sanitize(m.text, sizeof(m.text), text);
+  keepText(m.from, sizeof(m.from), from);   // as sent: emoji and all
+  keepText(m.text, sizeof(m.text), text);
   return &m;
 }
 
@@ -858,7 +870,9 @@ bool UITask::sendText(const char* text, uint8_t flags) {
     }
     uint32_t ts = the_mesh.getRTCClock()->getCurrentTimeUnique();
     Msg* m = addMsg(CONV_CHANNEL, _conv_chan, NULL, _node_prefs->node_name, text, true);
+    _capture_seq = m ? m->seq : 0;   // onFloodSent takes its hash, to hear repeaters pass it on
     bool ok = the_mesh.sendGroupMessage(ts, cd.channel, _node_prefs->node_name, text, len);
+    _capture_seq = 0;
     if (_mule_last_own >= 0 && _mule) {   // the courier took a copy as it went out
       MuleEntry& o = _mule[_mule_last_own];
       strncpy(o.from, _node_prefs->node_name, sizeof(o.from) - 1);
@@ -1059,6 +1073,7 @@ void UITask::onMessageRecv(mesh::Packet *pkt, const ContactInfo &from, uint8_t t
   Msg* m = addMsg(CONV_DM, 0, from.id.pub_key, room ? author : from.name, text, false);
   if (m == NULL) return;
   if (!room) notePosition(from.id.pub_key, text);
+  noteRoute(_msg_routes, CD_MSG_ROUTES, _msg_route_head, m->seq, pkt);
   m->hops = pkt->isRouteFlood() ? pkt->path_len : 0xFF;
   m->snr4 = (int8_t)(pkt->getSNR() * 4);
   if (room) m->flags |= MF_ROOM;
@@ -1131,6 +1146,7 @@ void UITask::onChannelMessageRecv(mesh::Packet *pkt, ChannelDetails& channel_det
 
   Msg* m = addMsg(CONV_CHANNEL, idx, NULL, from, body, false);
   if (m == NULL) return;
+  noteRoute(_msg_routes, CD_MSG_ROUTES, _msg_route_head, m->seq, pkt);
   m->hops = pkt->isRouteFlood() ? pkt->path_len : 0xFF;
   m->snr4 = (int8_t)(pkt->getSNR() * 4);
   stampSent(m, the_mesh.uiLastChannelTimestamp(), true);
@@ -1537,7 +1553,7 @@ void UITask::handleKey(int key) {
     if (key < TKEY_UP || key == TKEY_CLICK || key == TKEY_HOLD) ackPage();
     return;
   }
-  if (key == TKEY_HOLD) {   // long-press the trackball: blank the screen
+  if (key == TKEY_HOLD && _screen != SCR_CHAT) {   // long-press the trackball: blank the screen (in a chat: emoji)
     if (_display) _display->turnOff();
     return;
   }
@@ -1773,12 +1789,22 @@ void UITask::handleChatKey(int key) {
     _chat_sel = -1;
   };
 
+  if (_emoji_open) { handleEmojiKey(key, max_len); return; }
+  if (key == TKEY_HOLD) { openEmojiPicker(); return; }
+  if (_chat_sel >= 0 && _input_len == 0 && (key == 'm' || key == 'M' || key == 't' || key == 'T')) {
+    Msg* m = findMsg(_chat_sel_seq);
+    if (m && (key == 'm' || key == 'M')) { _chat_sel = -1; showMsgOnMap(m); }
+    else if (m && _conv_kind == CONV_CHANNEL) startThread(m);
+    return;
+  }
+
   switch (key) {
     case TKEY_UP:    _chat_sel++; _chat_sel_seq = 0; break;   // clamped, and pinned to a message, when drawn
     case TKEY_DOWN:  if (_chat_sel >= 0) _chat_sel--; _chat_sel_seq = 0; break;
     case TKEY_LEFT:
     case TKEY_ESC:
       if (_chat_sel >= 0) _chat_sel = -1;
+      else if (_thread_on) _thread_on = false;
       else _screen = SCR_LIST;
       break;
     case TKEY_CLICK:
@@ -1792,7 +1818,8 @@ void UITask::handleChatKey(int key) {
       break;
     case TKEY_BACKSPACE:
       if (_input_len > 0) {
-        _input_buf[--_input_len] = 0;
+        do { _input_len--; } while (_input_len > 0 && ((uint8_t)_input_buf[_input_len] & 0xC0) == 0x80);   // a whole character
+        _input_buf[_input_len] = 0;
       } else if (_chat_sel >= 0) {
         _chat_sel = -1;
       } else {
@@ -1809,7 +1836,7 @@ void UITask::handleChatKey(int key) {
       break;
   }
   if (_screen == SCR_CHAT) markRead(_conv_kind, _conv_chan, _conv_peer);
-  else _chat_sel = -1;
+  else { _chat_sel = -1; _thread_on = _emoji_open = false; }
 }
 
 /* --------------------------------------- console --------------------------------------- */
@@ -2624,21 +2651,33 @@ void UITask::loop() {
 
 /* ---------------------------------------- drawing -------------------------------------- */
 
+// UTF-8 aware: emoji are drawn two cells wide, other characters map onto the CP437 font
 void UITask::text(int x, int y, uint16_t col, const char* s) {
   uint16_t* buf = _display->buffer();
   Adafruit_GFX& g = _display->gfx();
-  for (; *s && x <= SCR_W - CHAR_W; s++, x += CHAR_W) {
-    if (x < 0) continue;
-    const uint8_t* glyph = &SPLEEN_8X16_CP437[(uint8_t)*s * 16];
+  while (*s) {
+    Gl gl = glyphAt(s);
+    s += gl.bytes;
+    if (gl.cells == 0) continue;
+    if (x > SCR_W - gl.cells * CHAR_W) break;
+    if (gl.emoji != -1) {
+      if (x >= 0) drawEmoji(x, y, gl.emoji);
+      x += 2 * CHAR_W;
+      continue;
+    }
+    int gx = x;
+    x += CHAR_W;
+    if (gx < 0) continue;
+    const uint8_t* glyph = &SPLEEN_8X16_CP437[gl.ch * 16];
     for (int r = 0; r < 16; r++) {
       int py = y + r;
       uint8_t bits = glyph[r];
       if (bits == 0 || py < 0 || py >= CYBERDECK_H) continue;
       if (buf) {
-        uint16_t* px = buf + py * CYBERDECK_W + x;
+        uint16_t* px = buf + py * CYBERDECK_W + gx;
         for (int c = 0; c < 8; c++) if (bits & (0x80 >> c)) px[c] = col;
       } else {
-        for (int c = 0; c < 8; c++) if (bits & (0x80 >> c)) g.drawPixel(x + c, py, col);
+        for (int c = 0; c < 8; c++) if (bits & (0x80 >> c)) g.drawPixel(gx + c, py, col);
       }
     }
   }
@@ -3097,7 +3136,8 @@ void UITask::drawInput(int y, const char* prompt, const char* buf, int len, bool
   text(2, y - 1, c_hi, prompt);
   int px = 2 + (strlen(prompt) + 1) * CHAR_W;
   int room = (SCR_W - px - 2) / CHAR_W - 1;
-  const char* shown = (len > room) ? buf + (len - room) : buf;   // keep the end of long input visible
+  const char* shown = buf;   // keep the end of long input visible
+  while (*shown && cellsOf(shown) > room) shown += glyphAt(shown).bytes;
   if (masked) {
     char stars[CD_INPUT_MAX + 1];
     int n = strlen(shown);
@@ -3107,7 +3147,7 @@ void UITask::drawInput(int y, const char* prompt, const char* buf, int len, bool
   } else {
     text(px, y - 1, c_fg, shown);
   }
-  if (_cursor_on) g.fillRect(px + strlen(shown) * CHAR_W, y, CHAR_W - 1, ROW_H - 3, c_fg);
+  if (_cursor_on) g.fillRect(px + (masked ? strlen(shown) : cellsOf(shown)) * CHAR_W, y, CHAR_W - 1, ROW_H - 3, c_fg);
 }
 
 void UITask::drawChat() {
@@ -3116,7 +3156,11 @@ void UITask::drawChat() {
   // title strip, where the tabs usually are
   const Node* peer = (_conv_kind == CONV_DM) ? findNode(_conv_peer) : NULL;
   bool room = peer && peer->type == ADV_TYPE_ROOM;
-  if (_conv_kind == CONV_CHANNEL) textf(0, TABS_Y, c_hi, "%.24s%s", _conv_name, isMuted(_conv_chan) ? " \x0E" : "");
+  if (_thread_on) {
+    char tt[80];
+    snprintf(tt, sizeof(tt), _thread_b[0] ? "THREAD // %s \x1D %s" : "THREAD // %s", _thread_a, _thread_b);
+    text(0, TABS_Y, c_alert, tt);
+  } else if (_conv_kind == CONV_CHANNEL) textf(0, TABS_Y, c_hi, "%.24s%s", _conv_name, isMuted(_conv_chan) ? " \x0E" : "");
   else textf(0, TABS_Y, c_hi, room ? "ROOM // %.24s" : "LINK // %.24s", _conv_name);
   int unread_elsewhere = totalUnread();
   if (unread_elsewhere) {
@@ -3135,28 +3179,36 @@ void UITask::drawChat() {
   if (want > max_lines) want = max_lines;
   int msgs = 0, sel_first = -1, sel_last = -1;
 
+  // "time who: words", as people read it (see prettyMsg); remembered for the last message built
   static char full[COLS * 8];
+  static const Msg* full_m = NULL;
+  static int full_len = 0, pre_time = 0, pre_who = 0;
+  static uint8_t full_style = 0;
+  auto build = [&](const Msg* m) {
+    if (m == full_m) return;
+    char t[8], who[72], body[CD_INPUT_MAX + 64];
+    fmtTime(t, m->ts);
+    prettyMsg(m, who, sizeof(who), body, sizeof(body), full_style);
+    full_len = snprintf(full, sizeof(full), "%s %s: %s", t, who, body);
+    if (full_len >= (int)sizeof(full)) full_len = sizeof(full) - 1;
+    pre_time = strlen(t);
+    pre_who = pre_time + 1 + strlen(who) + 1;
+    full_m = m;
+  };
+  full_m = NULL;
+
   for (uint32_t s = _next_seq - 1; s > 0 && s + _max_msgs >= _next_seq && n < want; s--) {
     const Msg* m = findMsg(s);
-    if (m == NULL || !msgInConv(*m, _conv_kind, _conv_chan, _conv_peer)) continue;
+    if (m == NULL || !msgInConv(*m, _conv_kind, _conv_chan, _conv_peer) || !inThread(*m)) continue;
 
-    // break this message into wrapped segments, then add them last-first
-    char t[8];
-    fmtTime(t, m->ts);
-    int flen = snprintf(full, sizeof(full), "%s %s: %s", t, m->from, m->text);
-    if (flen >= (int)sizeof(full)) flen = sizeof(full) - 1;
+    // break this message into wrapped segments (by screen cells: emoji are two), then add them last-first
+    build(m);
     uint16_t seg_start[8];
     uint8_t seg_len[8];
     int segs = 0, pos = 0;
-    while (pos < flen && segs < 8) {
+    while (pos < full_len && segs < 8) {
       int width = (segs == 0) ? COLS : COLS - 2;   // continuation lines are indented
-      int len = flen - pos;
-      if (len > width) {
-        len = width;
-        for (int k = width; k > width / 2; k--) {
-          if (full[pos + k] == ' ') { len = k; break; }
-        }
-      }
+      int len = wrapBytes(full + pos, full_len - pos, width);
       seg_start[segs] = pos;
       seg_len[segs] = len;
       segs++;
@@ -3206,63 +3258,68 @@ void UITask::drawChat() {
   if (_scroll > n - BODY_ROWS) _scroll = (n > BODY_ROWS) ? n - BODY_ROWS : 0;
 
   if (n == 0) {
-    text(4, BODY_Y + ROW_H, c_dim, _conv_kind == CONV_CHANNEL ? "NO TRAFFIC YET. SAY SOMETHING." : "LINK OPEN. NO MESSAGES YET.");
-    text(4, BODY_Y + 2 * ROW_H, c_dim, "/page TO RAISE THE ALARM.");
+    text(4, BODY_Y + ROW_H, c_dim, _thread_on ? "NOTHING BETWEEN THEM IN VIEW." : _conv_kind == CONV_CHANNEL ? "NO TRAFFIC YET. SAY SOMETHING." : "LINK OPEN. NO MESSAGES YET.");
+    text(4, BODY_Y + 2 * ROW_H, c_dim, _thread_on ? "ESC FOR THE WHOLE CHANNEL." : "/page TO RAISE THE ALARM.");
   }
 
   // each line re-derives its text from the message, so only a pointer and offsets were stored
+  full_m = NULL;
   for (int r = 0; r < BODY_ROWS; r++) {
     int li = _scroll + (BODY_ROWS - 1 - r);
     if (li >= n) continue;
     const Line& L = lines[li];
     const Msg* m = L.m;
-    if (li >= sel_first && li <= sel_last && sel_first >= 0) {   // the picked message gets a bar and a box
-      int yy = BODY_Y + r * ROW_H;
-      _display->gfx().fillRect(0, yy, 3, ROW_H, c_hi);
-      if (li == sel_last) _display->gfx().drawFastHLine(0, yy, SCR_W, c_dim);
-      if (li == sel_first) _display->gfx().drawFastHLine(0, yy + ROW_H - 1, SCR_W, c_dim);
-    }
-    char t[8];
-    fmtTime(t, m->ts);
-    int flen = snprintf(full, sizeof(full), "%s %s: %s", t, m->from, m->text);
-    if (flen >= (int)sizeof(full)) flen = sizeof(full) - 1;
-
     int y = BODY_Y + r * ROW_H;
+    if (li >= sel_first && li <= sel_last && sel_first >= 0) {   // the picked message gets a bar and a box
+      _display->gfx().fillRect(0, y, 3, ROW_H, c_hi);
+      if (li == sel_last) _display->gfx().drawFastHLine(0, y, SCR_W, c_dim);
+      if (li == sel_first) _display->gfx().drawFastHLine(0, y + ROW_H - 1, SCR_W, c_dim);
+    }
+    build(m);
+    uint8_t st = full_style;
+
     int x = (L.start > 0) ? 2 * CHAR_W : 0;
-    char seg[COLS + 1];
-    int len = L.len < COLS ? L.len : COLS;
+    char seg[COLS * 4 + 1];
+    int len = L.len;
+    if (len > (int)sizeof(seg) - 1) len = sizeof(seg) - 1;
     memcpy(seg, &full[L.start], len);
     seg[len] = 0;
 
     uint16_t body_col = m->outgoing ? c_hi : c_fg;
-    if (m->status == ST_FAILED || (m->flags & MF_PAGE)) body_col = c_alert;
-    else if (m->flags & MF_KEYWORD) body_col = c_hi;
-    if (m->flags & MF_PAGE) _display->gfx().fillRect(0, y, 2, ROW_H, c_alert);
+    if (m->status == ST_FAILED || (st & PS_ALERT)) body_col = c_alert;
+    else if ((m->flags & MF_KEYWORD) || (st & PS_TO_ME)) body_col = c_hi;
+    else if (st & PS_SYSTEM) body_col = c_dim;
+    if ((m->flags & MF_PAGE) || (st & PS_ALERT)) _display->gfx().fillRect(0, y, 2, ROW_H, c_alert);
+    else if (st & PS_TO_ME) _display->gfx().fillRect(0, y, 2, ROW_H, c_hi);
+
+    int cells;
     if (L.start == 0) {
-      // "time from:" prefix in its own colours
-      int tlen = strlen(t), plen = tlen + 1 + strlen(m->from) + 1;
-      if (plen > len) plen = len;
-      char pre[COLS + 1];
-      memcpy(pre, seg, tlen);
-      pre[tlen] = 0;
-      text(x, y, c_dim, pre);
-      memcpy(pre, seg + tlen, plen - tlen);
-      pre[plen - tlen] = 0;
-      text(x + tlen * CHAR_W, y, m->outgoing ? c_dim : c_hi, pre);
-      text(x + plen * CHAR_W, y, body_col, seg + plen);
+      // "time who:" prefix in its own colours
+      char piece[COLS * 4 + 1];
+      int a = pre_time < len ? pre_time : len, b = pre_who < len ? pre_who : len;
+      memcpy(piece, seg, a); piece[a] = 0;
+      text(x, y, c_dim, piece);
+      int cx = x + cellsOf(piece) * CHAR_W;
+      memcpy(piece, seg + a, b - a); piece[b - a] = 0;
+      text(cx, y, (m->outgoing || (st & PS_TO_OTHER)) ? c_dim : c_hi, piece);
+      cx += cellsOf(piece) * CHAR_W;
+      text(cx, y, body_col, seg + b);
+      cells = cellsOf(seg);
     } else {
       text(x, y, body_col, seg);
+      cells = cellsOf(seg);
     }
 
     // a message's final segment sits nearest the bottom: delivery state or route goes after it
     bool last_line = li == 0 || lines[li - 1].m != m;
-    int end_x = x + len * CHAR_W;
+    int end_x = x + cells * CHAR_W;
     if (m->outgoing && last_line) {
       char mark[16] = "";
       if (m->status == ST_SENDING) strcpy(mark, " ...");
       else if (m->status == ST_FAILED) strcpy(mark, " FAIL");
       else if (m->status == ST_DELIVERED && m->rtt_ds) snprintf(mark, sizeof(mark), " " G_CHECK "%u.%us", m->rtt_ds / 10, m->rtt_ds % 10);
       else if (m->status == ST_DELIVERED) strcpy(mark, " " G_CHECK);
+      else if (m->status == ST_SENT && m->kind == CONV_CHANNEL && m->rtt_ds) snprintf(mark, sizeof(mark), " " G_CHECK "%u", m->rtt_ds);   // repeaters heard passing it on
       if ((m->flags & MF_PAGE) && (m->flags & MF_ACKED)) strcat(mark, " ACK'D");
       if (end_x + (int)strlen(mark) * CHAR_W <= SCR_W) text(end_x, y, m->status == ST_FAILED ? c_alert : c_dim, mark);
       else if (mark[0]) stext(SCR_W - 2 - strlen(mark) * SMALL_W, y + 5, c_dim, mark);
@@ -3290,9 +3347,12 @@ void UITask::drawChat() {
   drawInput(INPUT_Y, prompt, _input_buf, _input_len);
   char hint[64];
   int max_len = CD_INPUT_MAX - (_conv_kind == CONV_CHANNEL ? strlen(_node_prefs->node_name) + 2 : 0);
-  if (sel_first >= 0) snprintf(hint, sizeof(hint), "CLICK/RET @MENTION THEM  " G_UP G_DOWN " PICK  ESC CANCEL  %3d/%d", _input_len, max_len);
-  else snprintf(hint, sizeof(hint), "RET SEND " G_UP G_DOWN " PICK MSG " G_LEFT " BACK /page /sos %3d/%d", _input_len, max_len);
+  if (_emoji_open) snprintf(hint, sizeof(hint), G_UP G_DOWN G_LEFT G_RIGHT " PICK  TYPE TO FIND  RET ADD  ESC");
+  else if (sel_first >= 0) snprintf(hint, sizeof(hint), "RET @REPLY  M MAP  T THREAD  " G_UP G_DOWN " PICK  ESC");
+  else if (_thread_on) snprintf(hint, sizeof(hint), "ESC WHOLE CHANNEL  " G_UP G_DOWN " PICK  HOLD BALL: EMOJI");
+  else snprintf(hint, sizeof(hint), "RET SEND " G_UP G_DOWN " PICK  HOLD BALL: EMOJI  %3d/%d", _input_len, max_len);
   drawFooter(hint);
+  if (_emoji_open) drawEmojiPicker();
 }
 
 void UITask::drawNode() {

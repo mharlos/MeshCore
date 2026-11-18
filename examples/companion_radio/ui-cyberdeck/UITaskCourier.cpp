@@ -89,6 +89,27 @@ void UITask::onFloodRecv(const mesh::Packet *pkt) {
   int hop = count > 0 ? pkt->path[(count - 1) * pkt->getPathHashSize()] : -1;
   if (hop >= 0) muleRepeaterSeen((uint8_t)hop, pkt->_snr);
 
+  // the map's live layer
+  if (count > 0) noteRoute(_live, CD_LIVE_ROUTES, _live_head, 0, pkt);
+
+  // one of our channel posts, passed on by a repeater: count each repeater once
+  if (hop >= 0 && pkt->getPayloadType() == PAYLOAD_TYPE_GRP_TXT) {
+    uint8_t h[MAX_HASH_SIZE];
+    pkt->calculatePacketHash(h);
+    for (int i = 0; i < CD_OUT_TRACK; i++) {
+      OutTrack& o = _out[i];
+      if (o.seq == 0 || memcmp(o.hash, h, MAX_HASH_SIZE) != 0) continue;
+      bool seen = false;
+      for (int k = 0; k < o.n; k++) if (o.hops[k] == (uint8_t)hop) seen = true;
+      if (!seen && o.n < sizeof(o.hops)) {
+        o.hops[o.n++] = (uint8_t)hop;
+        Msg* m = findMsg(o.seq);
+        if (m && m->outgoing) { m->rtt_ds = o.n; saveMsg(m); _dirty = true; }
+      }
+      break;
+    }
+  }
+
   if (_mule == NULL) return;
   uint8_t t = pkt->getPayloadType();
   if (t != PAYLOAD_TYPE_TXT_MSG && t != PAYLOAD_TYPE_GRP_TXT) return;
@@ -104,6 +125,14 @@ void UITask::onFloodRecv(const mesh::Packet *pkt) {
 }
 
 void UITask::onFloodSent(const mesh::Packet *pkt) {
+  if (_capture_seq) {   // our channel post going out: listen for it coming back
+    OutTrack& o = _out[_out_head];
+    _out_head = (_out_head + 1) % CD_OUT_TRACK;
+    o.seq = _capture_seq;
+    ((mesh::Packet*)pkt)->calculatePacketHash(o.hash);
+    o.n = 0;
+    _capture_seq = 0;
+  }
   if (_mule == NULL || _prefs.mule_own_off) return;
   uint8_t t = pkt->getPayloadType();
   if (t == PAYLOAD_TYPE_TXT_MSG || t == PAYLOAD_TYPE_GRP_TXT) muleConsider(pkt, true, -1);
