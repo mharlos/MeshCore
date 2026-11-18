@@ -59,7 +59,7 @@ private:
   enum MsgStatus : uint8_t { ST_NONE = 0, ST_SENDING, ST_DELIVERED, ST_FAILED, ST_SENT };
   enum MsgFlags : uint8_t { MF_PAGE = 1, MF_KEYWORD = 2, MF_ROOM = 4, MF_ACKED = 8 };
   enum NodeMode : uint8_t { NM_VIEW = 0, NM_PASSWORD, NM_CONFIRM_DEL };
-  enum ClockSrc : uint8_t { CLK_NONE = 0, CLK_MESH, CLK_SET };
+  enum ClockSrc : uint8_t { CLK_NONE = 0, CLK_MESH, CLK_SET, CLK_RESTORED };   // RESTORED: kept over a reboot, may have drifted
 
   struct Msg {
     uint32_t seq;          // 0 = empty slot

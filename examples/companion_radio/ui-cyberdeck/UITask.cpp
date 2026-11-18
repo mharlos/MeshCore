@@ -339,7 +339,7 @@ void UITask::begin(DisplayDriver* display, SensorManager* sensors, NodePrefs* no
   // a warm reboot restores the time from RTC memory; a cold boot starts at the floor
   _clk_last_rtc = rtc_clock.getCurrentTime();
   _clk_last_ms = millis();
-  if (_clk_last_rtc > CLOCK_FLOOR + 86400) _clock_src = CLK_SET;
+  if (_clk_last_rtc > CLOCK_FLOOR + 86400) _clock_src = CLK_RESTORED;   // good enough to use, open to correction
 
   _boot_started = millis();
   _auto_off = millis() + _prefs.dim_secs * 1000UL;
@@ -1323,15 +1323,19 @@ void UITask::setClock(uint32_t epoch, ClockSrc src) {
   _dirty = true;
 }
 
-// With no time source, adopt the mesh's time once two different nodes agree on it.
+// With no time source (or only one restored over a reboot, which may have drifted),
+// adopt the mesh's time once two different nodes agree on it.
 void UITask::syncClockFrom(uint32_t their_ts, const uint8_t* from) {
-  if (_clock_src != CLK_NONE || their_ts < CLOCK_FLOOR + 86400) return;
+  if ((_clock_src != CLK_NONE && _clock_src != CLK_RESTORED) || their_ts < CLOCK_FLOOR + 86400) return;
   uint32_t now_ms = millis();
   if (_clk_cand_ts && memcmp(_clk_cand_from, from, 4) != 0) {
     uint32_t expect = _clk_cand_ts + (now_ms - _clk_cand_ms) / 1000;
     int32_t diff = (int32_t)(their_ts - expect);
     if (diff > -CLOCK_AGREE_SECS && diff < CLOCK_AGREE_SECS) {
-      setClock(their_ts > expect ? their_ts : expect, CLK_MESH);
+      uint32_t t = their_ts > expect ? their_ts : expect;
+      int32_t off = (int32_t)(t - rtc_clock.getCurrentTime());
+      if (_clock_src == CLK_RESTORED && off > -120 && off < 120) { _clock_src = CLK_MESH; return; }   // ours was fine
+      setClock(t, CLK_MESH);
       showAlert("CLOCK SYNCED FROM MESH", 3000);
       return;
     }
@@ -2280,7 +2284,7 @@ void UITask::runCommand(const char* line) {
     int y; unsigned mo, d;
     civilFromDays(local / 86400, y, mo, d);
     uint32_t s = local % 86400;
-    static const char* SRC[] = { "NOT SET", "FROM MESH", "SET" };
+    static const char* SRC[] = { "NOT SET", "FROM MESH", "SET", "RESTORED (MESH OR GPS WILL FIX)" };
     consolePrint("%04d-%02u-%02u %02u:%02u:%02u UTC%+d", y, mo, d, s / 3600, (s / 60) % 60, s % 60, _node_prefs->tz_offset);
     consolePrint("CLOCK %s", SRC[_clock_src]);
   } else if (strcmp(cmd, "tz") == 0) {
