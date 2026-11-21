@@ -49,6 +49,10 @@ const char* UITask::officeName() const {
   return _prefs.office[0] ? _prefs.office : "moe";
 }
 
+const char* UITask::pageLabel() const {
+  return _prefs.page_label[0] ? _prefs.page_label : "OFFICE";
+}
+
 int UITask::farmChannel() {
   ChannelDetails cd;
   int first = -1;
@@ -100,7 +104,15 @@ void UITask::farmPress(int i) {
     case 1: strcpy(msg, "!DUCK LIGHTS TOGGLE"); break;
     case 2: strcpy(msg, CD_HOME " @[D*] come home"); flags = MF_PAGE; break;
     case 3: strcpy(msg, CD_HOME " @[K*] come home"); flags = MF_PAGE; break;
-    case 4: snprintf(msg, sizeof(msg), CD_PAGE_PREFIX " @[%s] to the office", officeName()); flags = MF_PAGE; break;
+    case 4: {
+      char where[12];
+      int k = 0;
+      for (const char* p = pageLabel(); *p && k < (int)sizeof(where) - 1; p++) where[k++] = tolower(*p);
+      where[k] = 0;
+      snprintf(msg, sizeof(msg), CD_PAGE_PREFIX " @[%s] to the %s", officeName(), where);
+      flags = MF_PAGE;
+      break;
+    }
     default: strcpy(msg, CD_WHERE); break;
   }
   bool ok = sendOnChannel(ch, msg, flags);
@@ -181,7 +193,7 @@ void UITask::drawFarm() {
       text(x + 26, y + 6 + ROW_H, col, "TO SEND");
     } else {
       text(x + 26, y + 6, col, b.line1);
-      text(x + 26, y + 6 + ROW_H, col, b.line2);
+      text(x + 26, y + 6 + ROW_H, col, i == 4 ? pageLabel() : b.line2);   // PAGE OFFICE / PAGE HOUSE...
     }
     // last press, and who's answered
     char st[48] = "";

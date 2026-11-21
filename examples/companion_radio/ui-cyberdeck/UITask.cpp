@@ -2365,17 +2365,28 @@ void UITask::runCommand(const char* line) {
     if (_prefs.gps_always) consolePrint("LIVE: NEVER RESTS (gps live off)");
     else consolePrint("RESTS AFTER 30MIN STILL, CHECKS /10MIN");
   } else if (strcmp(cmd, "farm") == 0) {
-    // farm office <name>: who the FARM tab's PAGE OFFICE button pages
+    // farm page <label> <name>: the FARM tab's page button, e.g. "farm page house h2co"
+    // (farm office <name> still just changes who it pages)
     if (strncmp(argl, "office ", 7) == 0 && arg[7]) {
       strncpy(_prefs.office, arg + 7, sizeof(_prefs.office) - 1);
       _prefs.office[sizeof(_prefs.office) - 1] = 0;
       savePrefs();
+    } else if (strncmp(argl, "page ", 5) == 0) {
+      char label[12], name[16];
+      if (sscanf(arg + 5, "%11s %15s", label, name) == 2) {
+        for (char* p = label; *p; p++) *p = toupper(*p);
+        strcpy(_prefs.page_label, label);
+        strcpy(_prefs.office, name);
+        savePrefs();
+      } else {
+        consolePrint("USAGE: farm page <label> <name>");
+      }
     }
     int ch = farmChannel();
     ChannelDetails cd;
     consolePrint("FARM CHANNEL: %s", ch >= 0 && the_mesh.getChannel(ch, cd) ? cd.name : "NONE");
-    consolePrint("PAGE OFFICE PAGES: %s", officeName());
-    consolePrint("farm office <name>  TO CHANGE IT");
+    consolePrint("PAGE %s PAGES: %s", pageLabel(), officeName());
+    consolePrint("farm page <label> <name>  TO CHANGE IT");
   } else if (strcmp(cmd, "touch") == 0) {
     // touch: show where touches land; touch swap|mx|my: turn a panel that's mounted differently
     if (strcmp(argl, "swap") == 0) _prefs.touch_flip ^= 1;

@@ -127,7 +127,8 @@ private:
     uint8_t  cpu_full;        // 1 = don't slow the CPU while the screen is off
     uint8_t  touch_flip;      // touch panel turned: 1 swap x/y, 2 mirror x, 4 mirror y
     uint8_t  spare[5];
-    char     office[16];      // who PAGE OFFICE pages ("" = moe)
+    char     office[16];      // who the FARM tab's page button pages ("" = moe)
+    char     page_label[12];  // and what it's called: PAGE <label> ("" = OFFICE)
   };
 
   struct RfEntry {
@@ -199,6 +200,7 @@ private:
   uint32_t _farm_sent_at[CD_FARM_BUTTONS];
   char _farm_ans[CD_FARM_BUTTONS][40];
   const char* officeName() const;
+  const char* pageLabel() const;
   int  farmChannel();
   bool sendOnChannel(int idx, const char* text, uint8_t flags = 0);
   void farmPress(int i);

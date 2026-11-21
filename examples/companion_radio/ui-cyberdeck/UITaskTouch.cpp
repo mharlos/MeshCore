@@ -44,6 +44,12 @@ static int listTopFor(int count, int sel, int rows) {   // as the lists draw the
 }
 
 void UITask::touchBegin() {
+  _t_down = _t_long = _t_drag = false;
+  _t_last_tap = 0;
+  _touch_debug = false;
+#ifdef CD_NO_TOUCH
+  return;   // this deck's build leaves the touch panel alone (trackball and keyboard only)
+#endif
   _touch.begin();
   _touch.setFlip(_prefs.touch_flip);
   _t_down = _t_long = _t_drag = false;
@@ -52,6 +58,9 @@ void UITask::touchBegin() {
 }
 
 void UITask::touchTick() {
+#ifdef CD_NO_TOUCH
+  return;
+#endif
   if (!_touch.present()) return;
   bool on = _display && _display->isOn();
   bool down = _touch.poll(on ? 15 : 120);   // slower while the screen is dark: a touch still wakes it
