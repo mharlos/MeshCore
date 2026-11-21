@@ -28,6 +28,12 @@
 #define TKEY_HOLD    0x86
 
 #define TAP_SLOP      12      // px a finger may wander and still be a tap
+
+#ifdef CD_SERIAL_BRIDGE
+  #define TLOG(...)  Serial.printf(__VA_ARGS__)   // gestures, for `deck.py log`
+#else
+  #define TLOG(...)
+#endif
 #define LONG_MS      600
 #define DOUBLE_MS    350
 
@@ -58,6 +64,7 @@ void UITask::touchTick() {
     _t_x0 = _t_lx = x; _t_y0 = _t_ly = y;
     _t_t0 = now;
     _t_woke = !on;
+    TLOG("#T down %d,%d%s\n", x, y, on ? "" : " (wakes)");
     if (!on) { wake(); _dirty = true; }
     return;
   }
@@ -77,6 +84,7 @@ void UITask::touchTick() {
   }
   if (!down && _t_down) {   // finger up
     _t_down = false;
+    TLOG("#T up %d,%d after %lums%s%s%s\n", _t_lx, _t_ly, now - _t_t0, _t_woke ? " woke" : "", _t_long ? " long" : "", _t_drag ? " drag" : "");
     if (_t_woke || _t_long) return;
     if (_t_drag) {
       if (!(_screen == SCR_LIST && _tab == TAB_MAP && !_map_pick)) touchSwipe(_t_lx - _t_x0, _t_ly - _t_y0);

@@ -78,6 +78,9 @@ bool UITask::sendOnChannel(int idx, const char* text, uint8_t flags) {
 
 void UITask::farmPress(int i) {
   if (i < 0 || i >= CD_FARM_BUTTONS) return;
+#ifdef CD_SERIAL_BRIDGE
+  Serial.printf("#F press %d armed=%d %lums\n", i, _farm_armed, millis() - _farm_armed_at);
+#endif
   _farm_sel = i;
   unsigned long now = millis();
   if (BUTTONS[i].confirm && !(_farm_armed == i && now - _farm_armed_at < ARM_MS)) {

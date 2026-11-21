@@ -2611,6 +2611,12 @@ void UITask::serialBridge() {
         Serial.println("#END");
         break;
       }
+      case 0x16: {   // a tap on the touch screen: 0x16 "<x> <y>" newline
+        String l = bridgeLine();
+        int tx = 0, ty = 0;
+        if (sscanf(l.c_str(), "%d %d", &tx, &ty) == 2) touchTap(tx, ty, false);
+        break;
+      }
       case 0x10: {   // pretend a page just arrived, to see the pager without a second deck
         static const uint8_t nobody[6] = { 0 };
         Msg* m = addMsg(CONV_DM, 0, nobody, "TEST", CD_PAGE_PREFIX " gate left open at north paddock", false);
