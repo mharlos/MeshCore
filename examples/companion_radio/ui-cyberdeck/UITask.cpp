@@ -94,7 +94,7 @@ static const RadioPreset PRESETS[] = {
 };
 #define NUM_PRESETS  (sizeof(PRESETS) / sizeof(PRESETS[0]))
 
-static const char* TAB_NAMES[] = { "CHAN", "NODES", "HEARD", "MAP", "RF", "SYS" };
+static const char* TAB_NAMES[] = { "CHAN", "FARM", "NODES", "HEARD", "MAP", "RF", "SYS" };
 
 static AdvertPath heard[16];
 static int num_heard = 0;
@@ -220,6 +220,12 @@ UITask::UITask(mesh::MainBoard* board, MultiSerialInterface* serial) : AbstractU
   _nodes = NULL;
   memset(_reports, 0, sizeof(_reports));
   _emoji_open = _thread_on = _map_live_off = false;
+  _farm_sel = 0;
+  _farm_armed = -1;
+  _farm_armed_at = 0;
+  memset(_farm_sent_at, 0, sizeof(_farm_sent_at));
+  memset(_farm_ans, 0, sizeof(_farm_ans));
+  memset(_tab_x, 0, sizeof(_tab_x));
   _emoji_sel = 0;
   _emoji_filter[0] = _thread_a[0] = _thread_b[0] = 0;
   memset(_msg_routes, 0, sizeof(_msg_routes));
@@ -1180,6 +1186,7 @@ void UITask::onChannelMessageRecv(mesh::Packet *pkt, ChannelDetails& channel_det
     uint8_t who[6];
     if (contactByName(m->from, who)) notePosition(who, body);
   }
+  if (idx == farmChannel()) farmNoteAnswer(m->from, body);
   if (is_page) {
     m->flags |= MF_PAGE;
     saveMsg(m);
@@ -1702,6 +1709,7 @@ void UITask::handleListKey(int key) {
 
   if (_tab != TAB_MAP) _map_pan = _map_pick = false;   // never come back to a map that's still panning
   if (_tab == TAB_MAP && handleMapKey(key)) return;
+  if (_tab == TAB_FARM && handleFarmKey(key)) return;
   if (_tab == TAB_RF && (key == 'm' || key == 'M')) { _screen = SCR_MULE; _mule_scroll = 0; return; }
 
   if (_tab == TAB_SYS) {   // the SYS tab is a command console
@@ -2356,6 +2364,18 @@ void UITask::runCommand(const char* line) {
     consolePrint("GPS %s // %s", getGPSState() ? "ON" : "OFF", MODES[_gps_mode]);
     if (_prefs.gps_always) consolePrint("LIVE: NEVER RESTS (gps live off)");
     else consolePrint("RESTS AFTER 30MIN STILL, CHECKS /10MIN");
+  } else if (strcmp(cmd, "farm") == 0) {
+    // farm office <name>: who the FARM tab's PAGE OFFICE button pages
+    if (strncmp(argl, "office ", 7) == 0 && arg[7]) {
+      strncpy(_prefs.office, arg + 7, sizeof(_prefs.office) - 1);
+      _prefs.office[sizeof(_prefs.office) - 1] = 0;
+      savePrefs();
+    }
+    int ch = farmChannel();
+    ChannelDetails cd;
+    consolePrint("FARM CHANNEL: %s", ch >= 0 && the_mesh.getChannel(ch, cd) ? cd.name : "NONE");
+    consolePrint("PAGE OFFICE PAGES: %s", officeName());
+    consolePrint("farm office <name>  TO CHANGE IT");
   } else if (strcmp(cmd, "touch") == 0) {
     // touch: show where touches land; touch swap|mx|my: turn a panel that's mounted differently
     if (strcmp(argl, "swap") == 0) _prefs.touch_flip ^= 1;
@@ -2797,6 +2817,7 @@ void UITask::render() {
       case SCR_LIST:
         drawTabs();
         if (_tab == TAB_CHAN) drawChanList();
+        else if (_tab == TAB_FARM) drawFarm();
         else if (_tab == TAB_NODES) drawNodeList(false);
         else if (_tab == TAB_HEARD) drawNodeList(true);
         else if (_tab == TAB_MAP) drawMap();
@@ -2967,17 +2988,19 @@ void UITask::drawTabs() {
     } else if (t == TAB_NODES) {
       for (int i = 0; i < _max_msgs; i++) if (_msgs[i].seq && _msgs[i].unread && _msgs[i].kind == CONV_DM) unread++;
     }
-    snprintf(label, sizeof(label), unread ? " %s*" : " %s ", TAB_NAMES[t]);
-    int w = strlen(label) * CHAR_W + CHAR_W / 2;
+    snprintf(label, sizeof(label), unread ? "%s*" : "%s", TAB_NAMES[t]);
+    int w = strlen(label) * CHAR_W + 6;   // seven tabs: just a little room each side
+    _tab_x[t] = x;
     if (t == _tab) {
       g.fillRect(x, TABS_Y - 1, w, ROW_H + 1, c_fg);
-      text(x, TABS_Y, c_bg, label);
+      text(x + 3, TABS_Y, c_bg, label);
     } else {
       g.drawRect(x, TABS_Y - 1, w, ROW_H + 1, c_dim);
-      text(x, TABS_Y, unread ? c_hi : c_dim, label);
+      text(x + 3, TABS_Y, unread ? c_hi : c_dim, label);
     }
-    x += w + 3;
+    x += w + 2;
   }
+  _tab_x[TAB_COUNT] = x;
   g.drawFastHLine(0, TABS_Y + ROW_H + 1, SCR_W, c_dim);
 }
 

@@ -344,6 +344,11 @@ void UITask::prettyMsg(const Msg* m, char* who, size_t wn, char* body, size_t bn
       snprintf(body, bn, "\xE2\x9C\x85 answered%s%s", w ? ": " : " the page", w ? w + 3 : "");   // ✅
       return;
     }
+    if (strncasecmp(t, "!DUCK", 5) == 0) {   // the duck house controller, and its answers
+      snprintf(body, bn, "\xF0\x9F\xA6\x86 duck house: %s", t[5] == '-' ? t + 9 : t + 6);   // 🦆
+      for (char* p = body; *p; p++) if (*p >= 'A' && *p <= 'Z') *p += 32;
+      return;
+    }
     bool page = strncasecmp(t, CD_PAGE_PREFIX, 5) == 0, home = strncasecmp(t, CD_HOME, 5) == 0;
     bool where = strncasecmp(t, CD_WHERE, strlen(CD_WHERE)) == 0;
     if (page || home || where) {

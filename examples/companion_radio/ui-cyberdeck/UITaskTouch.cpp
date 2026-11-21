@@ -31,8 +31,6 @@
 #define LONG_MS      600
 #define DOUBLE_MS    350
 
-static const char* TAB_LABELS[] = { "CHAN", "NODES", "HEARD", "MAP", "RF", "SYS" };
-
 static int listTopFor(int count, int sel, int rows) {   // as the lists draw themselves
   int top = sel - rows / 2;
   if (top > count - rows) top = count - rows;
@@ -127,21 +125,19 @@ void UITask::touchTap(int x, int y, bool dbl) {
 
   if (_screen == SCR_LIST) {
     if (y >= TABS_Y - 1 && y < BODY_Y - 2) {   // the tab strip: same widths drawTabs uses
-      int tx = 0;
-      for (int t = 0; t < TAB_COUNT; t++) {
-        int w = (strlen(TAB_LABELS[t]) + 2) * CHAR_W + CHAR_W / 2;
-        if (x < tx + w + 3) {
+      for (int t = 0; t < TAB_COUNT; t++) {   // where drawTabs put them
+        if (x < _tab_x[t + 1] || t == TAB_COUNT - 1) {
           if (t != _tab) {
             int key = t > _tab ? TKEY_RIGHT : TKEY_LEFT;   // via the keys, so leaving a tab tidies up
             for (int n = abs(t - _tab); n > 0 && _tab != t; n--) handleKey(key);
           }
           return;
         }
-        tx += w + 3;
       }
       return;
     }
     if (y < BODY_Y) return;
+    if (_tab == TAB_FARM) { farmTap(x, y); return; }
     if (_tab == TAB_MAP) {
       if (_map_pick) { mapPickTap(y); return; }
       if (dbl) handleKey('+');

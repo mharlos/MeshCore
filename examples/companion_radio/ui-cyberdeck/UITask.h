@@ -47,6 +47,7 @@
 #define CD_HOME            "!HOME"    // a page that means "come home" (pagers play a recall tone)
 #define CD_MSG_ROUTES      64         // the repeaters each recent message came through
 #define CD_LIVE_ROUTES     48         // recent flood packets' routes, for the map's live layer
+#define CD_FARM_BUTTONS     6         // the FARM tab
 #define CD_OUT_TRACK        8         // our channel posts, listening for repeaters passing them on
 #define CD_REPORTS         16         // positions people sent in messages, for the map
 
@@ -56,7 +57,7 @@ public:
 
 private:
   enum Screen : uint8_t { SCR_BOOT, SCR_LIST, SCR_CHAT, SCR_NODE, SCR_PAGE, SCR_GPS, SCR_MULE, SCR_ADMIN };
-  enum Tab : uint8_t { TAB_CHAN = 0, TAB_NODES, TAB_HEARD, TAB_MAP, TAB_RF, TAB_SYS, TAB_COUNT };
+  enum Tab : uint8_t { TAB_CHAN = 0, TAB_FARM, TAB_NODES, TAB_HEARD, TAB_MAP, TAB_RF, TAB_SYS, TAB_COUNT };
   enum MapStyle : uint8_t { MS_COLOR = 0, MS_NIGHT, MS_PHOSPHOR, MS_COUNT };
   enum MsgStatus : uint8_t { ST_NONE = 0, ST_SENDING, ST_DELIVERED, ST_FAILED, ST_SENT };
   enum MsgFlags : uint8_t { MF_PAGE = 1, MF_KEYWORD = 2, MF_ROOM = 4, MF_ACKED = 8 };
@@ -126,6 +127,7 @@ private:
     uint8_t  cpu_full;        // 1 = don't slow the CPU while the screen is off
     uint8_t  touch_flip;      // touch panel turned: 1 swap x/y, 2 mirror x, 4 mirror y
     uint8_t  spare[5];
+    char     office[16];      // who PAGE OFFICE pages ("" = moe)
   };
 
   struct RfEntry {
@@ -189,6 +191,21 @@ private:
   unsigned long _t_t0, _t_last_tap;
   uint32_t _row_seq[11];      // which message each chat row shows, for taps
   int _list_count;            // rows in the list on screen
+  int _tab_x[TAB_COUNT + 1];  // where each tab starts on screen, for taps
+
+  // FARM tab (UITaskFarm.cpp)
+  int _farm_sel, _farm_armed;
+  unsigned long _farm_armed_at;
+  uint32_t _farm_sent_at[CD_FARM_BUTTONS];
+  char _farm_ans[CD_FARM_BUTTONS][40];
+  const char* officeName() const;
+  int  farmChannel();
+  bool sendOnChannel(int idx, const char* text, uint8_t flags = 0);
+  void farmPress(int i);
+  void farmNoteAnswer(const char* from, const char* body);
+  bool handleFarmKey(int key);
+  void farmTap(int x, int y);
+  void drawFarm();
   void touchBegin();
   void touchTick();
   void touchTap(int x, int y, bool dbl);
