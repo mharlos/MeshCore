@@ -1017,3 +1017,41 @@ void UITask::showMsgOnMap(const Msg* m) {
   _map_pan = _map_pick = false;
   _dirty = true;
 }
+
+/* ---------------------------------------- touch ---------------------------------------- */
+
+void UITask::mapTouchPan(int dx, int dy) {
+  if (!_map_inited) mapInit();
+  double cx = lonToX(_map_lon, _map_z) - dx, cy = latToY(_map_lat, _map_z) - dy;
+  _map_lon = xToLon(cx, _map_z);
+  _map_lat = yToLat(cy, _map_z);
+  _map_follow = false;
+}
+
+// the node nearest the finger, if one is close
+void UITask::mapTouchTap(int x, int y) {
+  if (!_map_inited) mapInit();
+  const int z = _map_z;
+  double left = lonToX(_map_lon, z) - SCR_W / 2.0, top = latToY(_map_lat, z) - MAP_H / 2.0;
+  int best = -1, best_d = 22 * 22;
+  for (int i = 0; i < _num_nodes; i++) {
+    const Node& n = _nodes[i];
+    if (!n.lat && !n.lon) continue;
+    int nx = (int)lround(lonToX(n.lon / 1e6, z) - left), ny = MAP_Y + (int)lround(latToY(n.lat / 1e6, z) - top);
+    int d = (nx - x) * (nx - x) + (ny - y) * (ny - y);
+    if (d < best_d) { best_d = d; best = i; }
+  }
+  _map_node_sel = best;
+}
+
+// a row of the N node list
+void UITask::mapPickTap(int y) {
+  static int list[MAX_CONTACTS];
+  double rl, rn;
+  bool hr;
+  int n = mapPickList(list, rl, rn, hr);
+  int r = (y - (MAP_Y + 16)) / PICK_ROW_H;
+  if (r < 0 || r >= PICK_ROWS || _map_pick_top + r >= n) return;
+  _map_pick_sel = _map_pick_top + r;
+  mapPickKey(TKEY_ENTER);
+}

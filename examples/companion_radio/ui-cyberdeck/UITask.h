@@ -19,6 +19,8 @@
 #include "../NodePrefs.h"
 #include <CyberDeckDisplay.h>
 #include <TDeckInput.h>
+#include <TDeckTouch.h>
+#include <TDeckTouch.h>
 #include <TDeckAudio.h>
 
 #ifndef CD_MAX_MSGS
@@ -122,7 +124,8 @@ private:
     uint16_t mule_age_min;    // hold messages this long (0 = 6h)
     uint8_t  gps_always;      // 1 = never rest the GPS
     uint8_t  cpu_full;        // 1 = don't slow the CPU while the screen is off
-    uint8_t  spare[6];
+    uint8_t  touch_flip;      // touch panel turned: 1 swap x/y, 2 mirror x, 4 mirror y
+    uint8_t  spare[5];
   };
 
   struct RfEntry {
@@ -179,6 +182,23 @@ private:
   SensorManager* _sensors;
   NodePrefs* _node_prefs;
   TDeckInput _input;
+  TDeckTouch _touch;
+  // touch gestures (UITaskTouch.cpp)
+  bool _t_down, _t_long, _t_drag, _t_woke, _touch_debug;
+  int _t_x0, _t_y0, _t_lx, _t_ly, _t_tap_x, _t_tap_y;
+  unsigned long _t_t0, _t_last_tap;
+  uint32_t _row_seq[11];      // which message each chat row shows, for taps
+  int _list_count;            // rows in the list on screen
+  void touchBegin();
+  void touchTick();
+  void touchTap(int x, int y, bool dbl);
+  void touchSwipe(int dx, int dy);
+  void touchLong(int x, int y);
+  void emojiTap(int x, int y);
+  void drawTouchDebug();
+  void mapTouchPan(int dx, int dy);
+  void mapTouchTap(int x, int y);
+  void mapPickTap(int y);
   TDeckAudio _audio;
   Prefs _prefs;
 
@@ -368,6 +388,7 @@ private:
   // colours for the current theme
   uint16_t c_fg, c_dim, c_hi, c_alert, c_bg;
 
+  bool _first_boot;           // no saved settings yet: a new deck
   void applyTheme();
   void loadPrefs();
   void savePrefs();

@@ -11,6 +11,8 @@
 #include <Utils.h>
 #include <target.h>
 #include "font_spleen8x16.h"
+#include <Wire.h>
+#include <helpers/sensors/MicroNMEALocationProvider.h>
 
 #ifndef CD_DEFAULT_DIM_SECS
   #define CD_DEFAULT_DIM_SECS  90
@@ -323,11 +325,12 @@ void UITask::begin(DisplayDriver* display, SensorManager* sensors, NodePrefs* no
   _mule = (MuleEntry*) ps_calloc(CD_MULE_SLOTS, sizeof(MuleEntry));
 
   user_btn.begin();
-  _input.begin();
+  _input.begin();   // opens the I2C bus the touch panel shares
   sdBegin();
   loadCrumbs();
   loadPrefs();
   _input.setSensitivity(_prefs.ball);
+  touchBegin();
   _audio.begin();
   _audio.setVolume(_prefs.volume);
   if (_prefs.kbl) _input.setBacklight(_prefs.kbl);
@@ -340,6 +343,7 @@ void UITask::begin(DisplayDriver* display, SensorManager* sensors, NodePrefs* no
   _clk_last_rtc = rtc_clock.getCurrentTime();
   _clk_last_ms = millis();
   if (_clk_last_rtc > CLOCK_FLOOR + 86400) _clock_src = CLK_RESTORED;   // good enough to use, open to correction
+  if (_first_boot) { setGPS(true); savePrefs(); }   // a new deck: GPS on (the map and clock want it)
 
   _boot_started = millis();
   _auto_off = millis() + _prefs.dim_secs * 1000UL;
@@ -511,6 +515,7 @@ void UITask::loadPrefs() {
   _prefs.history = 1;
 
   File f = SPIFFS.open(CD_PREFS_FILE, "r");
+  _first_boot = !f;
   if (f) {
     Prefs p;
     memset(&p, 0, sizeof(p));
@@ -2351,6 +2356,37 @@ void UITask::runCommand(const char* line) {
     consolePrint("GPS %s // %s", getGPSState() ? "ON" : "OFF", MODES[_gps_mode]);
     if (_prefs.gps_always) consolePrint("LIVE: NEVER RESTS (gps live off)");
     else consolePrint("RESTS AFTER 30MIN STILL, CHECKS /10MIN");
+  } else if (strcmp(cmd, "touch") == 0) {
+    // touch: show where touches land; touch swap|mx|my: turn a panel that's mounted differently
+    if (strcmp(argl, "swap") == 0) _prefs.touch_flip ^= 1;
+    else if (strcmp(argl, "mx") == 0) _prefs.touch_flip ^= 2;
+    else if (strcmp(argl, "my") == 0) _prefs.touch_flip ^= 4;
+    else if (strcmp(argl, "reset") == 0) _prefs.touch_flip = 0;
+    else _touch_debug = !_touch_debug;
+    _touch.setFlip(_prefs.touch_flip);
+    savePrefs();
+    consolePrint("TOUCH %s  TEST %s  TURN %d", _touch.present() ? "FITTED" : "NONE", _touch_debug ? "ON" : "OFF", _prefs.touch_flip);
+    consolePrint("touch swap|mx|my|reset  TO TURN IT");
+  } else if (strcmp(cmd, "hw") == 0) {
+    // what's fitted: chips on the I2C bus, and whether a GPS is talking
+    char line[48] = "I2C:";
+    size_t l = strlen(line);
+    for (uint8_t a = 1; a < 127; a++) {
+      Wire.beginTransmission(a);
+      if (Wire.endTransmission() == 0) {
+        const char* what = a == 0x55 ? "KB" : (a == 0x5D || a == 0x14) ? "TOUCH" : a == 0x51 ? "RTC" : a == 0x6B ? "CHG" : a == 0x34 ? "PMU" : "";
+        l += snprintf(line + l, sizeof(line) - l, " %02X%s%s", a, what[0] ? "=" : "", what);
+        Serial.printf("#HW i2c 0x%02X %s\n", a, what);
+      }
+    }
+    consolePrint("%s", line);
+#ifdef NMEA_KEEP_RECENT
+    LocationProvider* lp = _sensors ? _sensors->getLocationProvider() : NULL;
+    const char* nmea = lp ? static_cast<MicroNMEALocationProvider*>(lp)->recentSentence(0) : NULL;
+    consolePrint("GPS: %s", nmea ? "TALKING" : "SILENT (NONE FITTED, OR ASLEEP)");
+    Serial.printf("#HW gps %s\n", nmea ? nmea : "silent");
+#endif
+    consolePrint("KEYBOARD: %s", _input.hasKeyboard() ? "YES" : "NO");
   } else if (strcmp(cmd, "power") == 0) {
     if (strcmp(argl, "cpu full") == 0) { _prefs.cpu_full = 1; savePrefs(); }
     else if (strcmp(argl, "cpu save") == 0) { _prefs.cpu_full = 0; savePrefs(); }
@@ -2578,6 +2614,7 @@ void UITask::loop() {
     if (key == TKEY_NONE) break;
     handleKey(key);
   }
+  touchTick();
 #ifdef CD_SERIAL_BRIDGE
   serialBridge();
 #endif
@@ -2787,6 +2824,7 @@ void UITask::render() {
     }
   }
 
+  drawTouchDebug();
   if (_prefs.crt) crtPass();
   if ((long)(_glitch_until - millis()) > 0) glitchPass();
 }
@@ -2959,6 +2997,7 @@ void UITask::drawChanList() {
   Adafruit_GFX& g = _display->gfx();
   int& sel = _sel[TAB_CHAN];
   if (sel >= _num_chans) sel = _num_chans ? _num_chans - 1 : 0;
+  _list_count = _num_chans;
 
   if (_num_chans == 0) {
     text(4, BODY_Y + ROW_H, c_dim, "NO CHANNELS YET.");
@@ -3008,6 +3047,7 @@ void UITask::drawNodeList(bool recent) {
   }
   int& sel = _sel[recent ? TAB_HEARD : TAB_NODES];
   if (sel >= count) sel = count ? count - 1 : 0;
+  _list_count = count;
 
   if (count == 0) {
     text(4, BODY_Y + ROW_H, c_dim, recent ? "NOTHING HEARD YET." : "NO CONTACTS YET.");
@@ -3268,11 +3308,13 @@ void UITask::drawChat() {
 
   // each line re-derives its text from the message, so only a pointer and offsets were stored
   full_m = NULL;
+  memset(_row_seq, 0, sizeof(_row_seq));
   for (int r = 0; r < BODY_ROWS; r++) {
     int li = _scroll + (BODY_ROWS - 1 - r);
     if (li >= n) continue;
     const Line& L = lines[li];
     const Msg* m = L.m;
+    _row_seq[r] = m->seq;
     int y = BODY_Y + r * ROW_H;
     if (li >= sel_first && li <= sel_last && sel_first >= 0) {   // the picked message gets a bar and a box
       _display->gfx().fillRect(0, y, 3, ROW_H, c_hi);
