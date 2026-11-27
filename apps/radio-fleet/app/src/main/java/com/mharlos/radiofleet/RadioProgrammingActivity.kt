@@ -14,7 +14,7 @@ import android.widget.RadioButton
 import android.widget.RadioGroup
 import android.widget.ScrollView
 import android.widget.TextView
-import com.chaquo.python.AndroidPlatform
+import com.chaquo.python.android.AndroidPlatform
 import com.chaquo.python.Python
 import org.json.JSONArray
 import org.json.JSONObject
