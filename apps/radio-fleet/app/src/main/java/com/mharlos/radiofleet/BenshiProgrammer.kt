@@ -41,7 +41,9 @@ class BenshiProgrammer(private val link: BluetoothLink) {
             memories.forEach { data.put(it.json()) }
             put("memories", data)
         }.toString(2)
-        val fingerprint: String get() = sha256(json().toByteArray())
+        val fingerprint: String get() = MessageDigest.getInstance("SHA-256")
+            .digest(json().toByteArray())
+            .joinToString("") { "%02x".format(it.toInt() and 255) }
     }
     private fun sha256(input: ByteArray) =
         MessageDigest.getInstance("SHA-256").digest(input)
