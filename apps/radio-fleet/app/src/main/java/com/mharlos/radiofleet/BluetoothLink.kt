@@ -235,9 +235,21 @@ class BluetoothLink(private val context: Context) {
                 @Suppress("DEPRECATION")
                 g.writeCharacteristic(ch)
             }
-            if (!accepted || !latch.await(3, TimeUnit.SECONDS) || !writeOk) {
+            if (!accepted) {
                 writeLatch = null
-                throw IOException("BLE write failed or timed out at byte " + off)
+                throw IOException("BLE write was rejected at byte " + off)
+            }
+            if (withResponse) {
+                if (!latch.await(3, TimeUnit.SECONDS) || !writeOk) {
+                    writeLatch = null
+                    throw IOException("BLE write ACK failed or timed out at byte " + off)
+                }
+            } else {
+                // WRITE_NO_RESPONSE has no guaranteed onCharacteristicWrite callback.
+                // Keep a conservative gap to avoid overrunning inexpensive UART dongles.
+                Thread.sleep(18)
+                if (!ready || closed.get())
+                    throw IOException("BLE disconnected during no-response transfer")
             }
             writeLatch = null
             off += count
