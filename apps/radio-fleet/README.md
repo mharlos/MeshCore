@@ -1,64 +1,99 @@
 # Farm Radio Fleet — Android
 
-A local-first radio-memory fleet manager for a mixed collection of Baofeng UV-5R and UV-5RM handhelds. Source lives in the MeshCore fork under a separate app directory; MeshCore firmware is untouched.
+This application resides under `apps/radio-fleet/` in the MeshCore fork and is
+built independently of the MeshCore firmware. The current development branch
+targets a **single Android app** for memory-channel management across:
 
-## Current build — v0.1
+- Baofeng UV-5R — CHIRP `Baofeng / UV-5R` clone driver.
+- Baofeng UV-5RM — CHIRP `Baofeng / 5RM` clone driver; distinct EEPROM layout.
+- BTECH UV-PRO — native BLE Benshi command/region protocol, also used by the
+  related VR-N76 family.
 
-- One canonical channel plan stored on the Android phone.
-- CHIRP CSV export/import supporting frequencies, split/offset, RX-only channels, CTCSS, bandwidth, and power.
-- Register physical radios by label and exact model.
-- Verify programming by importing a *fresh read-back CSV* exported from the physical radio. Displays per-memory mismatches and marks radios stale when the master changes.
-- Starter memories 001–006 from the earlier farm emergency plan; replace or inspect before transmission.
-- Includes a guided handoff to RadioDroid, whose CHIRP drivers support model-specific radio reads and writes over USB OTG or supported BLE UART adapters.
-- A **read-only TD-BL1 Bluetooth inspector** scans nearby advertisements and reports GATT service/characteristic UUIDs and capabilities. Use this for validating the direct BLE adapter before enabling any app-side writes.
+This programs **channel memories, not radio MCU firmware images**.
 
-**No direct EEPROM write in this build.** The current APK manages a shared channel list and verifies radio read-backs. RadioDroid performs the actual read/write. A single-button Bluetooth writer requires confirming TD-BL1 BLE characteristics and validating UV-5R and UV-5RM identification/write protocols on real hardware. Writing model-specific raw images across models risks corruption; only channel-level CSVs are portable.
+## Capability and validation status
 
-## Reproduce the user's ODmaster → new radio problem
+| Capability | Implemented in source | Validated on user's radios |
+|---|---|---|
+| One canonical channel list + editor | Yes | No |
+| CHIRP CSV import/export and fleet fingerprinting | Yes | No |
+| Register radios, track revision drift | Yes | No |
+| TD-BL1 BLE GATT discovery/serial I/O | Yes | No |
+| TD-BL1 vendor AES authentication | **No; protocol not verified** | No |
+| UV-5R model-specific memory clone via CHIRP | Yes, driver bridge | No |
+| UV-5RM model-specific memory clone via CHIRP | Yes, driver bridge | No |
+| BTECH UV-PRO Benshi BLE channel read/write | Yes, experimental | No |
+| Atomic local backup prior to any write | Yes | No |
+| Model-specific write with verification/read-back | Yes | No |
+| Automated APK build + JVM unit tests | **Yes, CI passed** | N/A |
 
-1. Install RadioDroid from https://github.com/jnyer27/RadioDroid/releases (external project).
-2. Open **Farm Radio Fleet**. Review/edit the six starter memory entries.
-3. Register each physical UV-5R and UV-5RM under **Radio Inventory**.
-4. Tap **Export CHIRP CSV master** and save to Downloads.
-5. In RadioDroid, select **Baofeng / UV-5R** (or **UV-5RM**) and read the individual physical radio. Save its original full EEPROM image before editing.
-6. After saving the original radio image, clear the target memory slots in the external programmer. RadioDroid's current CSV importer populates the first *empty* slots selected in the UI, rather than enforcing CSV Location values; choose the desired starting channel, check every destination slot and all receive/transmit/tone fields, and only then write.
-7. Write and await success. Read the physical radio again, export CHIRP CSV.
-8. Return to Farm Radio Fleet → **Compare a radio read-back CSV**, select the corresponding physical radio and the exported CSV.
-9. A zero-diff result marks the physical radio synced to the master fingerprint. Any profile change marks previous verifications stale.
+**CI passing does not prove a TD-BL1 adapter authenticated or a UV-PRO accepted a
+write.** The TD-BL1 requires an ODmaster-compatible AES challenge on some
+firmware. Without captured protocol details from the owner's hardware, UV-5R
+and UV-5RM connections may reach GATT but fail the initial CHIRP handshake.
+The app fails closed and requires a successful read + backup before enabling
+writes.
 
-If the external programmer uses a different CSV slot convention, adjust the model-specific import location in that programmer. The app doesn't silently remap slots.
+The UV-PRO uses native Benshi BLE characteristics and commands based on
+published protocol references; radio firmware differences require live
+validation. Android's Bluetooth protocol scanner is included for identifying
+and diagnosing real adapters.
 
-## Safety boundaries
+## Use
 
-- UV-5R/UV-5RM profiles are distinct. Never write one model's raw full EEPROM image to the other.
-- Radio channel 005 in the starter configuration is receive-only (RT22 factory FRS channel 5); normal UV-5R transmitters are not FCC Part 95-certified for FRS/GMRS transmission.
-- Edit the local frequencies and tones after confirming the current repeater owner's specifications.
-- Do not treat an exported-but-unverified file, or a completed write dialog, as proof of synchronization; import a read-back and compare.
-- The user controls the physical write. The app intentionally avoids claiming a successful device flash without reading the device.
-- This app programs channel memories, not radio firmware.
+1. Install the latest debug APK from the
+   [radio-fleet-latest release](https://github.com/mharlos/MeshCore/releases/tag/radio-fleet-latest).
+2. Open **FARM RADIO FLEET**, review the master frequencies, tones, and TX
+   disable settings. Import CHIRP CSV if needed.
+3. Tap **READ / WRITE RADIOS OVER BLUETOOTH** and select the exact model.
+4. Scan and connect to the TD-BL1 adapter (UV-5R/5RM) or UV-PRO BLE control
+   service.
+5. **Read radio + save backup.** The backup is written to Android app-private
+   storage before Write becomes available. Do not proceed if Read fails.
+6. Review the confirmation and choose **Write master channels + verify**.
+7. Watch for **VERIFIED**. A success result requires read-back matching the
+   master entries, not just a positive Bluetooth acknowledgment.
 
-## GitHub APK build
+Each physical radio must be read separately. A raw EEPROM image from a UV-5R
+must never be written to a UV-5RM. The app applies model-neutral channel
+intent through the correct CHIRP driver and retains unrelated radio settings
+from the radio's own source image.
 
-Built from the Lembas build pattern: JDK 17, Android/Gradle CI, run-number version codes, upload-artifact, immutable per-run Releases, plus a moving `radio-fleet-latest` tag.
+## Source and licensing
 
-Workflow: `.github/workflows/build-radio-fleet-apk.yml`
-APK artifact: `farm-radio-fleet-apk`
-Latest release: `https://github.com/mharlos/MeshCore/releases/tag/radio-fleet-latest`
+The Android app's Kotlin files are original code built using protocol
+documentation. For the Benshi transport, the implementation references the
+Apache-2.0 protocol work in
+[benlink](https://github.com/khusmann/benlink) and
+[OpenHT](https://github.com/repins267/repins267-OpenHT).
 
-The initial build uses a CI-generated debug key. Reinstalling a newly generated signed APK may require uninstalling the prior build, losing Android-local app data. Before relying on in-place updates, move to a persistent keystore held in GitHub Actions secrets. Export CSV before uninstalling.
+CHIRP Python sources are bundled at build time from the version vendored in
+[RadioDroid](https://github.com/jnyer27/RadioDroid), pinned to commit
+`cafbed75a9a044628e8d374bde9c3062a7d469ff`. Those files retain their
+upstream GPL notices and COPYING license. Distribution of an APK bundling CHIRP
+must comply with the applicable GPL and provide corresponding source.
 
-Local build:
+CI: `.github/workflows/build-radio-fleet-apk.yml`. Kotlin tests and APK
+compile run automatically; the most recent successful build is tagged at
+`radio-fleet-latest`.
 
-```sh
-gradle -p apps/radio-fleet testDebugUnitTest assembleDebug
-```
+**Signing:** The current workflow produces debug-signed test APKs. A durable
+release signing key in GitHub Actions Secrets is required for reliable in-place
+upgrades without uninstalling the app. Until then, export the channel profile
+before reinstalling.
 
-## Next milestone: direct Bluetooth programmer
+## Field-test requirements
 
-- Record read-only GATT service/characteristic inventory for TD-BL1 and actual service UUIDs.
-- Implement a BLE serial transport with MTU-aware chunking, ACK/timeout handling, disconnection safety, and a traffic log with no personal data.
-- Port a model-specific CHIRP clone adapter for UV-5R and UV-5RM **separately**, with first-write protection and original-image backup.
-- Gate the Write action on correct radio identification and approved band limitations; read back and compare after write.
-- Add fleet-wide progress and a deliberate manual action per connected radio.
+- Capture a read-only TD-BL1 BLE GATT service report from **Inspect TD-BL1
+  Bluetooth**. If generic CHIRP read fails, obtain an operator-approved Android
+  Bluetooth HCI trace of a **successful** ODmaster read to document the
+  authentication frames. Do not share pairing keys or personal data.
+- Confirm UV-5R CHIRP read, baseline backup, one test channel write, and a
+  matching independent read-back.
+- Repeat UV-5RM against its own `5RM` driver.
+- Validate UV-PRO BLE discovery, GET_DEV_INFO, group count/channel count,
+  full read, one slot write, and per-slot read-back.
+- Test interrupted connection, failed write, failed auth, and mixed-model
+  inventory; never mark a radio synchronized after a failed operation.
 
-No third-party RadioDroid code is copied into this repository. Programming handoff uses its published Android APK and CHIRP interoperability.
+**This branch stays a draft until those real-hardware tests pass.**
