@@ -103,6 +103,9 @@ class MainActivity : Activity() {
         addButton(host, "Compare a radio read-back CSV") { pickVerifyRadio() }
         section(host, "PROGRAMMING")
         addButton(host, "Program a radio via CHIRP / RadioDroid") { showProgrammingFlow() }
+        addButton(host, "Inspect TD-BL1 Bluetooth (read-only)") {
+            startActivity(Intent(this, BleInspectorActivity::class.java))
+        }
         host.addView(label(
             "This version exports portable channel configurations. RadioDroid performs the physical radio write " +
             "using the correct model-specific CHIRP driver. No raw EEPROM images are shared between models.",
@@ -273,7 +276,7 @@ class MainActivity : Activity() {
                 "1. Export the master CHIRP CSV here.\n" +
                 "2. Open RadioDroid and select this radio's exact model.\n" +
                 "3. Read the physical radio and save its original backup.\n" +
-                "4. Import the master CSV, inspect channel numbering, tones and TX inhibits.\n" +
+                "4. Clear the target memories in the programmer after backing them up; import into selected empty slots. Confirm every destination slot, tone and TX inhibit.\n" +
                 "5. Write to the radio and wait for completion.\n" +
                 "6. Read the radio again, export its CHIRP CSV, then return here to Verify.\n\n" +
                 "Never write a raw UV-5R image into a UV-5RM."
