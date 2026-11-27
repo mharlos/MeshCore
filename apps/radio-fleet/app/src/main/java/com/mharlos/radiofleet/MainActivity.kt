@@ -16,9 +16,9 @@ import android.widget.TextView
 import java.util.Locale
 
 /**
- * Local-first channel manager. Programming is delegated to an existing CHIRP-driver
- * Android programmer until this project has a verified, model-specific transport.
- * Verification requires an independently exported read-back CSV from each radio.
+ * Local-first fleet manager with a native BLE programming workflow.
+ * Physical radio writes require a local backup, exact model identification,
+ * and per-memory read-back verification.
  */
 class MainActivity : Activity() {
     private lateinit var store: FleetStore
@@ -72,7 +72,7 @@ class MainActivity : Activity() {
         setContentView(scroll)
         host.addView(label("FARM RADIO FLEET", 26f, green))
         host.addView(label(
-            "One master channel list for UV-5R, UV-5RM and other CHIRP-supported radios.",
+            "One master channel list across UV-5R, UV-5RM and BTECH UV-PRO.",
             13f, muted
         ))
         val currentHash = ChirpCsv.fingerprint(channels)
@@ -102,13 +102,15 @@ class MainActivity : Activity() {
         addButton(host, "+ Add a radio") { addRadio() }
         addButton(host, "Compare a radio read-back CSV") { pickVerifyRadio() }
         section(host, "PROGRAMMING")
+        addButton(host, "READ / WRITE RADIOS OVER BLUETOOTH") {
+            startActivity(Intent(this, RadioProgrammingActivity::class.java))
+        }
         addButton(host, "Program a radio via CHIRP / RadioDroid") { showProgrammingFlow() }
         addButton(host, "Inspect TD-BL1 Bluetooth (read-only)") {
             startActivity(Intent(this, BleInspectorActivity::class.java))
         }
         host.addView(label(
-            "This version exports portable channel configurations. RadioDroid performs the physical radio write " +
-            "using the correct model-specific CHIRP driver. No raw EEPROM images are shared between models.",
+            "This app includes a direct Bluetooth programming screen with read-back verification.",
             13f, muted
         ))
         host.addView(label(
