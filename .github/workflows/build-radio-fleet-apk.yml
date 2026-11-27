@@ -32,7 +32,12 @@ jobs:
           gradle-version: '8.9'
       - name: Bundle pinned CHIRP Python drivers and GPL license
         run: |
-          git clone --depth 1 https://github.com/jnyer27/RadioDroid.git /tmp/radio-droid
+          mkdir -p /tmp/radio-droid
+          git -C /tmp/radio-droid init -q
+          git -C /tmp/radio-droid remote add origin https://github.com/jnyer27/RadioDroid.git
+          git -C /tmp/radio-droid fetch --depth 1 origin cafbed75a9a044628e8d374bde9c3062a7d469ff
+          git -C /tmp/radio-droid checkout --detach FETCH_HEAD
+          test "$(git -C /tmp/radio-droid rev-parse HEAD)" = cafbed75a9a044628e8d374bde9c3062a7d469ff
           mkdir -p apps/radio-fleet/app/src/main/python/chirp
           cp -a /tmp/radio-droid/AndroidRadioDroid/app/src/main/python/chirp/chirp/. apps/radio-fleet/app/src/main/python/chirp/
           cp /tmp/radio-droid/AndroidRadioDroid/app/src/main/python/chirp/COPYING apps/radio-fleet/CHIRP-COPYING 2>/dev/null || true
