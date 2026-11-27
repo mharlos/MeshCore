@@ -1,0 +1,41 @@
+name: Build Farm Radio Fleet APK
+on:
+  push:
+    branches: [feature/radio-fleet-sync]
+    paths:
+      - 'apps/radio-fleet/**'
+      - '.github/workflows/build-radio-fleet-apk.yml'
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+      - name: Install Android platform
+        run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+      - name: Test and build APK
+        run: gradle -p apps/radio-fleet testDebugUnitTest assembleDebug -PradioVersionCode=${{ github.run_number }} --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: farm-radio-fleet-apk
+          path: apps/radio-fleet/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+      - name: Publish tagged build and latest APK
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          APK=apps/radio-fleet/app/build/outputs/apk/debug/app-debug.apk
+          TAG="radio-fleet-build-${{ github.run_number }}"
+          gh release create "$TAG" "$APK#farm-radio-fleet.apk" --target "$GITHUB_SHA" --title "Radio Fleet ${{ github.run_number }}" --notes "Sideloadable test APK. Verify all memories before on-air use."
+          gh release delete radio-fleet-latest --yes --cleanup-tag 2>/dev/null || true
+          gh release create radio-fleet-latest "$APK#farm-radio-fleet.apk" --target "$GITHUB_SHA" --title "Radio Fleet — latest Android APK" --notes "Feature-branch test build. Debug-signed APK; clean CI builds may require uninstall before an update."
