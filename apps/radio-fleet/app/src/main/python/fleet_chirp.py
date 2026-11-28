@@ -75,12 +75,16 @@ class AndroidPipe:
         self.tx_bytes = 0
         self.last_io = "initialized"
         self.recent_io = []
+        self.ident_frames = ()
+        self.ident_pending = b""
+        self.ident_batches = 0
         self.parity = "N"
         self.rts = False
         self.dtr = False
         self.is_open = True
 
     def read(self, size=1):
+        self._flush_ident()
         self.read_calls += 1
         requested = int(size)
         timeout_ms = max(1, int(float(self.timeout or 1) * 1000))
@@ -96,8 +100,39 @@ class AndroidPipe:
         self.recent_io.append(message)
         del self.recent_io[:-12]
 
+    def configure_uv5r_ident(self, radio):
+        # Match only the pinned driver's known identification sequences.
+        # Do not combine arbitrary ACKs, data frames or other radio models.
+        driver = importlib.import_module("chirp.drivers.uv5r")
+        self.ident_frames = tuple(bytes(x) for x in
+                                  list(radio._idents) + list(driver.IDENT_BLACKLIST))
+
+    def _flush_ident(self):
+        if self.ident_pending:
+            payload = self.ident_pending
+            self.ident_pending = b""
+            self._send(payload)
+
     def write(self, data):
         payload = bytes(data)
+        if self.ident_frames and len(payload) == 1:
+            candidate = self.ident_pending + payload
+            if candidate in self.ident_frames:
+                self.ident_pending = b""
+                self._send(candidate)
+                self.ident_batches += 1
+                return len(payload)
+            if any(frame.startswith(candidate) for frame in self.ident_frames):
+                self.ident_pending = candidate
+                return len(payload)
+        self._flush_ident()
+        if self.ident_frames and len(payload) == 1 and any(
+                frame.startswith(payload) for frame in self.ident_frames):
+            self.ident_pending = payload
+            return len(payload)
+        return self._send(payload)
+
+    def _send(self, payload):
         self.write_calls += 1
         self.last_io = "writing %d bytes" % len(payload)
         RadioIo.write(payload)
@@ -117,10 +152,10 @@ class AndroidPipe:
     def diagnostic(self):
         return ("baud=%d tx=%d bytes (%d calls) rx=%d bytes (%d calls); last=%s" %
                 (self.baudrate, self.tx_bytes, self.write_calls,
-                 self.rx_bytes, self.read_calls, self.last_io)) + " | recent: " + "; ".join(self.recent_io)
+                 self.rx_bytes, self.read_calls, self.last_io)) + " | UART baud unverified; ident batches=%d | recent: " % self.ident_batches + "; ".join(self.recent_io)
 
     def flush(self):
-        return None
+        self._flush_ident()
 
     def flushInput(self):
         RadioIo.flushInput()
@@ -135,6 +170,7 @@ class AndroidPipe:
         self.dtr = value
 
     def close(self):
+        self.ident_pending = b""
         self.is_open = False
 
 def _class(model):
@@ -169,6 +205,8 @@ def _sync_in_once(model):
     # that changing a Python property switches the hardware serial clock.
     radio.pipe.baudrate = int(getattr(cls, "BAUD_RATE", 9600))
     radio.pipe.timeout = 5.0
+    if model == "UV-5R":
+        radio.pipe.configure_uv5r_ident(radio)
     capture = _DriverErrors()
     driver_logger = logging.getLogger("chirp.drivers.baofeng_uv17Pro")
     driver_logger.addHandler(capture)
