@@ -71,8 +71,13 @@ Password recovery file: $PASSFILE
 Back up BOTH files securely. Losing the key breaks the Android upgrade chain.
 Never commit either file to your public GitHub repository.
 
-Now trigger a signed APK build:
-  gh workflow run build-radio-fleet-apk.yml --repo "$REPO" --ref feature/radio-fleet-sync
+Trigger a signed APK build by pushing a new commit on the feature branch:
+  git switch feature/radio-fleet-sync
+  git commit --allow-empty -m "ci: build signed Radio Fleet APK"
+  git push origin feature/radio-fleet-sync
+
+The workflow currently lives on the feature branch only; GitHub's manual
+workflow_dispatch event may require a copy on the default branch.
 
 After the new signed APK is available, uninstall the old debug-signed app one
 final time. All future builds signed by this certificate upgrade in place.
