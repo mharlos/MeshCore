@@ -98,6 +98,70 @@ internal class BenshiSession(private val link: BluetoothLink) : DeviceSession {
             index.toString() + " " + name + " · RX " + rx/1e6 + " · " + (if (inhibit) "RX ONLY" else "TX " + tx/1e6)
         }
     }
+    private fun currentRegion(): Int {
+        val b = command(20)
+        require(b.size == 4) { "Extended status required to verify active bank" }
+        require(u(b[0]) and 64 == 0) { "Radio is transmitting; stop before programming" }
+        return ((u(b[2]) and 15) shl 2) or (u(b[3]) ushr 6)
+    }
+    private fun channel(index: Int): ByteArray = command(13, byteArrayOf(index.toByte())).also {
+        require(it.size == 25 && u(it[0]) == index) { "Unsupported channel record or mismatched index" }
+    }
+    data class BankPlan(val region: Int, val perBank: Int, val channels: List<Channel>)
+    fun planBank(master: List<Channel>): BankPlan {
+        val info = cached ?: info()
+        val region = currentRegion()
+        require(region in 0 until info.regions)
+        val first = region * info.channels + 1
+        val last = first + info.channels - 1
+        val candidates = master.filter { it.slot in first..last && FrequencyCatalog.supports(it,"UV-5R") }
+        // Unknown FRS/GMRS equipment certification: preserve monitoring only.
+        // DCS wire code mapping must be validated before programming those memories.
+        val compatible = candidates.filter { it.txDcs == null && it.rxDcs == null }.map {
+            val tx = it.transmit
+            val permitted = tx != null && (tx in 144.0..148.0 || tx in 420.0..450.0) && it.mode != "AM"
+            it.copy(transmit = if (permitted) tx else null, name = it.name.take(10))
+        }
+        return BankPlan(region,info.channels,compatible)
+    }
+    fun writeBank(plan: BankPlan, saveBackup: (List<ByteArray>) -> Unit): String {
+        require(plan.channels.isNotEmpty())
+        require(currentRegion() == plan.region) { "Active bank changed; review again" }
+        val original = (0 until plan.perBank).map { channel(it) }
+        saveBackup(original)
+        val replacements = plan.channels.map { c ->
+            val index = c.slot - plan.region * plan.perBank - 1
+            val old = original[index]
+            require(u(old[14]) and 0xe0 == 0) { "Channel " + c.slot + " has fixed frequency, bandwidth or power" }
+            val raw = old.copyOf()
+            val bb = ByteBuffer.wrap(raw).order(ByteOrder.BIG_ENDIAN)
+            val rx = kotlin.math.round(c.receive * 1e6).toInt()
+            val tx = c.transmit?.let { kotlin.math.round(it * 1e6).toInt() } ?: rx
+            bb.putInt(1,tx)
+            bb.putInt(5,rx)
+            bb.putShort(9,(c.txCtcss?.let { kotlin.math.round(it*100).toInt() } ?: 0).toShort())
+            bb.putShort(11,(c.rxCtcss?.let { kotlin.math.round(it*100).toInt() } ?: 0).toShort())
+            var flags = u(raw[13]) and 0xac // preserve scan, talk-around, pre/deemphasis, sign
+            if (c.mode == "FM") flags = flags or 0x10
+            if (c.transmit == null) flags = flags or 1
+            if (c.power.equals("High",true)) flags = flags or 0x40
+            if (c.power.equals("Medium",true)) flags = flags or 2
+            raw[13] = flags.toByte()
+            for (i in 15 until 25) raw[i] = 0
+            val name = c.name.filter { it.code in 32..126 }.toByteArray(Charsets.US_ASCII).take(10)
+            name.forEachIndexed { i,b -> raw[15+i] = b }
+            index to raw
+        }
+        for ((index, raw) in replacements) {
+            require(currentRegion() == plan.region) { "Active bank changed during programming" }
+            require(channel(index).contentEquals(original[index])) { "Memory changed since backup" }
+            val reply = command(14,raw)
+            require(reply.size == 1 && u(reply[0]) == index) { "Write acknowledgement mismatch" }
+            require(channel(index).contentEquals(raw)) { "Memory read-back mismatch at index " + index }
+        }
+        return "VERIFIED " + replacements.size + " memories in active bank " + plan.region + ". Original backup retained."
+    }
+
     fun subscribeData() {
         command(6, byteArrayOf(1), false)
         command(6, byteArrayOf(2), false)
