@@ -170,7 +170,7 @@ class MainActivity : Activity() {
                     require(receive in 1.0..999.0 && (transmit == null || transmit in 1.0..999.0))
                     val mode = v[6].uppercase(Locale.US)
                     require(mode in listOf("FM", "NFM", "AM"))
-                    require(transmit == null || (mode != "AM" && (transmit in 144.0..148.0 || transmit in 420.0..450.0))) { "Non-amateur transmit must be blank" }
+                    require(FrequencyCatalog.txAllowed(receive, transmit, mode)) { "Use amateur TX, an exact GMRS simplex/repeater pair, or receive-only" }
                     val power = v[7].lowercase(Locale.US).replaceFirstChar { it.uppercase() }
                     require(power in listOf("Low","Medium","High"))
                     val txTone = v[4].takeIf { it.isNotBlank() }?.toDouble()
