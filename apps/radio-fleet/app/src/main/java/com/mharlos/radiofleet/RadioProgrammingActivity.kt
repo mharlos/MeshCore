@@ -448,6 +448,7 @@ class RadioProgrammingActivity : Activity() {
                     "Radio: " + targetName + "\nModel: " + model +
                     "\nBackup: " + backupFile!!.name +
                     "\nUnsupported / unavailable memories skipped: " + skipped +
+                    "\nFRS TX inhibited (no certified FRS driver): " + FrequencyCatalog.frsTxCount(master) +
                     "\nGMRS TX enabled: " + enabled +
                     "\nGMRS TX inhibited / unavailable: " + inhibited +
                     "\n\nOther memories and radio-specific settings will be preserved. " +
