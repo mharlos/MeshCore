@@ -134,6 +134,31 @@ class DeviceConsoleActivity : Activity() {
                         "Saved active-bank memory summary: " + file.name + "\n" + rows.joinToString("\n")
                     }
                 }
+                button(controls, "Program master memories in active bank") {
+                    runTask("Inspecting active radio bank…") {
+                        val plan = s.planBank(FleetStore(this).channels())
+                        val preview = plan.channels.joinToString("\n") { c ->
+                            c.slot.toString() + " · " + c.name + " · " + c.receive +
+                                (c.transmit?.let { " TX " + it } ?: " RX ONLY")
+                        }
+                        runOnUiThread {
+                            if (!destroyed && plan.channels.isNotEmpty()) {
+                                AlertDialog.Builder(this).setTitle("Write active bank " + (plan.region+1) + "?")
+                                    .setMessage("Only the listed compatible master memories are updated. GMRS/FRS receive-only; DCS skipped. Original bank backed up.\n\n" + preview)
+                                    .setNegativeButton("Cancel",null).setPositiveButton("Backup + write + verify") { _,_ ->
+                                        if (session === s) runTask("Programming active bank…") {
+                                            s.writeBank(plan) { records ->
+                                                val file = File(filesDir,"benshi-bank-" + plan.region + "-" + System.currentTimeMillis() + ".bin")
+                                                file.outputStream().use { out -> records.forEach { out.write(it) } }
+                                            }
+                                        }
+                                    }.show()
+                            }
+                        }
+                        if (plan.channels.isEmpty()) "No compatible master memories in active bank." else
+                            "Review " + plan.channels.size + " memories for active bank " + (plan.region+1)
+                    }
+                }
                 button(controls, "Read radio settings") { runTask("Reading settings…") { s.settingsSummary() } }
                 button(controls, "Set squelch (backup + verify)") {
                     val field = EditText(this).apply {
