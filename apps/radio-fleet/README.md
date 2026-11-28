@@ -77,7 +77,34 @@ CI: `.github/workflows/build-radio-fleet-apk.yml`. Kotlin tests and APK
 compile run automatically; the most recent successful build is tagged at
 `radio-fleet-latest`.
 
-## Permanent Android signing and in-place APK upgrades
+## Phone-only installation and updates
+
+Farm Radio Fleet now has an **isolated private signing workflow** in the
+owner's Lembas repository: `.github/workflows/radio-fleet-apk.yml` on
+`mharlos/Lembas` main.
+
+- It checks out the existing Lembas signing assets read-only from
+  `claude/lembas-metabolic-app-hmfahq`, without modifying either existing
+  Lembas Android app or its original build workflow.
+- It independently builds the public MeshCore `feature/radio-fleet-sync`
+  application from source and signs the release using the same stable
+  certificate mechanism that already supports Lembas updates.
+- It publishes to **private Lembas** releases named
+  `radio-fleet-build-N` and `radio-fleet-latest`. Existing Lembas tags
+  `latest-android` and `latest-android-theusual` remain untouched.
+- Download the Radio Fleet APK from
+  https://github.com/mharlos/Lembas/releases/tag/radio-fleet-latest
+  while signed into GitHub. No computer, local Java SDK, or GitHub CLI required.
+- After one final uninstall of the previously random-debug-signed Radio Fleet
+  APK, all subsequent Radio Fleet APKs from this private workflow will share
+  a stable signature and increase Android versionCode with each run.
+
+The MeshCore public workflow remains for source validation and CI-only APK
+artifacts. It will not publish standard debug APKs as installable updates
+when its release signing secrets are absent. The separate private Lembas
+signing workflow supplies the supported installation artifacts.
+
+## Optional independent signing via MeshCore Actions secrets
 
 Android verifies signing-certificate identity, package name, and increasing
 versionCode before an app can be updated in place. Previous APKs carried a new
