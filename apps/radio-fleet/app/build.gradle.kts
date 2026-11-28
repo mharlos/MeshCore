@@ -3,7 +3,32 @@ plugins {
     id("org.jetbrains.kotlin.android")
     id("com.chaquo.python")
 }
+// One persistent certificate must sign every public APK update.
+// CI injects the keystore from repository Actions secrets, never from Git.
+val fleetKeystorePath = System.getenv("RADIO_FLEET_KEYSTORE_FILE")
+val fleetKeystorePassword = System.getenv("RADIO_FLEET_SIGNING_PASSWORD")
+val hasFleetSigning = !fleetKeystorePath.isNullOrBlank() && !fleetKeystorePassword.isNullOrBlank()
+
 android {
+    signingConfigs {
+        if (hasFleetSigning) {
+            create("fleetRelease") {
+                storeFile = file(fleetKeystorePath!!)
+                storePassword = fleetKeystorePassword
+                keyAlias = "farmradiofleet"
+                keyPassword = fleetKeystorePassword
+                storeType = "PKCS12"
+            }
+        }
+    }
+    buildTypes {
+        getByName("release") {
+            if (hasFleetSigning) {
+                signingConfig = signingConfigs.getByName("fleetRelease")
+            }
+            isMinifyEnabled = false
+        }
+    }
     namespace = "com.mharlos.radiofleet"
     compileSdk = 35
     defaultConfig {
