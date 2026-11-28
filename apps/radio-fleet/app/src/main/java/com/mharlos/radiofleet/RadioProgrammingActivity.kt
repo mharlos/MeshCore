@@ -45,6 +45,7 @@ class RadioProgrammingActivity : Activity() {
     private var backupFile: File? = null
     private var targetName: String = ""
     private var busy = false
+    @Volatile private var lastFailureReport: String = ""
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -106,10 +107,12 @@ class RadioProgrammingActivity : Activity() {
             text = "Copy Bluetooth service diagnostics"
             isAllCaps = false
             setOnClickListener {
-                val diagnostic = link.lastGattReport
+                val diagnostic = link.lastGattReport +
+                    (if (lastFailureReport.isNotBlank())
+                        "\n\nRADIO READ/WRITE FAILURE\n" + lastFailureReport else "")
                 val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                clipboard.setPrimaryClip(ClipData.newPlainText("Radio BLE services", diagnostic))
-                setStatus("Copied GATT diagnostic report. Paste the report into our chat.")
+                clipboard.setPrimaryClip(ClipData.newPlainText("Radio BLE and CHIRP diagnostics", diagnostic))
+                setStatus("Copied GATT and last radio error diagnostics. Paste the report into our chat.")
             }
         })
         status = header("Choose a model and scan.", 13f)
@@ -169,6 +172,7 @@ class RadioProgrammingActivity : Activity() {
     }
     private fun worker(label: String, body: () -> Unit) {
         if (busy) return
+        lastFailureReport = ""
         busy = true
         readButton.isEnabled = false
         writeButton.isEnabled = false
@@ -176,8 +180,13 @@ class RadioProgrammingActivity : Activity() {
         task.submit {
             try { body() }
             catch (e: Exception) {
-                setStatus(label + " FAILED: " + (e.message ?: e.javaClass.simpleName) +
-                    "\nNo further write attempted.")
+                // The CHIRP driver masks many exceptions behind a generic
+                // RadioError. Preserve its Python-side diagnostic and our
+                // Java exception chain for the operator to copy and report.
+                lastFailureReport = e.stackTraceToString().take(6500)
+                setStatus(label + " FAILED:\n" +
+                    (e.message ?: e.javaClass.simpleName).take(1250) +
+                    "\nNo further write attempted. Use Copy Bluetooth service diagnostics for details.")
             } finally {
                 busy = false
                 runOnUiThread {
