@@ -38,31 +38,42 @@ class DeviceConsoleActivity : Activity() {
         family = if (intent.getStringExtra("family") == "meshcore") BluetoothLink.Family.MESHCORE
             else BluetoothLink.Family.BENSHI_UVPRO
         link = BluetoothLink(this)
-        host = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(20,20,20,20)
-        }
-        val scroll = ScrollView(this).apply { addView(host) }
-        setContentView(scroll)
-        host.addView(TextView(this).apply {
-            textSize = 22f
-            text = if (family == BluetoothLink.Family.MESHCORE) "MeshCore Companion" else "BTECH Native Bluetooth"
+        window.statusBarColor=Deck.bg
+        window.navigationBarColor=Deck.bg
+        host=Deck.stack(this,12).apply { setBackgroundColor(Deck.bg) }
+        setContentView(ScrollView(this).apply { setBackgroundColor(Deck.bg);addView(host) })
+        val accent=if(family==BluetoothLink.Family.MESHCORE) Deck.lime else Deck.pink
+        Deck.add(host,Deck.header(this,if(family==BluetoothLink.Family.MESHCORE)"MeshCore companion" else "BTECH native Bluetooth"))
+        val connection=Deck.card(this,accent)
+        Deck.heading(connection,"Device link",accent)
+        val actions=Deck.row(this)
+        Deck.weighted(actions,Deck.button(this,"Scan / connect",accent){if(!busy&&permitted())scan()})
+        Deck.weighted(actions,Deck.button(this,"Disconnect",Deck.amber){
+            if(!busy){link.disconnect();session=null;controls.removeAllViews();report.text="Disconnected"}
         })
-        button(host, "Scan / connect") { if (!busy && permitted()) scan() }
-        button(host, "Disconnect") { if (!busy) { link.disconnect(); session = null; controls.removeAllViews(); report.text = "Disconnected" } }
-        devices = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        host.addView(devices)
-        report = TextView(this).apply { text = "Select a native Bluetooth device."; setTextIsSelectable(true) }
-        host.addView(report)
-        controls = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        host.addView(controls)
-        button(host, "Copy BLE diagnostics") {
+        Deck.add(connection,actions)
+        devices=Deck.stack(this)
+        Deck.add(connection,devices,0)
+        Deck.add(host,connection)
+        val state=Deck.card(this,Deck.cyan)
+        Deck.heading(state,"Device status / operation output")
+        report=Deck.text(this,"Select a native Bluetooth device.",13f,Deck.ink,true).apply { setTextIsSelectable(true) }
+        Deck.add(state,report,0);Deck.add(host,state)
+        controls=Deck.card(this,accent)
+        Deck.add(host,controls)
+        button(host,"Copy BLE diagnostics"){
             (getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager)
-                .setPrimaryClip(ClipData.newPlainText("Bluetooth diagnostic", link.lastGattReport + "\n" + report.text))
+                .setPrimaryClip(ClipData.newPlainText("Bluetooth diagnostic",link.lastGattReport+"\n"+report.text))
         }
     }
-    private fun button(parent: LinearLayout, title: String, action: () -> Unit) {
-        parent.addView(Button(this).apply { text = title; isAllCaps = false; setOnClickListener { action() } })
+    private fun button(parent:LinearLayout,title:String,action:()->Unit) {
+        val accent=when {
+            title.contains("program",true)||title.contains("send",true)->Deck.pink
+            title.contains("settings",true)||title.contains("squelch",true)->Deck.amber
+            title.contains("sync",true)||title.contains("battery",true)->Deck.lime
+            else->Deck.cyan
+        }
+        Deck.action(parent,title,accent,action)
     }
     private fun permitted(): Boolean {
         val required = if (Build.VERSION.SDK_INT >= 31)
@@ -121,6 +132,7 @@ class DeviceConsoleActivity : Activity() {
     }
     private fun renderControls(s: DeviceSession) {
         controls.removeAllViews()
+        Deck.heading(controls,"Device operations")
         button(controls, "Refresh status") { runTask("Querying radio…") { s.status() } }
         when (s) {
             is BenshiSession -> {
