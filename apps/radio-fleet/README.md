@@ -97,7 +97,8 @@ git clone -b feature/radio-fleet-sync https://github.com/mharlos/MeshCore.git
 cd MeshCore
 gh auth login
 bash apps/radio-fleet/scripts/configure-signing.sh
-gh workflow run build-radio-fleet-apk.yml --repo mharlos/MeshCore --ref feature/radio-fleet-sync
+git commit --allow-empty -m "ci: build signed Radio Fleet APK"
+git push origin feature/radio-fleet-sync
 ```
 
 The script generates one private 3072-bit RSA PKCS#12 key pair at
