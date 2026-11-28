@@ -78,13 +78,14 @@ object StarterProfile {
             gmrs.mapIndexed { i, c -> c.copy(slot = if (i < 20) 70+i else 100+i-20) } +
             repeaters.mapIndexed { i, c -> c.copy(slot = 90+i) }
     }
-    val channels: List<Channel> get() = (base + serviceChannels).sortedBy { it.slot }
+    val reservedDefaults: List<Channel> get() = serviceChannels + RegionalCatalog.defaults
+    val channels: List<Channel> get() = (base + reservedDefaults).sortedBy { it.slot }
 
     // Never silently overwrite a saved custom memory; leave conflicting defaults
     // uninstalled until the operator explicitly applies the reserved layout.
     fun mergeMissing(existing: List<Channel>): List<Channel> {
         val used = existing.map { it.slot }.toSet()
-        return (existing + serviceChannels.filter { c -> c.slot !in used &&
+        return (existing + reservedDefaults.filter { c -> c.slot !in used &&
             existing.none { it.name.equals(c.name, true) && it.service == c.service } })
             .sortedBy { it.slot }
     }
@@ -226,11 +227,14 @@ class FleetStore(context: Context) {
         val json = prefs.getString("channels", null) ?: return StarterProfile.channels
         val array = JSONArray(json)
         val existing = (0 until array.length()).map { Channel.parse(array.getJSONObject(it)) }
-        if (!prefs.getBoolean("service_defaults_v1", false)) {
+        if (!prefs.getBoolean("regional_defaults_v1", false)) {
             val merged = StarterProfile.mergeMissing(existing)
-            prefs.edit().putString("pre_service_defaults_backup", json)
-                .putBoolean("service_defaults_v1", true).apply()
-            saveChannels(merged)
+            val updated = JSONArray()
+            merged.forEach { updated.put(it.json()) }
+            check(prefs.edit().putString("pre_regional_defaults_backup", json)
+                .putString("channels", updated.toString())
+                .putBoolean("service_defaults_v1", true)
+                .putBoolean("regional_defaults_v1", true).commit()) { "Default profile migration failed" }
             return merged
         }
         return existing
@@ -238,7 +242,7 @@ class FleetStore(context: Context) {
     fun saveChannels(channels: List<Channel>) {
         val arr = JSONArray()
         channels.sortedBy { it.slot }.forEach { arr.put(it.json()) }
-        prefs.edit().putString("channels", arr.toString()).putBoolean("service_defaults_v1", true).apply()
+        prefs.edit().putString("channels", arr.toString()).putBoolean("service_defaults_v1", true).putBoolean("regional_defaults_v1", true).apply()
     }
     fun radios(): List<FleetRadio> {
         val arr = JSONArray(prefs.getString("radios", "[]")!!)
