@@ -149,10 +149,10 @@ def _sync_in(model):
             type(error).__name__, str(error), diag))
         if underlying:
             message += " | driver: " + underlying[-1200:]
+        radio.pipe.close()
         raise RuntimeError(message[:2000]) from error
     finally:
         driver_logger.removeHandler(capture)
-        radio.pipe.close()
 
 def _image(radio):
     mmap = radio.get_mmap()
