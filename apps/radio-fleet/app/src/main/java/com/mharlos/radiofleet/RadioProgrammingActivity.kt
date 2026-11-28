@@ -44,7 +44,11 @@ class RadioProgrammingActivity : Activity() {
     private var uvproBackup: BenshiProgrammer.Snapshot? = null
     private var backupFile: File? = null
     private var targetName: String = ""
-    private var busy = false
+    @Volatile private var busy = false
+    private class VerificationFailure(cause: Exception) : IllegalStateException(
+        "Upload returned successfully, but read-back verification failed: " +
+            (cause.message ?: cause.javaClass.simpleName), cause
+    )
     @Volatile private var lastFailureReport: String = ""
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -85,7 +89,7 @@ class RadioProgrammingActivity : Activity() {
         root.addView(radioGroup)
         val scan = Button(this).apply {
             text = "1. Scan for Bluetooth adapters"
-            setOnClickListener { if (permissions()) scan() }
+            setOnClickListener { if (!busy && permissions()) scan() }
         }
         root.addView(scan)
         devices = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
@@ -174,6 +178,7 @@ class RadioProgrammingActivity : Activity() {
         if (busy) return
         lastFailureReport = ""
         busy = true
+        for (i in 0 until radioGroup.childCount) radioGroup.getChildAt(i).isEnabled = false
         readButton.isEnabled = false
         writeButton.isEnabled = false
         setStatus(label)
@@ -184,12 +189,20 @@ class RadioProgrammingActivity : Activity() {
                 // RadioError. Preserve its Python-side diagnostic and our
                 // Java exception chain for the operator to copy and report.
                 lastFailureReport = e.stackTraceToString().take(6500)
-                setStatus(label + " FAILED:\n" +
+                // Never reuse authorization after a failed or partial transaction.
+                readModel = null
+                baofengBackup = null
+                uvproBackup = null
+                link.disconnect()
+                val heading = if (e is VerificationFailure)
+                    "UPLOAD COMPLETED — VERIFICATION FAILED" else label + " FAILED"
+                setStatus(heading + ":\n" +
                     (e.message ?: e.javaClass.simpleName).take(1250) +
-                    "\nNo further write attempted. Use Copy Bluetooth service diagnostics for details.")
+                    "\nNo further write attempted. Copy diagnostics, reconnect, then READ again.")
             } finally {
                 busy = false
                 runOnUiThread {
+                    for (i in 0 until radioGroup.childCount) radioGroup.getChildAt(i).isEnabled = true
                     readButton.isEnabled = link.ready
                     writeButton.isEnabled = link.ready && readModel == model &&
                         backupFile?.exists() == true
@@ -243,7 +256,7 @@ class RadioProgrammingActivity : Activity() {
         }
     }
     private fun confirmWrite() {
-        if (readModel != model || backupFile?.exists() != true) {
+        if (busy || !link.ready || readModel != model || backupFile?.exists() != true) {
             setStatus("Read and back up this specific radio before writing.")
             return
         }
@@ -262,7 +275,10 @@ class RadioProgrammingActivity : Activity() {
                 "This operation writes to the physical radio and requires an uninterrupted connection."
             )
             .setNegativeButton("Cancel", null)
-            .setPositiveButton("Write + verify") { _, _ -> write(selected) }
+            .setPositiveButton("Write + verify") { _, _ ->
+                if (!busy && link.ready && readModel == model && backupFile?.exists() == true)
+                    write(selected)
+            }
             .show()
     }
     private fun write(selected: List<Channel>) {
@@ -293,14 +309,18 @@ class RadioProgrammingActivity : Activity() {
                     python().callAttr("write_radio", targetModel,
                         prior.getString("sha256"), array.toString())
                     setStatus("Write completed. Reading radio independently to verify...")
-                    val readback = JSONObject(python().callAttr("read_radio", targetModel).toString())
-                    val memory = readback.getJSONArray("channels")
-                    val actual = (0 until memory.length()).map {
-                        Channel.parse(memory.getJSONObject(it))
+                    try {
+                        val readback = JSONObject(python().callAttr("read_radio", targetModel, true).toString())
+                        val memory = readback.getJSONArray("channels")
+                        val actual = (0 until memory.length()).map {
+                            Channel.parse(memory.getJSONObject(it))
+                        }
+                        val differences = ChirpCsv.diff(selected, actual)
+                        if (differences.isNotEmpty())
+                            throw IllegalStateException("Read-back mismatch: " + differences.take(8).joinToString("; "))
+                    } catch (e: Exception) {
+                        throw VerificationFailure(e)
                     }
-                    val differences = ChirpCsv.diff(selected, actual)
-                    if (differences.isNotEmpty())
-                        throw IllegalStateException("Read-back mismatch: " + differences.take(8).joinToString("; "))
                     success(selected.size, targetModel)
                 }
             }
