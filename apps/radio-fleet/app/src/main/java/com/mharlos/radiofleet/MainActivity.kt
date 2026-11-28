@@ -25,11 +25,11 @@ class MainActivity : Activity() {
     private var channels = mutableListOf<Channel>()
     private var radios = mutableListOf<FleetRadio>()
     private var verifyRadioIndex = -1
-    private val bg = Color.rgb(10, 17, 26)
-    private val surface = Color.rgb(20, 33, 45)
-    private val green = Color.rgb(96, 227, 172)
-    private val foreground = Color.rgb(230, 239, 242)
-    private val muted = Color.rgb(163, 184, 193)
+    private val bg = Deck.bg
+    private val surface = Deck.panel
+    private val green = Deck.cyan
+    private val foreground = Deck.ink
+    private val muted = Deck.muted
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -40,111 +40,244 @@ class MainActivity : Activity() {
         window.navigationBarColor = bg
         render()
     }
-    private fun label(text: String, size: Float = 15f, color: Int = foreground): TextView =
-        TextView(this).apply {
-            this.text = text
-            textSize = size
-            setTextColor(color)
-            setPadding(4, 7, 4, 7)
-        }
-    private fun stack(): LinearLayout = LinearLayout(this).apply {
-        orientation = LinearLayout.VERTICAL
-        setPadding(16, 12, 16, 12)
+    private var tab = "Home"
+    private var query = ""
+    private var filter = "All"
+    private val expanded = mutableSetOf<String>()
+    private var initialized = false
+    private var revision = ""
+    private val favorites: MutableSet<String> by lazy {
+        getSharedPreferences("deck_ui",MODE_PRIVATE).getStringSet("favorites",emptySet())!!.toMutableSet()
     }
-    private fun addButton(host: LinearLayout, text: String, handler: () -> Unit) {
-        val btn = Button(this).apply {
-            this.text = text
-            isAllCaps = false
-            setTextColor(Color.WHITE)
-            setBackgroundColor(surface)
-            setOnClickListener { handler() }
-        }
-        val lp = LinearLayout.LayoutParams(-1, -2)
-        lp.bottomMargin = 6
-        host.addView(btn, lp)
-    }
-    private fun section(host: LinearLayout, title: String) {
-        host.addView(label(title, 19f, green))
+    private fun favKey(c:Channel) = c.slot.toString() + ":" + c.name + ":" + c.receive
+    private fun label(text:String,size:Float=15f,color:Int=foreground) = Deck.text(this,text,size,if(color==Color.DKGRAY) Deck.muted else color)
+    private fun stack() = Deck.stack(this,14)
+    private fun addButton(host:LinearLayout,text:String,handler:()->Unit) = Deck.action(host,text,Deck.cyan,handler)
+    private fun section(host:LinearLayout,title:String) = Deck.heading(host,title)
+    private fun program() { startActivity(Intent(this,RadioProgrammingActivity::class.java)) }
+    private fun native(family:String) { startActivity(Intent(this,DeviceConsoleActivity::class.java).putExtra("family",family)) }
+    private fun kiss() { startActivity(Intent(this,KissTerminalActivity::class.java)) }
+    override fun onResume() {
+        super.onResume()
+        if(initialized) { channels=store.channels().toMutableList(); radios=store.radios().toMutableList(); render() }
     }
     private fun render() {
-        val host = stack()
-        val scroll = ScrollView(this).apply { setBackgroundColor(bg); addView(host) }
-        setContentView(scroll)
-        host.addView(label("FARM RADIO FLEET", 26f, green))
-        host.addView(label(
-            "One master channel list across UV-5R, UV-5RM and BTECH UV-PRO.",
-            13f, muted
-        ))
-        val currentHash = ChirpCsv.fingerprint(channels)
-        host.addView(label("Master revision " + currentHash + "  •  " + channels.size + " memories", 13f, muted))
-        section(host, "CONNECTED DEVICES")
-        addButton(host, "BTECH UV-PRO — native Bluetooth console") {
-            startActivity(Intent(this, DeviceConsoleActivity::class.java).putExtra("family", "benshi"))
+        initialized=true
+        revision=ChirpCsv.fingerprint(channels)
+        val root=Deck.stack(this)
+        root.setBackgroundColor(Deck.bg)
+        val scroll=ScrollView(this).apply { isFillViewport=true }
+        val host=Deck.stack(this,12)
+        scroll.addView(host)
+        root.addView(scroll,LinearLayout.LayoutParams(-1,0,1f))
+        Deck.add(host,Deck.header(this,when(tab) {
+            "Home" -> "Field communications command"
+            "Channels" -> "Master frequency plan"
+            "Program" -> "Memory programming"
+            "Devices" -> "Device management"
+            else -> "System configuration"
+        }))
+        when(tab) {
+            "Home" -> dashboard(host)
+            "Channels" -> channelPage(host)
+            "Program" -> programPage(host)
+            "Devices" -> devicePage(host)
+            else -> settingsPage(host)
         }
-        addButton(host, "MeshCore — connect and message") {
-            startActivity(Intent(this, DeviceConsoleActivity::class.java).putExtra("family", "meshcore"))
+        val dock=Deck.row(this).apply {
+            setPadding(Deck.dp(this@MainActivity,4),Deck.dp(this@MainActivity,5),Deck.dp(this@MainActivity,4),Deck.dp(this@MainActivity,5))
+            setBackgroundColor(Deck.panel)
         }
-        addButton(host, "BTECH APRS / KISS packet terminal") {
-            startActivity(Intent(this, KissTerminalActivity::class.java))
+        for ((name,icon) in listOf("Home" to "⌂","Channels" to "≡","Program" to "▣","Devices" to "⌘","Settings" to "⚙")) {
+            val b=Deck.button(this,icon+"\n"+name,if(tab==name) Deck.cyan else Deck.line,tab==name) { if(tab!=name){tab=name;render()} }
+            b.textSize=11f
+            b.setPadding(0,Deck.dp(this,6),0,Deck.dp(this,6))
+            Deck.weighted(dock,b)
         }
-        section(host, "DISCOVER & TOOLS")
-        addButton(host, "Frequency library — browse and add") { showLibrary() }
-        addButton(host, "Nearby repeater finder") { findRepeaters() }
-        addButton(host, "DTMF code builder") { dtmfBuilder() }
-        section(host, "MASTER CHANNEL PLAN")
-        for (channel in channels.sortedBy { it.slot }) {
-            val rx = String.format(Locale.US, "%.5f", channel.receive)
-            val tx = channel.transmit?.let { String.format(Locale.US, "%.5f", it) } ?: "RX ONLY"
-            val tones = channel.txCtcss?.toString() ?: "OFF"
-            addButton(host, String.format(Locale.US, "%03d", channel.slot) + "  " +
-                channel.name + "  |  " + channel.service + "  " + channel.mode + "\nRX " + rx + "  TX " + tx + "  CT " + tones + (channel.txDcs?.let { " DCS " + it } ?: "")) {
-                edit(channel)
+        root.addView(dock,LinearLayout.LayoutParams(-1,-2))
+        setContentView(root)
+    }
+    private fun dashboard(host:LinearLayout) {
+        val stats=Deck.row(this)
+        for((v,t) in listOf(channels.size.toString() to "MEMORIES",Deck.bands(channels).size.toString() to "GROUPS",radios.size.toString() to "REGISTERED")) {
+            val box=Deck.card(this,Deck.line)
+            Deck.add(box,Deck.text(this,v,24f,Deck.cyan,true,true),2)
+            Deck.add(box,Deck.text(this,t,10f,Deck.muted,true),0)
+            Deck.weighted(stats,box)
+        }
+        Deck.add(host,stats)
+        val tools=Deck.card(this)
+        Deck.heading(tools,"Discover / tools")
+        val r1=Deck.row(this); val r2=Deck.row(this)
+        Deck.weighted(r1,Deck.button(this,"≡  Frequency library",Deck.cyan){showLibrary()})
+        Deck.weighted(r1,Deck.button(this,"⌁  Repeater finder",Deck.pink){findRepeaters()})
+        Deck.weighted(r2,Deck.button(this,"▦  DTMF tools",Deck.amber){dtmfBuilder()})
+        Deck.weighted(r2,Deck.button(this,"↗  APRS / KISS",Deck.lime){kiss()})
+        Deck.add(tools,r1,5);Deck.add(tools,r2,0);Deck.add(host,tools)
+        Deck.heading(host,"Master channel plan")
+        for(b in Deck.bands(channels)) {
+            val card=Deck.card(this,b.accent)
+            val row=Deck.row(this)
+            Deck.weighted(row,Deck.stack(this).apply {
+                Deck.add(this,Deck.text(this@MainActivity,b.name,15f,Deck.ink,false,true),3)
+                Deck.add(this,Deck.text(this@MainActivity,"SLOTS "+Deck.slots(b.channels),11f,b.accent,true),0)
+            })
+            row.addView(Deck.text(this,b.channels.size.toString()+"  ›",17f,b.accent,true,true))
+            Deck.add(card,row,0)
+            card.contentDescription=b.name+", "+b.channels.size+" channels"
+            card.setOnClickListener { tab="Channels";query="";filter="All";expanded.add(b.key);render() }
+            Deck.add(host,card,6)
+        }
+        Deck.add(host,Deck.text(this,"MASTER REV "+revision,11f,Deck.muted,true))
+    }
+    private fun channelPage(host:LinearLayout) {
+        val controls=Deck.card(this)
+        val input=EditText(this).apply { hint="Search name, frequency, service or slot";setSingleLine(true);setText(query);Deck.field(this) }
+        Deck.add(controls,input,8)
+        val result=Deck.stack(this)
+        val filters=Deck.row(this)
+        val choices=listOf("All","RX only","TX","★")
+        val buttons=mutableListOf<Button>()
+        for(f in choices) {
+            val b=Deck.button(this,f,Deck.cyan,filter==f) {
+                filter=f
+                buttons.forEachIndexed { i,v -> Deck.styleButton(v,Deck.cyan,choices[i]==filter) }
+                renderBands(result)
+            }
+            buttons.add(b);Deck.weighted(filters,b)
+        }
+        Deck.add(controls,filters,0);Deck.add(host,controls)
+        Deck.action(host,"+  New memory",Deck.lime){edit(null)}
+        Deck.add(host,result,0)
+        input.addTextChangedListener(object:android.text.TextWatcher {
+            override fun beforeTextChanged(s:CharSequence?,start:Int,count:Int,after:Int){}
+            override fun onTextChanged(s:CharSequence?,start:Int,before:Int,count:Int){query=s?.toString().orEmpty();renderBands(result)}
+            override fun afterTextChanged(s:android.text.Editable?){}
+        })
+        renderBands(result)
+    }
+    private fun renderBands(result:LinearLayout) {
+        result.removeAllViews()
+        val filtered=channels.filter { c ->
+            val text=listOf(c.name,c.slot.toString(),c.receive.toString(),c.transmit?.toString().orEmpty(),c.service,c.description,c.mode).joinToString(" ")
+            text.contains(query.trim(),true) && when(filter) {
+                "RX only" -> c.transmit==null
+                "TX" -> c.transmit!=null
+                "★" -> favKey(c) in favorites
+                else -> true
             }
         }
-        addButton(host, "+ Add / edit a channel") { edit(null) }
-        addButton(host, "Add missing default regional / FRS / GMRS memories") {
-            val before = channels.size
-            channels = StarterProfile.mergeMissing(channels).toMutableList()
+        Deck.add(result,Deck.text(this,filtered.size.toString()+" / "+channels.size+" MEMORIES · TX shows profile intent",11f,Deck.muted,true))
+        for(b in Deck.bands(filtered)) {
+            val card=Deck.card(this,b.accent)
+            val rows=Deck.stack(this)
+            val open=b.key in expanded||query.isNotBlank()||filter!="All"
+            val header=Deck.row(this)
+            Deck.weighted(header,Deck.stack(this).apply {
+                Deck.add(this,Deck.text(this@MainActivity,b.name,15f,Deck.ink,false,true),3)
+                Deck.add(this,Deck.text(this@MainActivity,"SLOTS "+Deck.slots(b.channels),11f,b.accent,true),0)
+            })
+            val toggle=Deck.text(this,b.channels.size.toString()+"  "+if(open)"⌃" else "⌄",17f,b.accent,true,true)
+            header.addView(toggle)
+            header.minimumHeight=Deck.dp(this,48)
+            header.setOnClickListener {
+                val showing=rows.visibility==View.VISIBLE
+                if(showing) expanded.remove(b.key) else expanded.add(b.key)
+                rows.visibility=if(showing) View.GONE else View.VISIBLE
+                toggle.text=b.channels.size.toString()+"  "+if(showing)"⌄" else "⌃"
+            }
+            Deck.add(card,header,0)
+            for(c in b.channels) {
+                val row=Deck.row(this).apply {
+                    minimumHeight=Deck.dp(this@MainActivity,68)
+                    setPadding(0,Deck.dp(this@MainActivity,7),0,Deck.dp(this@MainActivity,7))
+                }
+                val left=Deck.stack(this)
+                Deck.add(left,Deck.text(this,String.format(Locale.US,"%03d  %s",c.slot,c.name),14f,b.accent,true,true),3)
+                val rx=String.format(Locale.US,"%.5f",c.receive)
+                val tx=c.transmit?.let { String.format(Locale.US,"%.5f",it) }
+                Deck.add(left,Deck.text(this,"RX "+rx+" MHz  ·  "+c.mode,13f,Deck.ink,true),2)
+                Deck.add(left,Deck.text(this,if(tx==null)"RX ONLY" else "TX "+tx+" MHz",11f,if(tx==null)Deck.lime else Deck.amber,true),2)
+                if(c.txCtcss!=null||c.rxCtcss!=null||c.txDcs!=null||c.rxDcs!=null)
+                    Deck.add(left,Deck.text(this,"Tones TX "+(c.txCtcss?:c.txDcs?:"off")+" / RX "+(c.rxCtcss?:c.rxDcs?:"off"),11f,Deck.muted),2)
+                if(c.description.isNotBlank()) Deck.add(left,Deck.text(this,c.description,11f,Deck.muted),0)
+                left.setOnClickListener { edit(c) }
+                Deck.weighted(row,left)
+                val star=Deck.button(this,if(favKey(c) in favorites)"★" else "☆",Deck.amber){
+                    if(!favorites.add(favKey(c))) favorites.remove(favKey(c))
+                    getSharedPreferences("deck_ui",MODE_PRIVATE).edit().putStringSet("favorites",favorites.toSet()).apply()
+                    renderBands(result)
+                }
+                star.contentDescription="Toggle favorite "+c.name
+                row.addView(star,LinearLayout.LayoutParams(Deck.dp(this,48),-2))
+                val editBtn=Deck.button(this,"✎",b.accent){edit(c)}
+                editBtn.contentDescription="Edit "+c.name
+                row.addView(editBtn,LinearLayout.LayoutParams(Deck.dp(this,48),-2))
+                rows.addView(View(this).apply { setBackgroundColor(Deck.line) },LinearLayout.LayoutParams(-1,Deck.dp(this,1)))
+                Deck.add(rows,row,0)
+            }
+            rows.visibility=if(open)View.VISIBLE else View.GONE
+            Deck.add(card,rows,0);Deck.add(result,card,7)
+        }
+        if(filtered.isEmpty()) Deck.add(result,Deck.text(this,"No channels match the current filter.",14f,Deck.muted))
+    }
+    private fun programPage(host:LinearLayout) {
+        val card=Deck.card(this)
+        Deck.heading(card,"Target radio")
+        Deck.add(card,Deck.text(this,"BAOFENG / TD-BL1",18f,Deck.ink,true,true))
+        Deck.add(card,Deck.text(this,"UV-5R · UV-5RM  /  Connect, read, save backup, then write and verify.",13f,Deck.muted))
+        Deck.action(card,"Open memory programmer  ›",Deck.cyan){program()}
+        Deck.action(card,"BTECH UV-PRO · native bank programmer",Deck.pink){native("benshi")}
+        Deck.add(host,card)
+        val preview=Deck.card(this,Deck.line)
+        Deck.heading(preview,"Master write plan")
+        for(b in Deck.bands(channels)) Deck.add(preview,Deck.text(this,b.name+"  ·  "+b.channels.size+"  /  "+Deck.slots(b.channels),13f,b.accent,true),5)
+        Deck.add(preview,Deck.text(this,"Target-specific RX/TX limits and supported modes applied during programming.",12f,Deck.amber))
+        Deck.add(host,preview)
+    }
+    private fun devicePage(host:LinearLayout) {
+        val interfaces=Deck.card(this)
+        Deck.heading(interfaces,"Device interfaces")
+        Deck.action(interfaces,"UV-5R / UV-5RM  ·  TD-BL1",Deck.cyan){program()}
+        Deck.action(interfaces,"BTECH UV-PRO  ·  Native BLE / experimental",Deck.pink){native("benshi")}
+        Deck.action(interfaces,"MeshCore  ·  Companion / experimental",Deck.lime){native("meshcore")}
+        Deck.action(interfaces,"APRS / KISS  ·  Classic Bluetooth",Deck.amber){kiss()}
+        Deck.add(host,interfaces)
+        val inventory=Deck.card(this,Deck.line)
+        Deck.heading(inventory,"Registered radios")
+        if(radios.isEmpty()) Deck.add(inventory,Deck.text(this,"No registered radios.",14f,Deck.muted))
+        for(r in radios) Deck.action(inventory,r.label+"\n"+r.model+" · "+if(r.verifiedHash==revision)"REVISION VERIFIED" else "NOT VERIFIED",if(r.verifiedHash==revision)Deck.lime else Deck.amber){radioActions(r)}
+        Deck.action(inventory,"+ Register radio",Deck.cyan){addRadio()}
+        Deck.action(inventory,"Compare read-back CSV",Deck.cyan){pickVerifyRadio()}
+        Deck.add(host,inventory)
+    }
+    private fun settingsPage(host:LinearLayout) {
+        val data=Deck.card(this)
+        Deck.heading(data,"Profile / storage")
+        Deck.add(data,Deck.text(this,"MASTER REV "+revision,12f,Deck.muted,true))
+        Deck.action(data,"Export CHIRP CSV",Deck.cyan){exportCsv()}
+        Deck.action(data,"Import CHIRP CSV",Deck.amber){chooseCsv(REQUEST_IMPORT)}
+        Deck.action(data,"Merge missing default regional / FRS / GMRS channels",Deck.lime){
+            val before=channels.size
+            channels=StarterProfile.mergeMissing(channels).toMutableList()
             save()
-            val conflicts = StarterProfile.reservedDefaults.count { c -> channels.none { it.slot == c.slot && it.name == c.name } }
-            message("Default service channels", "Added " + (channels.size-before) + " missing memories. " + conflicts + " reserved slots differ; existing channels retained.")
+            val conflicts=StarterProfile.reservedDefaults.count { c -> channels.none { it.slot==c.slot&&it.name==c.name } }
+            message("Default channels","Added "+(channels.size-before)+" memories. "+conflicts+" reserved slots differ; existing channels retained.")
         }
-        addButton(host, "Export CHIRP CSV master") { exportCsv() }
-        addButton(host, "Import CHIRP CSV into master") { chooseCsv(REQUEST_IMPORT) }
-        section(host, "RADIO INVENTORY")
-        if (radios.isEmpty()) host.addView(label("No radios registered yet.", 14f, muted))
-        for (radio in radios) {
-            val synced = radio.verifiedHash == currentHash
-            addButton(host, radio.label + "  (" + radio.model + ")  •  " +
-                (if (synced) "READ-BACK VERIFIED" else "NOT VERIFIED / CHANGED")) {
-                radioActions(radio)
-            }
-        }
-        addButton(host, "+ Add a radio") { addRadio() }
-        addButton(host, "Compare a radio read-back CSV") { pickVerifyRadio() }
-        section(host, "PROGRAMMING")
-        addButton(host, "READ / WRITE RADIOS OVER BLUETOOTH") {
-            startActivity(Intent(this, RadioProgrammingActivity::class.java))
-        }
-        addButton(host, "Program a radio via CHIRP / RadioDroid") { showProgrammingFlow() }
-        addButton(host, "Inspect TD-BL1 Bluetooth (read-only)") {
-            startActivity(Intent(this, BleInspectorActivity::class.java))
-        }
-        host.addView(label(
-            "This app includes a direct Bluetooth programming screen with read-back verification.",
-            13f, muted
-        ))
-        host.addView(label(
-            "Repeater values are starter entries—confirm locally. Channel 5 defaults to receive-only on a UV-5R.",
-            12f, muted
-        ))
+        Deck.add(host,data)
+        val support=Deck.card(this,Deck.line)
+        Deck.heading(support,"Diagnostics / tools")
+        Deck.action(support,"Inspect TD-BL1 BLE services",Deck.cyan){startActivity(Intent(this,BleInspectorActivity::class.java))}
+        Deck.action(support,"External CHIRP / RadioDroid workflow",Deck.cyan){showProgrammingFlow()}
+        Deck.action(support,"Browse frequency library",Deck.cyan){showLibrary()}
+        Deck.add(host,support)
     }
 
     private fun input(value: String, numeric: Boolean = false): EditText = EditText(this).apply {
         setSingleLine(true)
         setText(value)
         textSize = 15f
-        setTextColor(Color.BLACK)
+        Deck.field(this)
         if (numeric) inputType = InputType.TYPE_CLASS_NUMBER or
             InputType.TYPE_NUMBER_FLAG_DECIMAL or InputType.TYPE_NUMBER_FLAG_SIGNED
         setSelectAllOnFocus(true)
