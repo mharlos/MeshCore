@@ -6,6 +6,7 @@ import android.bluetooth.BluetoothGatt
 import android.bluetooth.BluetoothGattCallback
 import android.bluetooth.BluetoothGattCharacteristic
 import android.bluetooth.BluetoothGattDescriptor
+import android.bluetooth.BluetoothGattService
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
 import android.bluetooth.BluetoothStatusCodes
@@ -35,6 +36,8 @@ import java.util.concurrent.atomic.AtomicBoolean
 @SuppressLint("MissingPermission")
 class BluetoothLink(private val context: Context) {
     enum class Family { BAOFENG_DONLGE, BENSHI_UVPRO }
+    @Volatile var lastGattReport: String = "No GATT discovery yet."
+        private set
     data class Candidate(val device: BluetoothDevice, val name: String, val rssi: Int)
     private val manager = context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
     private val handler = Handler(Looper.getMainLooper())
@@ -55,7 +58,9 @@ class BluetoothLink(private val context: Context) {
     private val uartServices = listOf(
         UUID.fromString("0000ffe0-0000-1000-8000-00805f9b34fb"),
         UUID.fromString("6e400001-b5a3-f393-e0a9-e50e24dcca9e"),
-        UUID.fromString("49535343-fe7d-4ae5-8fa9-9fafd205e455")
+        UUID.fromString("49535343-fe7d-4ae5-8fa9-9fafd205e455"),
+        UUID.fromString("0000ff00-0000-1000-8000-00805f9b34fb"),
+        UUID.fromString("0000fff0-0000-1000-8000-00805f9b34fb")
     )
     private val benshiService = UUID.fromString("00001100-d102-11e1-9b23-00025b00a5a5")
     private val benshiWrite = UUID.fromString("00001101-d102-11e1-9b23-00025b00a5a5")
@@ -91,9 +96,70 @@ class BluetoothLink(private val context: Context) {
         try { manager.adapter.bluetoothLeScanner?.stopScan(cb) }
         catch (_: Exception) { }
     }
+    /**
+     * Full GATT service/characteristic report, with BLE address excluded.
+     * Zero radio write operations occur during this enumeration.
+     */
+    private fun describeGatt(services: List<BluetoothGattService>): String = buildString {
+        appendLine("Farm Radio Fleet — GATT diagnostic")
+        appendLine("Services: " + services.size)
+        for (service in services) {
+            appendLine("SERVICE " + service.uuid)
+            for (char in service.characteristics) {
+                val p = char.properties
+                val modes = listOfNotNull(
+                    if (p and BluetoothGattCharacteristic.PROPERTY_READ != 0) "READ" else null,
+                    if (p and BluetoothGattCharacteristic.PROPERTY_WRITE != 0) "WRITE" else null,
+                    if (p and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE != 0) "WRITE_NO_RESPONSE" else null,
+                    if (p and BluetoothGattCharacteristic.PROPERTY_NOTIFY != 0) "NOTIFY" else null,
+                    if (p and BluetoothGattCharacteristic.PROPERTY_INDICATE != 0) "INDICATE" else null
+                )
+                appendLine("  CHARACTERISTIC " + char.uuid + " [" + modes.joinToString("|") + "]")
+                for (descriptor in char.descriptors) appendLine("    DESCRIPTOR " + descriptor.uuid)
+            }
+        }
+    }
+
+    private data class UartPair(
+        val service: BluetoothGattService,
+        val write: BluetoothGattCharacteristic,
+        val notify: BluetoothGattCharacteristic
+    )
+
+    /**
+     * Choose matching service-local UART channels only when unambiguous.
+     * Never auto-connect to an arbitrary GATT service on a UV-PRO:
+     * the Benshi protocol has explicit fixed UUIDs.
+     */
+    private fun findUart(services: List<BluetoothGattService>): UartPair? {
+        val pairs = services.flatMap { service ->
+            val writeChars = service.characteristics.filter {
+                it.properties and (BluetoothGattCharacteristic.PROPERTY_WRITE or
+                    BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE) != 0
+            }
+            val notifyChars = service.characteristics.filter {
+                it.properties and (BluetoothGattCharacteristic.PROPERTY_NOTIFY or
+                    BluetoothGattCharacteristic.PROPERTY_INDICATE) != 0 &&
+                    it.getDescriptor(uuidCccd) != null
+            }
+            writeChars.flatMap { write ->
+                notifyChars.map { notify -> UartPair(service, write, notify) }
+            }
+        }
+        // Prioritize explicitly recognized UART services.
+        val known = pairs.filter { it.service.uuid in uartServices }
+        return when {
+            known.size == 1 -> known.single()
+            known.size > 1 -> null
+            pairs.size == 1 -> pairs.single()
+            else -> null // require GATT inspection for ambiguous/unknown layouts
+        }
+    }
+
     fun connect(device: BluetoothDevice, desired: Family, callback: (Result<String>) -> Unit) {
         disconnect()
         closed.set(false)
+        lastGattReport = "Connecting — awaiting GATT discovery."
         family = desired
         val resultOnce = AtomicBoolean()
         fun deliver(result: Result<String>) {
@@ -128,31 +194,32 @@ class BluetoothLink(private val context: Context) {
                     deliver(Result.failure(IOException("GATT service discovery failed: " + status)))
                     return
                 }
-                val service = when (desired) {
-                    Family.BENSHI_UVPRO -> g.getService(benshiService)
-                    Family.BAOFENG_DONLGE ->
-                        uartServices.firstNotNullOfOrNull { g.getService(it) }
+                // Always capture advertised services before choosing a transport.
+                // The TD-BL1 appears as "TIDRADIO KIT" but hardware revisions
+                // expose different UART UUIDs.
+                lastGattReport = describeGatt(g.services)
+                val pair = when (desired) {
+                    Family.BENSHI_UVPRO -> {
+                        val svc = g.getService(benshiService)
+                        val write = svc?.getCharacteristic(benshiWrite)
+                        val notify = svc?.getCharacteristic(benshiNotify)
+                        if (svc != null && write != null && notify != null)
+                            UartPair(svc, write, notify) else null
+                    }
+                    Family.BAOFENG_DONLGE -> findUart(g.services)
                 }
-                if (service == null) {
+                if (pair == null) {
                     deliver(Result.failure(IOException(
-                        if (desired == Family.BENSHI_UVPRO)
-                            "Expected UV-PRO Benshi control service missing."
-                        else "Expected TD-BL1 BLE serial service missing."
+                        "No unambiguous UART service/characteristic pair found. " +
+                        "Copy the GATT diagnostic report and send it for adapter support."
                     )))
                     return
                 }
-                val writable = if (desired == Family.BENSHI_UVPRO)
-                    service.getCharacteristic(benshiWrite)
-                else service.characteristics.firstOrNull {
-                    it.properties and (BluetoothGattCharacteristic.PROPERTY_WRITE or
-                        BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE) != 0
-                }
-                val notify = if (desired == Family.BENSHI_UVPRO)
-                    service.getCharacteristic(benshiNotify)
-                else service.characteristics.firstOrNull {
-                    it.properties and (BluetoothGattCharacteristic.PROPERTY_NOTIFY or
-                        BluetoothGattCharacteristic.PROPERTY_INDICATE) != 0
-                }
+                val writable = pair.write
+                val notify = pair.notify
+                lastGattReport += "\nSELECTED SERVICE " + pair.service.uuid +
+                    "\nSELECTED WRITE " + writable.uuid +
+                    "\nSELECTED NOTIFY " + notify.uuid
                 if (writable == null || notify == null) {
                     deliver(Result.failure(IOException("BLE UART requires writable + notifying characteristics")))
                     return
@@ -186,8 +253,7 @@ class BluetoothLink(private val context: Context) {
                 if (closed.get()) return
                 if (status == BluetoothGatt.GATT_SUCCESS) {
                     ready = true
-                    deliver(Result.success("Connected: " + device.address +
-                        " service " + (notifyChar?.service?.uuid ?: "?")))
+                    deliver(Result.success("BLE transport connected; radio read/authentication still unverified.\nUART service: " + (notifyChar?.service?.uuid ?: "?")))
                 } else deliver(Result.failure(IOException("CCCD subscribe failed: " + status)))
             }
             override fun onCharacteristicChanged(
