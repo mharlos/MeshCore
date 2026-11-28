@@ -13,6 +13,7 @@ import json
 import math
 import logging
 import traceback
+import time
 from java import jclass
 
 # Build workflow copies the GPL CHIRP package here from RadioDroid's vendored
@@ -23,6 +24,23 @@ for driver in ("uv5r", "baofeng_uv17Pro"):
 from chirp import chirp_common, directory
 RadioIo = jclass("com.mharlos.radiofleet.RadioIo")
 LOG = logging.getLogger("radiofleet.chirp")
+
+# UV-5RM clone driver has no explicit exit command after download.
+# Allow the handset to settle before a new identification handshake.
+SESSION_SETTLE_SECONDS = 3.0
+IDENT_RETRY_SECONDS = 5.0
+IDENT_FAILURE = "Radio did not respond as expected (A)"
+
+
+def _settle_session(seconds):
+    time.sleep(seconds)
+    RadioIo.flushInput()
+
+
+def _ident_failure(error):
+    # Exact pinned driver's pre-block identification error only.
+    return str(error) == IDENT_FAILURE
+
 
 class _DriverErrors(logging.Handler):
     """Only collect errors and stack traces; never channel/EERPOM contents."""
@@ -56,6 +74,7 @@ class AndroidPipe:
         self.rx_bytes = 0
         self.tx_bytes = 0
         self.last_io = "initialized"
+        self.recent_io = []
         self.parity = "N"
         self.rts = False
         self.dtr = False
@@ -70,7 +89,12 @@ class AndroidPipe:
         self.rx_bytes += len(result)
         self.last_io = "read %d/%d bytes, timeout %d ms" % (
             len(result), requested, timeout_ms)
+        self._record(self.last_io)
         return result
+
+    def _record(self, message):
+        self.recent_io.append(message)
+        del self.recent_io[:-12]
 
     def write(self, data):
         payload = bytes(data)
@@ -79,6 +103,7 @@ class AndroidPipe:
         RadioIo.write(payload)
         self.tx_bytes += len(payload)
         self.last_io = "wrote %d bytes" % len(payload)
+        self._record(self.last_io)
         return len(payload)
 
     def log(self, message, *args):
@@ -92,7 +117,7 @@ class AndroidPipe:
     def diagnostic(self):
         return ("baud=%d tx=%d bytes (%d calls) rx=%d bytes (%d calls); last=%s" %
                 (self.baudrate, self.tx_bytes, self.write_calls,
-                 self.rx_bytes, self.read_calls, self.last_io))
+                 self.rx_bytes, self.read_calls, self.last_io)) + " | recent: " + "; ".join(self.recent_io)
 
     def flush(self):
         return None
@@ -123,7 +148,18 @@ def _class(model):
             return candidate
     raise ValueError("Bundled CHIRP driver missing: " + vendor + " " + name)
 
-def _sync_in(model):
+def _sync_in(model, ident_retry=False):
+    try:
+        return _sync_in_once(model)
+    except RuntimeError as error:
+        if not (ident_retry and model == "UV-5RM" and
+                _ident_failure(error.__cause__)):
+            raise
+        _settle_session(IDENT_RETRY_SECONDS)
+        return _sync_in_once(model)
+
+
+def _sync_in_once(model):
     cls = _class(model)
     radio = cls(None)
     radio.pipe = AndroidPipe()
@@ -196,8 +232,10 @@ def _channels(radio):
             raise RuntimeError("Failed reading memory slot %d: %s" % (slot, error)) from error
     return result
 
-def read_radio(model):
-    radio = _sync_in(model)
+def read_radio(model, after_upload=False):
+    if after_upload:
+        _settle_session(SESSION_SETTLE_SECONDS)
+    radio = _sync_in(model, ident_retry=bool(after_upload))
     try:
         raw = _image(radio)
         return json.dumps({
@@ -275,7 +313,9 @@ def write_radio(model, expected_image_sha256, channel_json):
         raise ValueError("No memories selected")
     if len({int(x["slot"]) for x in profile}) != len(profile):
         raise ValueError("Duplicate memory locations")
-    radio = _sync_in(model)
+    # The initial operator backup may have just finished cloning.
+    _settle_session(SESSION_SETTLE_SECONDS)
+    radio = _sync_in(model, ident_retry=True)
     try:
         original = _image(radio)
         baseline_sha = hashlib.sha256(original).hexdigest()
@@ -285,7 +325,8 @@ def write_radio(model, expected_image_sha256, channel_json):
             )
         for item in profile:
             _apply(radio, item)
-        radio.sync_out()
+        _settle_session(SESSION_SETTLE_SECONDS)
+        _upload_with_recovery(radio, model)
         return json.dumps({
             "written": len(profile),
             "model": model,
@@ -294,3 +335,39 @@ def write_radio(model, expected_image_sha256, channel_json):
         })
     finally:
         radio.pipe.close()
+
+
+def _upload_with_recovery(radio, model):
+    """Retry only the UV-5RM's exact pre-block identification failure.
+
+    The pinned driver's first status callback follows successful identification
+    and precedes any block write. Once reached, never replay the upload.
+    """
+    progress = {"started": False, "cur": 0, "max": 0}
+    previous_status = radio.status_fn
+
+    def status(update):
+        progress["started"] = True
+        progress["cur"] = update.cur
+        progress["max"] = update.max
+        previous_status(update)
+
+    radio.status_fn = status
+    try:
+        for attempt in range(2):
+            try:
+                radio.sync_out()
+                return
+            except Exception as error:
+                if (attempt == 0 and model == "UV-5RM" and
+                        not progress["started"] and _ident_failure(error)):
+                    _settle_session(IDENT_RETRY_SECONDS)
+                    continue
+                phase = ("UPLOAD BLOCKS" if progress["started"]
+                         else "UPLOAD IDENTIFICATION")
+                raise RuntimeError(
+                    "%s failed, attempt %d, blocks %d/%d: %s | %s" %
+                    (phase, attempt + 1, progress["cur"], progress["max"],
+                     error, radio.pipe.diagnostic())) from error
+    finally:
+        radio.status_fn = previous_status
