@@ -279,7 +279,15 @@ def read_radio(model, after_upload=False):
     radio = _sync_in(model, ident_retry=bool(after_upload))
     try:
         raw = _image(radio)
+        try:
+            settings = _settings_snapshot(radio)
+            settings_error = ""
+        except Exception as error:
+            settings = []
+            settings_error = str(error)
         return json.dumps({
+            "settings": settings,
+            "settings_error": settings_error,
             "model": model,
             "sha256": hashlib.sha256(raw).hexdigest(),
             "image_base64": base64.b64encode(raw).decode("ascii"),
@@ -417,3 +425,93 @@ def _upload_with_recovery(radio, model):
                      error, radio.pipe.diagnostic())) from error
     finally:
         radio.status_fn = previous_status
+
+# Allowlist ordinary operator settings. Never expose firmware band limits,
+# factory calibration, password, reset, work-mode frequencies or alarm controls.
+_OPERATOR_SETTINGS = {
+    "squelch", "save", "vox", "abr", "tdr", "tdrab", "beep", "timeout",
+    "voice", "screv", "mdfa", "mdfb", "bcl", "autolk", "roger", "fmradio",
+    "wtled", "rxled", "txled", "ste", "rpste", "rptrl", "keylock",
+    "poweron_msg.line1", "poweron_msg.line2",
+    "settings.squelch", "settings.tot", "settings.dualstandby",
+    "settings.powerondistype", "settings.voice", "settings.voicesw",
+    "settings.backlight", "settings.autolock", "settings.beep",
+    "settings.roger", "settings.chadistype", "settings.chbdistype",
+    "settings.savemode", "settings.scanmode", "settings.keylock",
+    "settings.voxsw", "settings.vox", "settings.voxdlytime",
+    "ani.dtmfon", "ani.dtmfoff", "ani.code", "ani.aniid",
+}
+
+def _operator_settings(radio):
+    from chirp.settings import RadioSetting
+    tree = radio.get_settings()
+    def walk(group):
+        for entry in group:
+            if isinstance(entry, RadioSetting):
+                name = entry.get_name()
+                if name in _OPERATOR_SETTINGS or (
+                        name.startswith("pttid/") and name.endswith(".code")):
+                    yield entry
+            else:
+                yield from walk(entry)
+    return tree, list(walk(tree))
+
+def _settings_snapshot(radio):
+    from chirp.settings import (RadioSettingValueBoolean, RadioSettingValueInteger,
+                                RadioSettingValueList, RadioSettingValueString)
+    _, entries = _operator_settings(radio)
+    result = []
+    for entry in entries:
+        value = entry.value
+        if not value.get_mutable() or not value.initialized:
+            continue
+        row = {"key": entry.get_name(), "label": entry.get_shortname()}
+        if isinstance(value, RadioSettingValueBoolean):
+            row.update(kind="choice", options=["False", "True"], value=str(bool(value)))
+        elif isinstance(value, RadioSettingValueList):
+            row.update(kind="choice", options=[str(x) for x in value.get_options()],
+                       value=str(value))
+        elif isinstance(value, RadioSettingValueInteger):
+            row.update(kind="integer", min=value.get_min(), max=value.get_max(),
+                       value=str(int(value)))
+        elif isinstance(value, RadioSettingValueString):
+            row.update(kind="text", max=value.maxlength, value=str(value).rstrip())
+        else:
+            continue
+        result.append(row)
+    return result
+
+def _apply_settings(radio, changes):
+    from chirp.settings import RadioSettingValueBoolean, RadioSettingValueInteger
+    tree, entries = _operator_settings(radio)
+    by_key = {x.get_name(): x for x in entries}
+    if not isinstance(changes, dict) or not changes:
+        raise ValueError("No setting changes")
+    for key, text in changes.items():
+        entry = by_key.get(key)
+        if entry is None or not entry.value.get_mutable():
+            raise ValueError("Unsupported setting: " + key)
+        value = entry.value
+        if isinstance(value, RadioSettingValueBoolean):
+            if text not in ("True", "False"):
+                raise ValueError("Invalid Boolean")
+            value.set_value(text == "True")
+        elif isinstance(value, RadioSettingValueInteger):
+            value.set_value(int(text))
+        else:
+            value.set_value(text)
+    radio.set_settings(tree)
+
+def write_settings(model, expected_image_sha256, changes_json):
+    changes = json.loads(changes_json)
+    _settle_session(SESSION_SETTLE_SECONDS)
+    radio = _sync_in(model, ident_retry=True)
+    try:
+        if hashlib.sha256(_image(radio)).hexdigest() != expected_image_sha256:
+            raise ValueError("Radio changed since backup; read again")
+        _apply_settings(radio, changes)
+        _settle_session(SESSION_SETTLE_SECONDS)
+        _upload_with_recovery(radio, model)
+        return json.dumps({"written": len(changes)})
+    finally:
+        radio.pipe.close()
