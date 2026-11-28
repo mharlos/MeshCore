@@ -16,7 +16,13 @@ data class Channel(
     val txCtcss: Double? = null,
     val rxCtcss: Double? = null,
     val narrow: Boolean = false,
-    val power: String = "High"
+    val power: String = "High",
+    val mode: String = if (narrow) "NFM" else "FM",
+    val txDcs: Int? = null,
+    val rxDcs: Int? = null,
+    val dcsPolarity: String = "NN",
+    val service: String = "Custom",
+    val description: String = ""
 ) {
     fun json(): JSONObject = JSONObject().apply {
         put("slot", slot); put("name", name); put("receive", receive)
@@ -24,6 +30,8 @@ data class Channel(
         put("txCtcss", txCtcss ?: JSONObject.NULL)
         put("rxCtcss", rxCtcss ?: JSONObject.NULL)
         put("narrow", narrow); put("power", power)
+        put("mode", mode); put("txDcs", txDcs ?: JSONObject.NULL); put("rxDcs", rxDcs ?: JSONObject.NULL)
+        put("dcsPolarity", dcsPolarity); put("service", service); put("description", description)
     }
     companion object {
         fun parse(j: JSONObject) = Channel(
@@ -31,7 +39,11 @@ data class Channel(
             if (j.isNull("transmit")) null else j.getDouble("transmit"),
             if (j.isNull("txCtcss")) null else j.getDouble("txCtcss"),
             if (j.isNull("rxCtcss")) null else j.getDouble("rxCtcss"),
-            j.optBoolean("narrow", false), j.optString("power", "High")
+            j.optBoolean("narrow", false), j.optString("power", "High"),
+            j.optString("mode", if (j.optBoolean("narrow")) "NFM" else "FM"),
+            if (j.isNull("txDcs")) null else j.getInt("txDcs"),
+            if (j.isNull("rxDcs")) null else j.getInt("rxDcs"),
+            j.optString("dcsPolarity", "NN"), j.optString("service", "Custom"), j.optString("description", "")
         )
     }
 }
@@ -80,17 +92,21 @@ object ChirpCsv {
                 else -> "-"
             }
             val offset = if (c.transmit == null) 0.0 else abs(c.transmit - c.receive)
+            val txMode = if (c.txDcs != null) "DTCS" else if (c.txCtcss != null) "Tone" else ""
+            val rxMode = if (c.rxDcs != null) "DTCS" else if (c.rxCtcss != null) "Tone" else ""
             val toneMode = when {
-                c.rxCtcss != null -> "TSQL"
-                c.txCtcss != null -> "Tone"
-                else -> ""
+                txMode == "" && rxMode == "" -> ""
+                txMode == "Tone" && rxMode == "" -> "Tone"
+                txMode == "Tone" && rxMode == "Tone" && c.txCtcss == c.rxCtcss -> "TSQL"
+                txMode == "DTCS" && rxMode == "DTCS" && c.txDcs == c.rxDcs -> "DTCS"
+                else -> "Cross"
             }
             val row = listOf(
-                c.slot.toString(), c.name.uppercase(Locale.US).take(7), num(c.receive),
+                c.slot.toString(), c.name.uppercase(Locale.US).take(12), num(c.receive),
                 duplex, num(offset), toneMode, num(c.txCtcss ?: 88.5),
-                num(c.rxCtcss ?: c.txCtcss ?: 88.5), "023", "NN", "023",
-                "Tone->Tone", if (c.narrow) "NFM" else "FM", "5.00", "",
-                c.power, "", "", "", "", ""
+                num(c.rxCtcss ?: c.txCtcss ?: 88.5), "%03d".format(c.txDcs ?: 23), c.dcsPolarity, "%03d".format(c.rxDcs ?: 23),
+                "$txMode->$rxMode", c.mode, "5.00", "",
+                c.power, c.description, "", "", "", ""
             )
             append(row.joinToString(",") { escape(it) }).append('\n')
         }
@@ -142,13 +158,18 @@ object ChirpCsv {
                 else -> rx
             }
             val tone = row.field("Tone")
-            val txTone = if (tone == "Tone" || tone == "TSQL" || tone == "Cross")
-                row.field("rToneFreq").toDoubleOrNull() else null
-            val rxTone = if (tone == "TSQL") row.field("cToneFreq").toDoubleOrNull() else null
+            val cross = row.field("CrossMode").split("->")
+            val txMode = when(tone) { "Tone","TSQL" -> "Tone"; "DTCS" -> "DTCS"; "Cross" -> cross.getOrNull(0) ?: ""; else -> "" }
+            val rxMode = when(tone) { "TSQL" -> "Tone"; "DTCS" -> "DTCS"; "Cross" -> cross.getOrNull(1) ?: ""; else -> "" }
+            val txTone = if (txMode == "Tone") row.field(if (tone == "TSQL") "cToneFreq" else "rToneFreq").toDoubleOrNull() else null
+            val rxTone = if (rxMode == "Tone") row.field("cToneFreq").toDoubleOrNull() else null
             Channel(
                 row.field("Location").toInt(), row.field("Name"), rx, tx,
                 txTone, rxTone, row.field("Mode").uppercase(Locale.US) == "NFM",
-                row.field("Power").ifBlank { "High" }
+                row.field("Power").ifBlank { "High" }, row.field("Mode").ifBlank { "FM" }.uppercase(Locale.US),
+                if (txMode == "DTCS") row.field("DtcsCode").toIntOrNull() else null,
+                if (rxMode == "DTCS") row.field(if (tone == "DTCS") "DtcsCode" else "RxDtcsCode").toIntOrNull() else null,
+                row.field("DtcsPolarity").ifBlank { "NN" }, description = row.field("Comment")
             )
         }.also { list -> require(list.map { it.slot }.distinct().size == list.size) {
             "Duplicate memory locations in CSV"
@@ -165,7 +186,10 @@ object ChirpCsv {
             if (!equal(want.transmit, got.transmit)) wrong.add("transmit / inhibit")
             if (!equal(want.txCtcss, got.txCtcss)) wrong.add("TX tone")
             if (!equal(want.rxCtcss, got.rxCtcss)) wrong.add("RX tone")
-            if (want.narrow != got.narrow) wrong.add("bandwidth")
+            if (want.mode != got.mode) wrong.add("modulation")
+            if (want.txDcs != got.txDcs || want.rxDcs != got.rxDcs) wrong.add("DCS")
+            if (want.txDcs != null && want.dcsPolarity.first() != got.dcsPolarity.first() ||
+                want.rxDcs != null && want.dcsPolarity.last() != got.dcsPolarity.last()) wrong.add("DCS polarity")
             if (!want.name.equals(got.name, ignoreCase = true)) wrong.add("name")
             if (wrong.isEmpty()) null else "CH " + want.slot + ": " + wrong.joinToString(", ")
         }
