@@ -35,46 +35,30 @@ class BleInspectorActivity : Activity() {
 
     override fun onCreate(state: Bundle?) {
         super.onCreate(state)
-        window.statusBarColor = Color.rgb(10, 17, 26)
-        val root = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(18, 24, 18, 18)
-            setBackgroundColor(Color.rgb(10, 17, 26))
+        window.statusBarColor=Deck.bg
+        window.navigationBarColor=Deck.bg
+        val root=Deck.stack(this,12).apply { setBackgroundColor(Deck.bg) }
+        Deck.add(root,Deck.header(this,"Bluetooth diagnostics"))
+        val panel=Deck.card(this)
+        Deck.heading(panel,"Read-only GATT inspection")
+        Deck.add(panel,Deck.text(this,"Discover Bluetooth services and characteristic properties. No radio memories changed.",13f,Deck.muted))
+        Deck.action(panel,"Scan for adapters",Deck.cyan){scan()}
+        Deck.action(panel,"Copy diagnostic report",Deck.amber){
+            val cm=getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
+            cm.setPrimaryClip(ClipData.newPlainText("TD-BL1 GATT",report))
         }
-        root.addView(TextView(this).apply {
-            text = "BLUETOOTH ADAPTER DIAGNOSTIC"
-            textSize = 20f
-            setTextColor(Color.rgb(96, 227, 172))
-        })
-        root.addView(TextView(this).apply {
-            text = "Read-only: discovers GATT services and characteristic properties. No radio memories are changed."
-            setTextColor(Color.WHITE)
-        })
-        root.addView(Button(this).apply {
-            text = "Scan for adapters"
-            setOnClickListener { scan() }
-        })
-        root.addView(Button(this).apply {
-            text = "Copy diagnostic report"
-            setOnClickListener {
-                val cm = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
-                cm.setPrimaryClip(ClipData.newPlainText("TD-BL1 GATT", report))
-            }
-        })
-        found = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        val scroll = ScrollView(this).apply { addView(found) }
-        root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
-        output = TextView(this).apply {
-            text = "Turn on Bluetooth and the TD-BL1, then scan."
-            textSize = 12f
-            setTextColor(Color.rgb(163, 184, 193))
-        }
-        root.addView(output)
-        setContentView(root)
+        found=Deck.stack(this)
+        Deck.add(panel,found,0)
+        Deck.add(root,panel)
+        val terminal=Deck.card(this,Deck.lime)
+        Deck.heading(terminal,"Diagnostic output",Deck.lime)
+        output=Deck.text(this,"Turn on Bluetooth and the TD-BL1, then scan.",12f,Deck.lime,true).apply { setTextIsSelectable(true) }
+        Deck.add(terminal,output,0);Deck.add(root,terminal)
+        setContentView(ScrollView(this).apply { setBackgroundColor(Deck.bg);addView(root) })
     }
     private fun append(line: String) {
         report += line + "\n"
-        output.text = line
+        output.text = report.takeLast(18000)
     }
     private fun permitted(): Boolean {
         val required = if (Build.VERSION.SDK_INT >= 31)
@@ -120,6 +104,7 @@ class BleInspectorActivity : Activity() {
                             catch (_: SecurityException) { "Unnamed BLE" }
                         found.addView(Button(this@BleInspectorActivity).apply {
                             text = title + "  (" + address.takeLast(5) + ")"
+                            Deck.styleButton(this,Deck.cyan)
                             setOnClickListener { connect(device, title) }
                         })
                     }
