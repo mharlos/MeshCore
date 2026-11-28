@@ -40,7 +40,7 @@ class RadioProgrammingActivity : Activity() {
     private lateinit var readButton: Button
     private lateinit var writeButton: Button
     private lateinit var radioGroup: RadioGroup
-    private val models = listOf("UV-5R", "UV-5RM", "BTECH UV-PRO")
+    private val models = listOf("UV-5R", "UV-5RM")
     private var model = models.first()
     private var readModel: String? = null
     private var baofengBackup: JSONObject? = null
@@ -302,7 +302,9 @@ class RadioProgrammingActivity : Activity() {
             setStatus("Read and back up this specific radio before writing.")
             return
         }
-        val selected = store.channels().sortedBy { it.slot }
+        val master = store.channels().sortedBy { it.slot }
+        val selected = FrequencyCatalog.forModel(master, model)
+        val skipped = master.size - selected.size
         if (selected.isEmpty()) {
             setStatus("Master channel profile is empty.")
             return
@@ -311,7 +313,7 @@ class RadioProgrammingActivity : Activity() {
             .setTitle("Write " + selected.size + " channel memories?")
             .setMessage(
                 "Radio: " + targetName + "\nModel: " + model +
-                "\nBackup: " + backupFile!!.name +
+                "\nBackup: " + backupFile!!.name + "\nUnsupported / unavailable memories skipped: " + skipped +
                 "\n\nOnly the shared master memories will be updated. Other memories and " +
                 "radio-specific settings will be preserved by the model driver. " +
                 "This operation writes to the physical radio and requires an uninterrupted connection."
@@ -377,7 +379,9 @@ class RadioProgrammingActivity : Activity() {
         val entry = FleetRadio(id, targetName, targetModel, version)
         if (existing < 0) radios.add(entry) else radios[existing] = entry
         store.saveRadios(radios)
-        setStatus("VERIFIED " + total + " memories on " + targetModel + ". Master " +
+        val skipped = store.channels().size - total
+        setStatus("VERIFIED " + total + " compatible memories on " + targetModel +
+            " (" + skipped + " master memories skipped). Master " +
             version + ". Backup retained: " + backupFile!!.name)
         // A second write requires a fresh read because the baseline hash changed.
         readModel = null
