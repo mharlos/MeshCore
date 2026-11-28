@@ -5,7 +5,7 @@ import org.junit.Test
 
 class FrequencyCatalogTest {
     @Test fun standardServiceFrequenciesAndRxInhibit() {
-        val shared = FrequencyCatalog.groups.getValue("FRS / GMRS (22)")
+        val shared = FrequencyCatalog.groups.getValue("FRS monitoring (22)")
         assertEquals(22, shared.size)
         assertEquals(462.6625, shared[4].receive, 0.000001)
         assertEquals(467.5625, shared[7].receive, 0.000001)
@@ -13,6 +13,22 @@ class FrequencyCatalogTest {
         assertTrue(shared.all { it.transmit == null && it.txCtcss == null && it.rxCtcss == null })
         assertEquals(7, FrequencyCatalog.groups.getValue("NOAA weather (7)").size)
         assertEquals(40, FrequencyCatalog.groups.getValue("CB (40; reference only)").size)
+    }
+
+    @Test fun gmrsIntentAndProjection() {
+        val simplex = FrequencyCatalog.groups.getValue("GMRS simplex (22)")
+        val repeaters = FrequencyCatalog.groups.getValue("GMRS repeaters (8)")
+        assertEquals(22, simplex.size)
+        assertEquals(8, repeaters.size)
+        assertTrue(simplex.all { it.receive == it.transmit })
+        assertTrue(repeaters.all { kotlin.math.abs(it.transmit!! - it.receive - 5.0) < 0.000001 })
+        val master = (simplex + repeaters).mapIndexed { i, c -> c.copy(slot = i + 1) }
+        assertEquals(30, FrequencyCatalog.gmrsTxCount(master))
+        assertEquals(0, FrequencyCatalog.gmrsTxCount(FrequencyCatalog.forModel(master, "UV-5RM")))
+        val authorized = FrequencyCatalog.forModel(master, "UV-5RM", true)
+        assertEquals(23, FrequencyCatalog.gmrsTxCount(authorized))
+        assertTrue(authorized.subList(7,14).all { it.transmit == null })
+        assertFalse(FrequencyCatalog.txAllowed(462.550, 467.575, "FM"))
     }
 
     @Test fun modelProjectionPreservesSlotsAndNames() {
