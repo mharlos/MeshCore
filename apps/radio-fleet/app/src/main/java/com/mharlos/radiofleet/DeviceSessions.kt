@@ -220,6 +220,51 @@ internal class MeshCoreSession(private val link: BluetoothLink) : DeviceSession 
         }
         return result
     }
+    data class Contact(val key: ByteArray, val name: String, val type: Int) {
+        override fun toString() = name + " · " + key.take(6).joinToString("") { "%02x".format(it.toInt() and 255) }
+    }
+    fun contacts(): List<Contact> {
+        val start = exchange(byteArrayOf(4),setOf(2))
+        require(start.size == 5)
+        val count = ByteBuffer.wrap(start,1,4).order(ByteOrder.LITTLE_ENDIAN).int
+        require(count in 0..4096)
+        val out = mutableListOf<Contact>()
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(90)
+        while (System.nanoTime() < deadline) {
+            val b = link.readPacket(5000) ?: throw IOException("Contact sync timed out")
+            if (b.isEmpty()) continue
+            when (u(b[0])) {
+                4 -> return out
+                1 -> throw IOException("Contact sync rejected")
+                3 -> {
+                    // Name and four 32-bit trailing fields follow fixed path data.
+                    require(b.size >= 84)
+                    val nameStart = b.size-48
+                    val name = b.copyOfRange(nameStart,nameStart+32).takeWhile { it != 0.toByte() }.toByteArray().toString(Charsets.UTF_8)
+                    out.add(Contact(b.copyOfRange(1,33), name.ifBlank { "Unnamed node" },u(b[33])))
+                    require(out.size <= 4096)
+                }
+            }
+        }
+        throw IOException("Contact sync timed out")
+    }
+    fun sendDirect(contact: Contact, message: String): String {
+        require(contact.type == 1) { "Select a chat contact" }
+        val bytes = message.toByteArray(Charsets.UTF_8)
+        require(bytes.isNotEmpty() && bytes.size <= 120 && !message.contains('\u0000'))
+        val header = ByteBuffer.allocate(13).order(ByteOrder.LITTLE_ENDIAN)
+            .put(2.toByte()).put(0.toByte()).put(0.toByte()).putInt((System.currentTimeMillis()/1000).toInt())
+            .put(contact.key.copyOfRange(0,6)).array()
+        val reply = exchange(header+bytes,setOf(6))
+        require(reply.size == 10)
+        return "Node accepted direct message; over-air delivery not confirmed."
+    }
+    fun setName(name: String): String {
+        val bytes = name.trim().toByteArray(Charsets.UTF_8)
+        require(bytes.isNotEmpty() && bytes.size <= 31 && !name.contains('\u0000'))
+        exchange(byteArrayOf(8)+bytes,setOf(0))
+        return "Node acknowledged name update."
+    }
     fun send(group: Int, message: String) {
         require(group in 0 until maxChannels)
         val body = message.toByteArray(Charsets.UTF_8)
