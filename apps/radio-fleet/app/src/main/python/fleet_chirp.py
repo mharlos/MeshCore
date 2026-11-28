@@ -254,15 +254,18 @@ def _channels(radio):
                 tx = freq - int(memory.offset)
             else:
                 tx = freq
-            tone = float(memory.rtone) if memory.tmode in ("Tone", "TSQL") else None
-            receive_tone = float(memory.ctone) if memory.tmode == "TSQL" else None
+            tx_spec, rx_spec = chirp_common.split_tone_encode(memory)
             result.append({
                 "slot": slot,
                 "name": memory.name or "",
                 "receive": round(freq / 1e6, 6),
                 "transmit": None if tx is None else round(tx / 1e6, 6),
-                "txCtcss": tone,
-                "rxCtcss": receive_tone,
+                "txCtcss": tx_spec[1] if tx_spec[0] == "Tone" else None,
+                "rxCtcss": rx_spec[1] if rx_spec[0] == "Tone" else None,
+                "txDcs": tx_spec[1] if tx_spec[0] == "DTCS" else None,
+                "rxDcs": rx_spec[1] if rx_spec[0] == "DTCS" else None,
+                "dcsPolarity": (tx_spec[2] or "N") + (rx_spec[2] or "N"),
+                "mode": memory.mode,
                 "narrow": memory.mode == "NFM",
                 "power": str(memory.power or "High"),
             })
@@ -312,23 +315,27 @@ def _apply(radio, item):
             memory.offset = transmit - receive
     memory.freq = receive
     memory.name = str(item.get("name", ""))[:features.valid_name_length]
-    memory.mode = "NFM" if item.get("narrow", False) else "FM"
-    tx_tone = item.get("txCtcss")
-    rx_tone = item.get("rxCtcss")
-    if rx_tone is not None:
-        memory.tmode = "TSQL" if tx_tone is None or abs(float(tx_tone) - float(rx_tone)) < 0.05 else "Cross"
-        if memory.tmode == "Cross":
-            memory.cross_mode = "Tone->Tone"
-        memory.rtone = float(tx_tone or rx_tone)
-        memory.ctone = float(rx_tone)
-    elif tx_tone is not None:
-        memory.tmode = "Tone"
-        memory.rtone = float(tx_tone)
-        memory.ctone = 88.5
-    else:
-        memory.tmode = ""
-        memory.rtone = 88.5
-        memory.ctone = 88.5
+    memory.mode = item.get("mode", "NFM" if item.get("narrow", False) else "FM")
+    polarity = item.get("dcsPolarity", "NN")
+    if len(polarity) != 2 or any(x not in "NR" for x in polarity):
+        raise ValueError("Invalid DCS polarity")
+    def spec(ctcss, dcs, direction):
+        if ctcss is not None and dcs is not None:
+            raise ValueError("Choose CTCSS or DCS, not both, per direction")
+        if dcs is not None:
+            return ("DTCS", int(dcs), polarity[direction])
+        if ctcss is not None:
+            return ("Tone", float(ctcss), None)
+        return ("", None, None)
+    chirp_common.split_tone_decode(memory,
+        spec(item.get("txCtcss"), item.get("txDcs"), 0),
+        spec(item.get("rxCtcss"), item.get("rxDcs"), 1))
+    # Standard UV-5R/5RM amateur models: no non-amateur transmit memories.
+    if transmit is not None and not (144000000 <= transmit <= 148000000 or
+                                      420000000 <= transmit <= 450000000):
+        raise ValueError("Memory %d: non-amateur TX must be inhibited" % slot)
+    if memory.mode == "AM" and transmit is not None:
+        raise ValueError("AM memories must be receive only")
     levels = getattr(features, "valid_power_levels", None) or []
     if levels:
         requested = str(item.get("power", "High")).lower()
