@@ -20,8 +20,23 @@ class DeviceIntegrationTest {
         val custom = Channel(50,"CUSTOM",146.52,146.52)
         val result = StarterProfile.mergeMissing(listOf(custom))
         assertEquals(custom,result.first { it.slot == 50 })
-        assertEquals(52,result.size)
+        assertEquals(82,result.size)
         assertEquals(result,StarterProfile.mergeMissing(result))
+    }
+
+    @Test fun regionalDefaultsAreUniqueReceiveOnlyAndModelAware() {
+        val all = StarterProfile.channels
+        assertEquals(88, all.size)
+        assertEquals(all.size, all.map { it.slot }.distinct().size)
+        val regional = RegionalCatalog.defaults
+        assertEquals((20..49).toList(), regional.map { it.slot })
+        assertTrue(regional.all { it.transmit == null && it.rxCtcss == null && it.rxDcs == null })
+        assertEquals(124.200, regional.first().receive, 0.000001)
+        assertEquals(18, FrequencyCatalog.forModel(regional, "UV-5R").size)
+        assertEquals(30, FrequencyCatalog.forModel(regional, "UV-5RM").size)
+        assertTrue(RegionalCatalog.digitalReference.none { FrequencyCatalog.supports(it, "UV-5RM") })
+        val custom = Channel(20, "CUSTOM", 146.52, 146.52)
+        assertEquals(custom, StarterProfile.mergeMissing(listOf(custom)).first { it.slot == 20 })
     }
 
     @Test fun kissEscapingRoundtripAcrossStreamChunks() {
