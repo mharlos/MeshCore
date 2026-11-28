@@ -12,6 +12,8 @@
         android:label="Farm Radio Fleet"
         android:usesCleartextTraffic="false"
         android:theme="@android:style/Theme.Material.NoActionBar">
+        <activity android:name=".DeviceConsoleActivity" android:exported="false" />
+        <activity android:name=".KissTerminalActivity" android:exported="false" />
         <activity android:name=".RadioProgrammingActivity" android:exported="false" />
         <activity android:name=".BleInspectorActivity" android:exported="false" />
         <activity android:name=".MainActivity" android:exported="true">
