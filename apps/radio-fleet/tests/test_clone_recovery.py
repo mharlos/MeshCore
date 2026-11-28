@@ -95,5 +95,43 @@ class CloneRecoveryTests(unittest.TestCase):
         self.assertEqual(calls, [3.0, "flush"])
 
 
+
+class IdentificationBatchTests(unittest.TestCase):
+    def test_known_magic_is_sent_in_one_ble_write(self):
+        pipe = bridge.AndroidPipe()
+        magic = bytes.fromhex("50112233445566")
+        pipe.ident_frames = (magic,)
+        with patch.object(bridge.RadioIo, "write") as send:
+            for byte in magic:
+                self.assertEqual(pipe.write(bytes([byte])), 1)
+            send.assert_called_once_with(magic)
+        self.assertEqual(pipe.ident_batches, 1)
+        self.assertEqual(pipe.write_calls, 1)
+
+    def test_other_model_preserves_individual_writes(self):
+        pipe = bridge.AndroidPipe()
+        with patch.object(bridge.RadioIo, "write") as send:
+            pipe.write(b"\\x50")
+            pipe.write(b"\\x06")
+            self.assertEqual(send.call_count, 2)
+
+    def test_partial_prefix_flushes_before_read(self):
+        pipe = bridge.AndroidPipe()
+        pipe.ident_frames = (b"ABC",)
+        with patch.object(bridge.RadioIo, "write") as send:
+            with patch.object(bridge.RadioIo, "read", return_value=[6]):
+                pipe.write(b"A")
+                self.assertEqual(pipe.read(1), b"\\x06")
+            send.assert_called_once_with(b"A")
+
+    def test_mismatch_preserves_wire_order(self):
+        pipe = bridge.AndroidPipe()
+        pipe.ident_frames = (b"ABC",)
+        with patch.object(bridge.RadioIo, "write") as send:
+            pipe.write(b"A")
+            pipe.write(b"Z")
+            self.assertEqual([c.args[0] for c in send.call_args_list], [b"A", b"Z"])
+
+
 if __name__ == "__main__":
     unittest.main()
