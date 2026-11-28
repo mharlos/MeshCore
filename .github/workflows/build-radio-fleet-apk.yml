@@ -63,6 +63,8 @@ jobs:
             echo "No stable signing key configured. Debug build only; production release publishing disabled." >> "$GITHUB_STEP_SUMMARY"
             echo "Run apps/radio-fleet/scripts/configure-signing.sh to set both Actions secrets." >> "$GITHUB_STEP_SUMMARY"
           fi
+      - name: Test clone-session recovery (host Python)
+        run: python3 -m unittest discover -s apps/radio-fleet/tests -v
       - name: Test and build debug APK (CI-only)
         run: gradle -p apps/radio-fleet testDebugUnitTest assembleDebug -PradioVersionCode=${{ github.run_number }} --no-daemon
       - name: Build signed release APK
