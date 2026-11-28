@@ -56,90 +56,107 @@ class RadioProgrammingActivity : Activity() {
     )
     @Volatile private var lastFailureReport: String = ""
 
+    private lateinit var targetStatus: TextView
+    private lateinit var backupStatus: TextView
+    private lateinit var plan: LinearLayout
+    private lateinit var scanButton: Button
+    private val events = ArrayDeque<String>()
+    private var lastEvent = ""
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        window.statusBarColor = Color.rgb(10, 17, 26)
-        store = FleetStore(this)
-        link = BluetoothLink(this)
-        RadioIo.active = link
-        val root = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(18, 20, 18, 16)
-            setBackgroundColor(Color.rgb(10, 17, 26))
-        }
-        fun header(text: String, size: Float): TextView =
-            TextView(this).apply {
-                this.text = text; textSize = size; setTextColor(Color.WHITE)
-                setPadding(5, 9, 5, 9)
-            }
-        root.addView(header("RADIO MEMORY PROGRAMMER", 23f))
-        root.addView(header("Bluetooth programming directly in this app. Read and back up each radio before Write.", 13f))
-        radioGroup = RadioGroup(this)
-        for ((index, name) in models.withIndex()) {
+        window.statusBarColor=Deck.bg
+        window.navigationBarColor=Deck.bg
+        store=FleetStore(this)
+        link=BluetoothLink(this)
+        RadioIo.active=link
+        val root=Deck.stack(this,12).apply { setBackgroundColor(Deck.bg) }
+        Deck.add(root,Deck.header(this,"Program radio"))
+        val target=Deck.card(this)
+        Deck.heading(target,"Target radio")
+        radioGroup=RadioGroup(this).apply { orientation=RadioGroup.HORIZONTAL }
+        for((index,name) in models.withIndex()) {
             radioGroup.addView(RadioButton(this).apply {
-                id = 100 + index
-                text = name
-                textSize = 16f
-                setTextColor(Color.WHITE)
-            })
+                id=100+index; text=name; textSize=15f; setTextColor(Deck.ink)
+                buttonTintList=android.content.res.ColorStateList.valueOf(Deck.cyan)
+                minimumHeight=Deck.dp(this@RadioProgrammingActivity,48)
+            },RadioGroup.LayoutParams(0,-2,1f))
         }
         radioGroup.check(100)
-        radioGroup.setOnCheckedChangeListener { _, checked ->
-            model = models[(checked - 100).coerceIn(0, models.lastIndex)]
-            resetBackup()
-            link.disconnect()
-            setStatus("Choose and connect a new device for " + model)
+        Deck.add(target,radioGroup)
+        targetStatus=Deck.text(this,"NO DEVICE SELECTED",13f,Deck.muted,true)
+        Deck.add(target,targetStatus,0)
+        Deck.add(root,target)
+        val workflow=Deck.card(this)
+        Deck.heading(workflow,"Program workflow")
+        val actions=Deck.row(this)
+        scanButton=Deck.button(this,"01\nSCAN",Deck.cyan){if(!busy&&permissions())scan()}
+        readButton=Deck.button(this,"02\nREAD + SAVE",Deck.lime){read()}.apply { isEnabled=false }
+        writeButton=Deck.button(this,"03\nWRITE + VERIFY",Deck.pink){confirmWrite()}.apply { isEnabled=false }
+        for(b in listOf(scanButton,readButton,writeButton)) {
+            b.minHeight=Deck.dp(this,76)
+            Deck.weighted(actions,b)
+        }
+        Deck.add(workflow,actions)
+        devices=Deck.stack(this)
+        Deck.add(workflow,devices,0)
+        Deck.add(root,workflow)
+        val backup=Deck.card(this,Deck.lime)
+        Deck.heading(backup,"Read status",Deck.lime)
+        backupStatus=Deck.text(this,"Backup required before writing.",13f,Deck.muted,true)
+        Deck.add(backup,backupStatus)
+        memoryButton=Deck.button(this,"Inspect radio memories",Deck.cyan){showMemories()}.apply { isEnabled=false }
+        settingsButton=Deck.button(this,"Radio settings / DTMF presets",Deck.amber){showSettings()}.apply { isEnabled=false }
+        Deck.add(backup,memoryButton,5);Deck.add(backup,settingsButton,0)
+        Deck.add(root,backup)
+        plan=Deck.card(this,Deck.line)
+        Deck.add(root,plan)
+        val terminal=Deck.card(this,Deck.cyan)
+        Deck.heading(terminal,"Activity log")
+        status=Deck.text(this,"Choose a model and scan.",12f,Deck.lime,true).apply { setTextIsSelectable(true) }
+        Deck.add(terminal,status)
+        Deck.action(terminal,"Copy BLE / CHIRP diagnostics",Deck.amber) {
+            val diagnostic=link.lastGattReport+(if(lastFailureReport.isNotBlank()) "\n\nRADIO READ/WRITE FAILURE\n"+lastFailureReport else "")
+            val clipboard=getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            clipboard.setPrimaryClip(ClipData.newPlainText("Radio BLE and CHIRP diagnostics",diagnostic))
+            setStatus("Copied GATT and last radio error diagnostics.")
+        }
+        Deck.add(root,terminal)
+        radioGroup.setOnCheckedChangeListener { _,checked ->
+            model=models[(checked-100).coerceIn(0,models.lastIndex)]
+            resetBackup();link.disconnect();targetName=""
             devices.removeAllViews()
+            setStatus("Choose and connect a new device for "+model)
+            updatePlan()
         }
-        root.addView(radioGroup)
-        val scan = Button(this).apply {
-            text = "1. Scan for Bluetooth adapters"
-            setOnClickListener { if (!busy && permissions()) scan() }
-        }
-        root.addView(scan)
-        devices = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        val results = ScrollView(this).apply { addView(devices) }
-        root.addView(results, LinearLayout.LayoutParams(-1, 0, 1f))
-        readButton = Button(this).apply {
-            text = "2. Read radio + save backup"
-            isEnabled = false
-            setOnClickListener { read() }
-        }
-        root.addView(readButton)
-        writeButton = Button(this).apply {
-            text = "3. Write master channels + verify"
-            isEnabled = false
-            setOnClickListener { confirmWrite() }
-        }
-        root.addView(writeButton)
-        memoryButton = Button(this).apply {
-            text = "Inspect radio memories"
-            isEnabled = false
-            setOnClickListener { showMemories() }
-        }
-        root.addView(memoryButton)
-        settingsButton = Button(this).apply {
-            text = "Radio settings / DTMF presets"
-            isEnabled = false
-            setOnClickListener { showSettings() }
-        }
-        root.addView(settingsButton)
-        root.addView(Button(this).apply {
-            text = "Copy Bluetooth service diagnostics"
-            isAllCaps = false
-            setOnClickListener {
-                val diagnostic = link.lastGattReport +
-                    (if (lastFailureReport.isNotBlank())
-                        "\n\nRADIO READ/WRITE FAILURE\n" + lastFailureReport else "")
-                val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                clipboard.setPrimaryClip(ClipData.newPlainText("Radio BLE and CHIRP diagnostics", diagnostic))
-                setStatus("Copied GATT and last radio error diagnostics. Paste the report into our chat.")
-            }
-        })
-        status = header("Choose a model and scan.", 13f)
-        root.addView(status)
-        setContentView(root)
-        if (Build.VERSION.SDK_INT >= 31) permissions()
+        updatePlan()
+        setContentView(ScrollView(this).apply { setBackgroundColor(Deck.bg);addView(root) })
+        if(Build.VERSION.SDK_INT>=31) permissions()
+    }
+    private fun updatePlan() {
+        if(!::plan.isInitialized) return
+        plan.removeAllViews()
+        Deck.heading(plan,"Write preview")
+        val master=store.channels()
+        val projected=FrequencyCatalog.forModel(master,model)
+        Deck.add(plan,Deck.text(this,projected.size.toString()+" COMPATIBLE / "+master.size+" MASTER",12f,Deck.cyan,true,true))
+        for(b in Deck.bands(projected)) Deck.add(plan,Deck.text(this,b.name+" · "+b.channels.size+" / "+Deck.slots(b.channels),12f,b.accent,true),5)
+        Deck.add(plan,Deck.text(this,(master.size-projected.size).toString()+" unsupported memories skipped. FRS / GMRS target permissions apply.",12f,Deck.amber),0)
+    }
+    private fun refreshStatus() {
+        if(!::targetStatus.isInitialized) return
+        val ready=link.ready&&(!link.hasTidradioControl||link.confirmedBaud!=null)
+        targetStatus.text=model+" · "+(targetName.ifBlank { "No adapter selected" })+"\n"+
+            (if(ready) "LINK READY" else "NOT READY")+(link.confirmedBaud?.let { " · UART "+it+" baud" }?:"")
+        targetStatus.setTextColor(if(ready) Deck.lime else Deck.muted)
+        val snapshot=baofengBackup
+        val count=snapshot?.optJSONArray("channels")?.length()
+        val valid=ready&&readModel==model&&backupFile?.exists()==true
+        backupStatus.text=(if(valid) "BACKUP SAVED · WRITE REVIEW AVAILABLE" else "FRESH READ REQUIRED")+
+            (count?.let { "\n"+it+" occupied memories" }?:"")+
+            (snapshot?.optString("sha256")?.take(16)?.let { "\nSHA-256 "+it }?:"")+
+            (backupFile?.name?.let { "\n"+it }?:"")
+        backupStatus.setTextColor(if(valid) Deck.lime else Deck.amber)
+        scanButton.isEnabled=!busy
     }
     private fun resetBackup() {
         baofengBackup = null
@@ -151,7 +168,17 @@ class RadioProgrammingActivity : Activity() {
         if (::settingsButton.isInitialized) settingsButton.isEnabled = false
         if (::memoryButton.isInitialized) memoryButton.isEnabled = false
     }
-    private fun setStatus(text: String) = runOnUiThread { status.text = text }
+    private fun setStatus(text:String)=runOnUiThread {
+        if(!::status.isInitialized) return@runOnUiThread
+        val now=java.text.SimpleDateFormat("HH:mm:ss",java.util.Locale.US).format(java.util.Date())
+        if(text!=lastEvent) {
+            lastEvent=text
+            events.addLast("["+now+"] "+text)
+            while(events.size>12) events.removeFirst()
+        }
+        status.text=events.joinToString("\n\n")
+        refreshStatus()
+    }
     private fun permissions(): Boolean {
         val permissions = if (Build.VERSION.SDK_INT >= 31)
             arrayOf(Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT)
@@ -172,7 +199,8 @@ class RadioProgrammingActivity : Activity() {
                 text = candidate.name + "  ·  " + candidate.rssi + " dBm"
                 setOnClickListener { connect(candidate.device, candidate.name) }
             }
-            devices.addView(button)
+            Deck.styleButton(button,Deck.cyan)
+            Deck.add(devices,button,5)
         }, { error -> setStatus(error) })
     }
     private fun connect(device: BluetoothDevice, name: String) {
@@ -264,6 +292,7 @@ class RadioProgrammingActivity : Activity() {
                         backupFile?.exists() == true
                     settingsButton.isEnabled = writeButton.isEnabled && baofengBackup != null
                     memoryButton.isEnabled = baofengBackup != null
+                    refreshStatus()
                 }
             }
         }
@@ -364,6 +393,7 @@ class RadioProgrammingActivity : Activity() {
                 val field = android.widget.EditText(this).apply {
                     setSingleLine(true)
                     setText(value)
+                    Deck.field(this)
                     if (setting.getString("kind") == "integer") {
                         inputType = android.text.InputType.TYPE_CLASS_NUMBER or android.text.InputType.TYPE_NUMBER_FLAG_SIGNED
                         hint = setting.optInt("min").toString() + "–" + setting.optInt("max")
