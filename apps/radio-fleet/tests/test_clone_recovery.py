@@ -111,8 +111,8 @@ class IdentificationBatchTests(unittest.TestCase):
     def test_other_model_preserves_individual_writes(self):
         pipe = bridge.AndroidPipe()
         with patch.object(bridge.RadioIo, "write") as send:
-            pipe.write(b"\\x50")
-            pipe.write(b"\\x06")
+            pipe.write(bytes([0x50]))
+            pipe.write(bytes([0x06]))
             self.assertEqual(send.call_count, 2)
 
     def test_partial_prefix_flushes_before_read(self):
@@ -121,7 +121,7 @@ class IdentificationBatchTests(unittest.TestCase):
         with patch.object(bridge.RadioIo, "write") as send:
             with patch.object(bridge.RadioIo, "read", return_value=[6]):
                 pipe.write(b"A")
-                self.assertEqual(pipe.read(1), b"\\x06")
+                self.assertEqual(pipe.read(1), bytes([0x06]))
             send.assert_called_once_with(b"A")
 
     def test_mismatch_preserves_wire_order(self):
