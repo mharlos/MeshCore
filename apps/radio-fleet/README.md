@@ -41,7 +41,7 @@ and diagnosing real adapters.
 
 ## Use
 
-1. Install the latest debug APK from the
+1. Install the persistently signed APK from the
    [radio-fleet-latest release](https://github.com/mharlos/MeshCore/releases/tag/radio-fleet-latest).
 2. Open **FARM RADIO FLEET**, review the master frequencies, tones, and TX
    disable settings. Import CHIRP CSV if needed.
@@ -77,10 +77,50 @@ CI: `.github/workflows/build-radio-fleet-apk.yml`. Kotlin tests and APK
 compile run automatically; the most recent successful build is tagged at
 `radio-fleet-latest`.
 
-**Signing:** The current workflow produces debug-signed test APKs. A durable
-release signing key in GitHub Actions Secrets is required for reliable in-place
-upgrades without uninstalling the app. Until then, export the channel profile
-before reinstalling.
+## Permanent Android signing and in-place APK upgrades
+
+Android verifies signing-certificate identity, package name, and increasing
+versionCode before an app can be updated in place. Previous APKs carried a new
+ephemeral debug certificate on each GitHub-hosted runner, so Android rejected
+updates with **APP NOT INSTALLED / UPDATE INCOMPATIBLE**.
+
+The workflow now builds a **persistently signed release APK**, provided
+repository Actions secrets are configured. The moving `radio-fleet-latest`
+release is updated **only when the stable signing certificate exists**. If
+secrets are missing, the CI test and debug APK still build, but GitHub will not
+publish another debug-signed APK under the normal download link.
+
+### One-time operator setup on a computer with GitHub CLI, JDK/keytool and OpenSSL
+
+```sh
+git clone -b feature/radio-fleet-sync https://github.com/mharlos/MeshCore.git
+cd MeshCore
+gh auth login
+bash apps/radio-fleet/scripts/configure-signing.sh
+gh workflow run build-radio-fleet-apk.yml --repo mharlos/MeshCore --ref feature/radio-fleet-sync
+```
+
+The script generates one private 3072-bit RSA PKCS#12 key pair at
+`~/.config/farm-radio-fleet/release-signing.p12`, saves its password in
+`release-signing-password`, and pushes only encrypted GitHub Actions secret
+values under `RADIO_FLEET_KEYSTORE_B64` and
+`RADIO_FLEET_SIGNING_PASSWORD`.
+
+**Back up the key and password securely.** Never commit either file. GitHub
+Actions will restore that same certificate for every release. The workflow
+builds and publishes `app-release.apk` and renames it
+`farm-radio-fleet.apk` in releases.
+
+**One final uninstall is expected** when moving from the old per-run
+debug-signed APK to the first persistently signed release. Preserve your master
+channel list by exporting CSV before uninstalling. Subsequent signed APKs use
+the same application ID, signing certificate, and increasing run-number
+versionCode, supporting normal Android updates without losing app data.
+
+Local debug APKs are CI-only and must never be offered as updates to the
+production release. Do not run the signing setup script again after losing
+the key: restore the original certificate and password from backup to avoid
+breaking the established upgrade chain.
 
 ## Field-test requirements
 
