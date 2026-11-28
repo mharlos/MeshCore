@@ -76,7 +76,11 @@ internal object FrequencyCatalog {
         linkedMapOf("FRS simplex (22)" to frs, "FRS monitoring (22)" to shared.map { it.copy(name = "FRSRX" + it.name.takeLast(2)) }, "GMRS simplex (22)" to simplex, "GMRS repeaters (8)" to gmrs,
             "NOAA weather (7)" to weather, "Marine VHF (10)" to marine,
             "Aviation AM (7; UV-5RM only)" to aviation, "MURS (5)" to murs,
-            "Amateur simplex (2)" to amateur, "CB (40; reference only)" to cb)
+            "Amateur simplex (2)" to amateur, "CB (40; reference only)" to cb,
+            "Rainier regional aviation" to RegionalCatalog.aviation,
+            "Columbia River marine" to RegionalCatalog.marine,
+            "Rainier regional public services" to RegionalCatalog.local,
+            "Regional DMR / P25 (reference only)" to RegionalCatalog.digitalReference)
     }
 
     // Use conservative verified shared receive ranges; AM belongs only to 5RM.
