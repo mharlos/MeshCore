@@ -15,6 +15,19 @@ class FrequencyCatalogTest {
         assertEquals(40, FrequencyCatalog.groups.getValue("CB (40; reference only)").size)
     }
 
+    @Test fun frsCatalogRetainsTransmitIntentAndSeparateService() {
+        val frs = FrequencyCatalog.groups.getValue("FRS simplex (22)")
+        assertEquals(22, frs.size)
+        assertTrue(frs.all { it.transmit == it.receive && it.mode == "NFM" })
+        val master = FrequencyCatalog.append(emptyList(), frs +
+            FrequencyCatalog.groups.getValue("GMRS simplex (22)"))
+        assertEquals(44, master.size)
+        assertEquals(22, FrequencyCatalog.frsTxCount(master))
+        assertEquals(22, FrequencyCatalog.gmrsTxCount(master))
+        val projected = FrequencyCatalog.forModel(master, "UV-5RM", true)
+        assertTrue(projected.filter { FrequencyCatalog.isFrs(it) }.all { it.transmit == null })
+    }
+
     @Test fun gmrsIntentAndProjection() {
         val simplex = FrequencyCatalog.groups.getValue("GMRS simplex (22)")
         val repeaters = FrequencyCatalog.groups.getValue("GMRS repeaters (8)")
