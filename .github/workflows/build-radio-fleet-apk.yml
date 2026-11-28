@@ -43,19 +43,58 @@ jobs:
           cp /tmp/radio-droid/AndroidRadioDroid/app/src/main/python/chirp/COPYING apps/radio-fleet/CHIRP-COPYING 2>/dev/null || true
           test -f apps/radio-fleet/app/src/main/python/chirp/drivers/uv5r.py
           test -f apps/radio-fleet/app/src/main/python/chirp/drivers/baofeng_uv17Pro.py
-      - name: Test and build APK
+      - name: Restore persistent Android signing certificate
+        id: signing
+        shell: bash
+        env:
+          SIGNING_KEY_B64: ${{ secrets.RADIO_FLEET_KEYSTORE_B64 }}
+          SIGNING_PASSWORD: ${{ secrets.RADIO_FLEET_SIGNING_PASSWORD }}
+        run: |
+          if [[ -n "${SIGNING_KEY_B64:-}" && -n "${SIGNING_PASSWORD:-}" ]]; then
+            umask 077
+            KEYSTORE="$RUNNER_TEMP/farm-radio-fleet-release.p12"
+            printf '%s' "$SIGNING_KEY_B64" | base64 --decode > "$KEYSTORE"
+            KEY_PASSWORD="$SIGNING_PASSWORD" keytool -list -keystore "$KEYSTORE" -storepass:env KEY_PASSWORD -alias farmradiofleet >/dev/null
+            echo "RADIO_FLEET_KEYSTORE_FILE=$KEYSTORE" >> "$GITHUB_ENV"
+            echo "FLEET_SIGNING_READY=true" >> "$GITHUB_ENV"
+            echo "Persistent certificate found: building upgradable release APK." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "FLEET_SIGNING_READY=false" >> "$GITHUB_ENV"
+            echo "No stable signing key configured. Debug build only; production release publishing disabled." >> "$GITHUB_STEP_SUMMARY"
+            echo "Run apps/radio-fleet/scripts/configure-signing.sh to set both Actions secrets." >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Test and build debug APK (CI-only)
         run: gradle -p apps/radio-fleet testDebugUnitTest assembleDebug -PradioVersionCode=${{ github.run_number }} --no-daemon
-      - uses: actions/upload-artifact@v4
+      - name: Build signed release APK
+        if: env.FLEET_SIGNING_READY == 'true'
+        env:
+          RADIO_FLEET_SIGNING_PASSWORD: ${{ secrets.RADIO_FLEET_SIGNING_PASSWORD }}
+        run: |
+          gradle -p apps/radio-fleet assembleRelease -PradioVersionCode=${{ github.run_number }} --no-daemon
+          APK=apps/radio-fleet/app/build/outputs/apk/release/app-release.apk
+          test -s "$APK"
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          "$SDK_ROOT/build-tools/35.0.0/apksigner" verify --print-certs "$APK"
+      - name: Upload debug APK for CI investigation
+        uses: actions/upload-artifact@v4
         with:
-          name: farm-radio-fleet-apk
+          name: farm-radio-fleet-debug-ci-only
           path: apps/radio-fleet/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
-      - name: Publish tagged build and latest APK
+      - name: Upload persistently signed installable APK
+        if: env.FLEET_SIGNING_READY == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: farm-radio-fleet-release-apk
+          path: apps/radio-fleet/app/build/outputs/apk/release/app-release.apk
+          if-no-files-found: error
+      - name: Publish versioned release and update stable download
+        if: env.FLEET_SIGNING_READY == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          APK=apps/radio-fleet/app/build/outputs/apk/debug/app-debug.apk
+          APK=apps/radio-fleet/app/build/outputs/apk/release/app-release.apk
           TAG="radio-fleet-build-${{ github.run_number }}"
-          gh release create "$TAG" "$APK#farm-radio-fleet.apk" --target "$GITHUB_SHA" --title "Radio Fleet ${{ github.run_number }}" --notes "Sideloadable test APK. Verify all memories before on-air use."
+          gh release create "$TAG" "$APK#farm-radio-fleet.apk" --target "$GITHUB_SHA" --title "Radio Fleet ${{ github.run_number }} — signed" --notes "Signed with persistent release certificate. Subsequent releases can update without uninstalling once this certificate is installed."
           gh release delete radio-fleet-latest --yes --cleanup-tag 2>/dev/null || true
-          gh release create radio-fleet-latest "$APK#farm-radio-fleet.apk" --target "$GITHUB_SHA" --title "Radio Fleet — latest Android APK" --notes "Feature-branch test build. Debug-signed APK; clean CI builds may require uninstall before an update."
+          gh release create radio-fleet-latest "$APK#farm-radio-fleet.apk" --target "$GITHUB_SHA" --title "Radio Fleet — current signed Android APK" --notes "Stable-signature release. First transition from previous CI debug APK may need one final uninstall. Subsequent releases signed with the same certificate support in-place upgrades."
