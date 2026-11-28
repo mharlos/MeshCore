@@ -296,7 +296,18 @@ def read_radio(model, after_upload=False):
     finally:
         radio.pipe.close()
 
-def _apply(radio, item):
+def _gmrs_pair(receive, transmit):
+    simplex = (
+        {462562500 + i * 25000 for i in range(7)} |
+        {467562500 + i * 25000 for i in range(7)} |
+        {462550000 + i * 25000 for i in range(8)}
+    )
+    return (receive == transmit and receive in simplex) or (
+        receive in {462550000 + i * 25000 for i in range(8)} and
+        transmit == receive + 5000000)
+
+
+def _apply(radio, item, gmrs_authorized=False):
     slot = int(item["slot"])
     features = radio.get_features()
     lo, hi = features.memory_bounds
@@ -339,10 +350,15 @@ def _apply(radio, item):
     chirp_common.split_tone_decode(memory,
         spec(item.get("txCtcss"), item.get("txDcs"), 0),
         spec(item.get("rxCtcss"), item.get("rxDcs"), 1))
-    # Standard UV-5R/5RM amateur models: no non-amateur transmit memories.
+    # Exact GMRS pairs are allowed only on an explicitly authorized target.
     if transmit is not None and not (144000000 <= transmit <= 148000000 or
                                       420000000 <= transmit <= 450000000):
-        raise ValueError("Memory %d: non-amateur TX must be inhibited" % slot)
+        if not gmrs_authorized or not _gmrs_pair(receive, transmit):
+            raise ValueError("Memory %d: TX not authorized for this service" % slot)
+        if receive in {467562500 + i * 25000 for i in range(7)}:
+            raise ValueError("GMRS 8-14 require verified 0.5 W ERP hardware")
+        if receive in {462562500 + i * 25000 for i in range(7)} and str(item.get("power", "")).lower() != "low":
+            raise ValueError("GMRS 1-7 require low power on this driver")
     if memory.mode == "AM" and transmit is not None:
         raise ValueError("AM memories must be receive only")
     levels = getattr(features, "valid_power_levels", None) or []
@@ -355,7 +371,7 @@ def _apply(radio, item):
         raise ValueError("Memory %d: %s" % (slot, "; ".join(errors)))
     radio.set_memory(memory)
 
-def write_radio(model, expected_image_sha256, channel_json):
+def write_radio(model, expected_image_sha256, channel_json, gmrs_authorized=False):
     """Re-read, check baseline, apply only requested channels, and write via driver.
 
     Android persists a backup from read_radio BEFORE exposing Write.
@@ -378,7 +394,7 @@ def write_radio(model, expected_image_sha256, channel_json):
                 "Radio memory changed since the backup. Read again before writing."
             )
         for item in profile:
-            _apply(radio, item)
+            _apply(radio, item, gmrs_authorized)
         _settle_session(SESSION_SETTLE_SECONDS)
         _upload_with_recovery(radio, model)
         return json.dumps({
