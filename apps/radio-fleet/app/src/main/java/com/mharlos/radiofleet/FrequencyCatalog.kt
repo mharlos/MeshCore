@@ -3,7 +3,7 @@ package com.mharlos.radiofleet
 import java.util.Locale
 
 /** US channel plan. Catalog entries are templates, not assigned memory slots.
- * Non-amateur services are RX-only on the supported amateur handsets.
+ * GMRS intent is separate from FRS monitoring; direct TX needs operator confirmation.
  */
 internal object FrequencyCatalog {
     val groups: Map<String, List<Channel>> by lazy {
@@ -17,13 +17,19 @@ internal object FrequencyCatalog {
                 in 8..14 -> 467.5625 + (n - 8) * 0.025
                 else -> 462.550 + (n - 15) * 0.025
             }
-            rx("FRGM" + num(n), f, "FRS / GMRS",
+            rx("FRS" + num(n), f, "FRS monitoring",
                 "Shared channel " + n + "; no universal privacy tone", "NFM")
+        }
+        val simplex = shared.mapIndexed { i, c ->
+            val n = i + 1
+            c.copy(name = "GMRS" + num(n), transmit = c.receive, service = "GMRS simplex",
+                description = "GMRS channel " + n + (if (n in 8..14) "; 0.5 W ERP max, certified handheld only" else "; operator-selected tone"),
+                mode = if (n in 8..14) "NFM" else "FM", narrow = n in 8..14, power = "Low")
         }
         val gmrs = (15..22).map { n ->
             val f = 462.550 + (n - 15) * 0.025
-            rx("GMR" + num(n), f, "GMRS repeater", "Output; input " +
-                String.format(Locale.US, "%.4f", f + 5.0) + " MHz; operator-specific tone")
+            Channel(0, "GMR" + num(n), f, f + 5.0, power = "Low", service = "GMRS repeater",
+                description = "+5 MHz input; operator-specific tone")
         }
         val weather = listOf(162.550, 162.400, 162.475, 162.425, 162.450, 162.500, 162.525)
             .mapIndexed { i, f -> rx("WX" + (i + 1), f, "NOAA weather", "NOAA Weather Radio") }
@@ -62,7 +68,7 @@ internal object FrequencyCatalog {
             Channel(0, "CALL2M", 146.520, 146.520, service="Amateur simplex", description="National 2m calling"),
             Channel(0, "CALL70", 446.000, 446.000, service="Amateur simplex", description="National 70cm calling")
         )
-        linkedMapOf("FRS / GMRS (22)" to shared, "GMRS repeater outputs (8)" to gmrs,
+        linkedMapOf("FRS monitoring (22)" to shared, "GMRS simplex (22)" to simplex, "GMRS repeaters (8)" to gmrs,
             "NOAA weather (7)" to weather, "Marine VHF (10)" to marine,
             "Aviation AM (7; UV-5RM only)" to aviation, "MURS (5)" to murs,
             "Amateur simplex (2)" to amateur, "CB (40; reference only)" to cb)
@@ -75,10 +81,35 @@ internal object FrequencyCatalog {
         return c.receive in 136.0..174.0 || c.receive in 400.0..480.0
     }
 
-    fun forModel(channels: List<Channel>, model: String): List<Channel> =
+    private val gmrsSimplexHz = (1..22).map { n ->
+        when (n) {
+            in 1..7 -> 462562500 + (n - 1) * 25000
+            in 8..14 -> 467562500 + (n - 8) * 25000
+            else -> 462550000 + (n - 15) * 25000
+        }
+    }
+    private fun hz(f: Double) = kotlin.math.round(f * 1e6).toInt()
+    fun isGmrsPair(receive: Double, transmit: Double?): Boolean {
+        if (transmit == null) return false
+        val rx = hz(receive)
+        val tx = hz(transmit)
+        return (rx == tx && rx in gmrsSimplexHz) ||
+            (rx in 462550000..462725000 && (rx - 462550000) % 25000 == 0 && tx == rx + 5000000)
+    }
+    fun txAllowed(receive: Double, transmit: Double?, mode: String): Boolean =
+        transmit == null || (mode != "AM" && (transmit in 144.0..148.0 ||
+            transmit in 420.0..450.0 || isGmrsPair(receive, transmit)))
+
+    fun gmrsTxCount(channels: List<Channel>) = channels.count { isGmrsPair(it.receive, it.transmit) }
+
+    fun forModel(channels: List<Channel>, model: String, gmrsAuthorized: Boolean = false): List<Channel> =
         channels.filter { supports(it, model) && it.slot in 1..127 }.map {
+            val gmrs = isGmrsPair(it.receive, it.transmit)
+            val restricted = gmrs && hz(it.receive) in gmrsSimplexHz.subList(7,14)
+            val powerLimited = gmrs && hz(it.receive) in gmrsSimplexHz.subList(0,7)
             it.copy(name = it.name.take(if (model == "UV-5R") 7 else 12),
-                power = if (model == "UV-5R" && it.power.equals("Medium", true)) "Low" else it.power)
+                transmit = if (gmrs && (!gmrsAuthorized || restricted)) null else it.transmit,
+                power = if (powerLimited || restricted || model == "UV-5R" && it.power.equals("Medium", true)) "Low" else it.power)
         }
 
     fun append(existing: List<Channel>, candidates: List<Channel>): List<Channel> {
