@@ -192,6 +192,33 @@ class DeviceConsoleActivity : Activity() {
                 }
             }
             is MeshCoreSession -> {
+                button(controls,"Sync contacts / send direct message") {
+                    runTask("Syncing contacts…") {
+                        val contacts = s.contacts().filter { it.type == 1 }
+                        runOnUiThread {
+                            if (!destroyed && contacts.isNotEmpty()) {
+                                AlertDialog.Builder(this).setTitle("Choose chat contact")
+                                    .setItems(contacts.map { it.toString() }.toTypedArray()) { _,i ->
+                                        val field = EditText(this).apply { hint = "Message (up to 120 UTF-8 bytes)" }
+                                        AlertDialog.Builder(this).setTitle("Send to " + contacts[i].name).setView(field)
+                                            .setNegativeButton("Cancel",null).setPositiveButton("Send") { _,_ ->
+                                                val msg = field.text.toString()
+                                                if (session === s) runTask("Sending…") { s.sendDirect(contacts[i],msg) }
+                                            }.show()
+                                    }.setNegativeButton("Close",null).show()
+                            }
+                        }
+                        "Found " + contacts.size + " chat contacts."
+                    }
+                }
+                button(controls,"Change node name") {
+                    val field = EditText(this).apply { hint = "Node name (31 UTF-8 bytes maximum)" }
+                    AlertDialog.Builder(this).setTitle("Rename connected node").setView(field)
+                        .setNegativeButton("Cancel",null).setPositiveButton("Update") { _,_ ->
+                            val name = field.text.toString()
+                            if (session === s) runTask("Updating node name…") { s.setName(name) }
+                        }.show()
+                }
                 button(controls,"Read configured channels") { runTask("Reading channel names…") {
                     meshGroups = s.channels()
                     meshGroups.joinToString("\n").ifBlank { "No named channels found." }
