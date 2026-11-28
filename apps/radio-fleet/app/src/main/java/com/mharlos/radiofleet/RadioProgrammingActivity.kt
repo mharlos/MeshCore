@@ -433,29 +433,47 @@ class RadioProgrammingActivity : Activity() {
             return
         }
         val master = store.channels().sortedBy { it.slot }
-        val selected = FrequencyCatalog.forModel(master, model)
-        val skipped = master.size - selected.size
-        if (selected.isEmpty()) {
-            setStatus("Master channel profile is empty.")
-            return
-        }
-        AlertDialog.Builder(this)
-            .setTitle("Write " + selected.size + " channel memories?")
-            .setMessage(
-                "Radio: " + targetName + "\nModel: " + model +
-                "\nBackup: " + backupFile!!.name + "\nUnsupported / unavailable memories skipped: " + skipped +
-                "\n\nOnly the shared master memories will be updated. Other memories and " +
-                "radio-specific settings will be preserved by the model driver. " +
-                "This operation writes to the physical radio and requires an uninterrupted connection."
-            )
-            .setNegativeButton("Cancel", null)
-            .setPositiveButton("Write + verify") { _, _ ->
-                if (!busy && link.ready && readModel == model && backupFile?.exists() == true)
-                    write(selected)
+        fun review(gmrsAuthorized: Boolean) {
+            val selected = FrequencyCatalog.forModel(master, model, gmrsAuthorized)
+            val skipped = master.size - selected.size
+            val enabled = FrequencyCatalog.gmrsTxCount(selected)
+            val inhibited = FrequencyCatalog.gmrsTxCount(master) - enabled
+            if (selected.isEmpty()) {
+                setStatus("Master channel profile has no compatible memories.")
+                return
             }
-            .show()
+            AlertDialog.Builder(this)
+                .setTitle("Write " + selected.size + " channel memories?")
+                .setMessage(
+                    "Radio: " + targetName + "\nModel: " + model +
+                    "\nBackup: " + backupFile!!.name +
+                    "\nUnsupported / unavailable memories skipped: " + skipped +
+                    "\nGMRS TX enabled: " + enabled +
+                    "\nGMRS TX inhibited / unavailable: " + inhibited +
+                    "\n\nOther memories and radio-specific settings will be preserved. " +
+                    "Keep the connection uninterrupted."
+                )
+                .setNegativeButton("Cancel", null)
+                .setPositiveButton("Write + verify") { _, _ ->
+                    if (!busy && link.ready && readModel == model && backupFile?.exists() == true)
+                        write(selected, gmrsAuthorized)
+                }.show()
+        }
+        if (FrequencyCatalog.gmrsTxCount(master) == 0) {
+            review(false)
+        } else {
+            AlertDialog.Builder(this)
+                .setTitle("GMRS transmit permissions")
+                .setMessage("Choose GMRS TX only for a GMRS-certified radio with compatible firmware. " +
+                    "Channels 8–14 remain RX-only with these drivers because 0.5 W ERP is not verified. " +
+                    "No firmware TX locks are bypassed.")
+                .setNegativeButton("Cancel", null)
+                .setNeutralButton("RX only") { _, _ -> review(false) }
+                .setPositiveButton("Certified GMRS target") { _, _ -> review(true) }
+                .show()
+        }
     }
-    private fun write(selected: List<Channel>) {
+    private fun write(selected: List<Channel>, gmrsAuthorized: Boolean = false) {
         val targetModel = model
         worker("Writing " + targetModel + " — do not disconnect...") {
             when (targetModel) {
@@ -481,7 +499,7 @@ class RadioProgrammingActivity : Activity() {
                     val array = JSONArray()
                     selected.forEach { array.put(it.json()) }
                     python().callAttr("write_radio", targetModel,
-                        prior.getString("sha256"), array.toString())
+                        prior.getString("sha256"), array.toString(), gmrsAuthorized)
                     setStatus("Write completed. Reading radio independently to verify...")
                     try {
                         val readback = JSONObject(python().callAttr("read_radio", targetModel, true).toString())
