@@ -42,7 +42,13 @@ class BluetoothLink(private val context: Context) {
     private val manager = context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
     private val handler = Handler(Looper.getMainLooper())
     private var scan: ScanCallback? = null
-    private var gatt: BluetoothGatt? = null
+    @Volatile private var gatt: BluetoothGatt? = null
+    private var controlWrite: BluetoothGattCharacteristic? = null
+    private var controlNotify: BluetoothGattCharacteristic? = null
+    private val controlReceived = LinkedBlockingQueue<ByteArray>(64)
+    val hasTidradioControl: Boolean get() = controlWrite != null && controlNotify != null
+    @Volatile var confirmedBaud: Int? = null
+        private set
     private var writeChar: BluetoothGattCharacteristic? = null
     private var notifyChar: BluetoothGattCharacteristic? = null
     private val received = LinkedBlockingQueue<Int>(8192)
@@ -155,7 +161,7 @@ class BluetoothLink(private val context: Context) {
                     BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE) != 0
             ) {
                 lastGattReport += "\\nTIDRADIO KIT: FF01 (RX notifications) / FF02 (TX writes) selected." +
-                    "\\nSecondary FF21/FF22 channel left untouched."
+                    "\\nFF21/FF22 reserved for adapter control."
                 return UartPair(tid, dataTx, dataRx)
             }
             // FF21/FF22 alone is not proof of a transparent serial transport;
@@ -202,12 +208,20 @@ class BluetoothLink(private val context: Context) {
                 handler.post { callback(result) }
             }
         }
+        val discoveryStarted = AtomicBoolean()
+        fun discover(g: BluetoothGatt) {
+            if (!closed.get() && gatt === g && discoveryStarted.compareAndSet(false, true)) {
+                if (!g.discoverServices()) deliver(Result.failure(IOException("GATT discovery rejected")))
+            }
+        }
         val connection = object : BluetoothGattCallback() {
             override fun onConnectionStateChange(g: BluetoothGatt, status: Int, newState: Int) {
-                if (closed.get()) return
+                if (closed.get() || gatt !== g) return
                 if (status != BluetoothGatt.GATT_SUCCESS ||
                     newState != BluetoothProfile.STATE_CONNECTED) {
                     ready = false
+                    confirmedBaud = null
+                    writeLatch?.countDown()
                     deliver(Result.failure(IOException("GATT disconnected: " + status +
                         " state " + newState)))
                     return
@@ -215,16 +229,17 @@ class BluetoothLink(private val context: Context) {
                 g.requestMtu(185)
                 // Some adapters never respond to MTU requests.
                 handler.postDelayed({
-                    if (!ready && !closed.get() && gatt === g) g.discoverServices()
+                    discover(g)
                 }, 1250)
             }
             override fun onMtuChanged(g: BluetoothGatt, mtu: Int, status: Int) {
+                if (closed.get() || gatt !== g) return
                 if (status == BluetoothGatt.GATT_SUCCESS)
                     chunkSize = (mtu - 3).coerceIn(20, 180)
-                if (!closed.get()) g.discoverServices()
+                discover(g)
             }
             override fun onServicesDiscovered(g: BluetoothGatt, status: Int) {
-                if (closed.get()) return
+                if (closed.get() || gatt !== g) return
                 if (status != BluetoothGatt.GATT_SUCCESS) {
                     deliver(Result.failure(IOException("GATT service discovery failed: " + status)))
                     return
@@ -261,48 +276,48 @@ class BluetoothLink(private val context: Context) {
                 }
                 writeChar = writable
                 notifyChar = notify
+                if (desired == Family.BAOFENG_DONLGE && pair.service.uuid == tidService &&
+                    writable.uuid == tidDataTx && notify.uuid == tidDataRx) {
+                    controlWrite = pair.service.getCharacteristic(tidAuxTx)
+                    controlNotify = pair.service.getCharacteristic(tidAuxRx)
+                    if (!hasTidradioControl) {
+                        deliver(Result.failure(IOException("TD-BL1 control characteristics missing")))
+                        return
+                    }
+                }
                 received.clear()
-                if (!g.setCharacteristicNotification(notify, true)) {
-                    deliver(Result.failure(IOException("Could not enable notifications")))
-                    return
-                }
-                val cccd = notify.getDescriptor(uuidCccd)
-                if (cccd == null) {
-                    deliver(Result.failure(IOException("CCCD missing; notification activation unverified")))
-                    return
-                }
-                val value = if (notify.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY != 0)
-                    BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-                else BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
-                val scheduled = if (Build.VERSION.SDK_INT >= 33)
-                    g.writeDescriptor(cccd, value) == BluetoothStatusCodes.SUCCESS
-                else {
-                    @Suppress("DEPRECATION")
-                    cccd.value = value
-                    @Suppress("DEPRECATION")
-                    g.writeDescriptor(cccd)
-                }
-                if (!scheduled) deliver(Result.failure(IOException("CCCD write failed")))
+                if (!subscribe(g, notify))
+                    deliver(Result.failure(IOException("Data notification subscription failed")))
             }
             override fun onDescriptorWrite(g: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
-                if (closed.get()) return
-                if (status == BluetoothGatt.GATT_SUCCESS) {
-                    ready = true
-                    deliver(Result.success("BLE transport connected; radio read/authentication still unverified.\nUART service: " + (notifyChar?.service?.uuid ?: "?")))
-                } else deliver(Result.failure(IOException("CCCD subscribe failed: " + status)))
+                if (closed.get() || gatt !== g) return
+                if (descriptor.uuid != uuidCccd) return
+                if (status != BluetoothGatt.GATT_SUCCESS) {
+                    deliver(Result.failure(IOException("CCCD subscribe failed: " + status)))
+                    return
+                }
+                val control = controlNotify
+                if (descriptor.characteristic.uuid == notifyChar?.uuid && control != null) {
+                    if (!subscribe(g, control))
+                        deliver(Result.failure(IOException("TD-BL1 control subscription failed")))
+                    return
+                }
+                if (descriptor.characteristic.uuid != (control?.uuid ?: notifyChar?.uuid)) return
+                ready = true
+                deliver(Result.success("BLE transport connected. UART service: " + (notifyChar?.service?.uuid ?: "?")))
             }
             override fun onCharacteristicChanged(
                 g: BluetoothGatt, characteristic: BluetoothGattCharacteristic, value: ByteArray
             ) {
-                if (characteristic.uuid == notifyChar?.uuid)
-                    for (v in value) received.offer(v.toInt() and 255)
+                if (gatt === g && !closed.get()) routeNotification(characteristic.uuid, value)
             }
             @Suppress("DEPRECATION")
             override fun onCharacteristicChanged(g: BluetoothGatt, c: BluetoothGattCharacteristic) {
-                if (Build.VERSION.SDK_INT < 33 && c.uuid == notifyChar?.uuid)
-                    for (v in c.value ?: byteArrayOf()) received.offer(v.toInt() and 255)
+                if (Build.VERSION.SDK_INT < 33 && gatt === g && !closed.get())
+                    routeNotification(c.uuid, c.value ?: byteArrayOf())
             }
             override fun onCharacteristicWrite(g: BluetoothGatt, c: BluetoothGattCharacteristic, status: Int) {
+                if (gatt !== g || c.uuid != writeChar?.uuid || closed.get()) return
                 writeOk = status == BluetoothGatt.GATT_SUCCESS
                 writeLatch?.countDown()
             }
@@ -311,11 +326,67 @@ class BluetoothLink(private val context: Context) {
         catch (e: Exception) { deliver(Result.failure(e)) }
     }
 
+    private fun subscribe(g: BluetoothGatt, c: BluetoothGattCharacteristic): Boolean {
+        if (!g.setCharacteristicNotification(c, true)) return false
+        val descriptor = c.getDescriptor(uuidCccd) ?: return false
+        val value = if (c.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY != 0)
+            BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+        else BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
+        return if (Build.VERSION.SDK_INT >= 33)
+            g.writeDescriptor(descriptor, value) == BluetoothStatusCodes.SUCCESS
+        else {
+            @Suppress("DEPRECATION")
+            descriptor.value = value
+            @Suppress("DEPRECATION")
+            g.writeDescriptor(descriptor)
+        }
+    }
+
+    private fun routeNotification(uuid: UUID, value: ByteArray) {
+        when (uuid) {
+            notifyChar?.uuid -> for (v in value) received.offer(v.toInt() and 255)
+            controlNotify?.uuid -> controlReceived.offer(value.copyOf())
+        }
+    }
+
+    // Captured TD-BL1 AT commands use ATT Write Command (without response).
+    // The independent FF21 notification supplies the application-level reply.
+    @Synchronized
+    fun sendAdapterCommand(command: String) {
+        val g = gatt ?: throw IOException("Adapter not connected")
+        val c = controlWrite ?: throw IOException("Adapter control unavailable")
+        if (!ready || closed.get()) throw IOException("Adapter control link not ready")
+        require(command in setOf("AT+BAUD?]", "AT+BAUD=2]", "AT+BAUD=7]", "AT+RST]"))
+        require(c.properties and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE != 0)
+        controlReceived.clear()
+        val bytes = command.toByteArray(Charsets.US_ASCII)
+        val accepted = if (Build.VERSION.SDK_INT >= 33)
+            g.writeCharacteristic(c, bytes, BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE) == BluetoothStatusCodes.SUCCESS
+        else {
+            @Suppress("DEPRECATION")
+            c.value = bytes
+            c.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+            @Suppress("DEPRECATION")
+            g.writeCharacteristic(c)
+        }
+        if (!accepted) throw IOException("Adapter rejected control command " + command)
+    }
+
+    fun adapterReply(timeoutMs: Long): ByteArray? =
+        controlReceived.poll(timeoutMs, TimeUnit.MILLISECONDS)
+
+    fun recordBaud(baud: Int) {
+        if (!ready || closed.get()) throw IOException("Adapter disconnected before baud confirmation")
+        confirmedBaud = baud
+        lastGattReport += "\nTD-BL1 UART confirmed: " + baud + " baud"
+    }
+
     @Synchronized
     fun write(bytes: ByteArray) {
         val g = gatt ?: throw IOException("Not connected")
         val ch = writeChar ?: throw IOException("No writable BLE characteristic")
         if (!ready || closed.get()) throw IOException("Bluetooth link is not ready")
+        if (hasTidradioControl && confirmedBaud == null) throw IOException("TD-BL1 UART baud not confirmed")
         var off = 0
         while (off < bytes.size) {
             val count = minOf(bytes.size - off, chunkSize)
@@ -375,11 +446,15 @@ class BluetoothLink(private val context: Context) {
         stopScan()
         closed.set(true)
         ready = false
+        confirmedBaud = null
         writeLatch?.countDown()
         try { gatt?.disconnect() } catch (_: Exception) {}
         try { gatt?.close() } catch (_: Exception) {}
         gatt = null; writeChar = null; notifyChar = null
+        controlWrite = null; controlNotify = null
+        controlReceived.clear()
         received.clear()
+        chunkSize = 20
     }
 }
 
