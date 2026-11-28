@@ -39,6 +39,8 @@ class RadioProgrammingActivity : Activity() {
     private lateinit var devices: LinearLayout
     private lateinit var readButton: Button
     private lateinit var writeButton: Button
+    private lateinit var settingsButton: Button
+    private lateinit var memoryButton: Button
     private lateinit var radioGroup: RadioGroup
     private val models = listOf("UV-5R", "UV-5RM")
     private var model = models.first()
@@ -110,6 +112,18 @@ class RadioProgrammingActivity : Activity() {
             setOnClickListener { confirmWrite() }
         }
         root.addView(writeButton)
+        memoryButton = Button(this).apply {
+            text = "Inspect radio memories"
+            isEnabled = false
+            setOnClickListener { showMemories() }
+        }
+        root.addView(memoryButton)
+        settingsButton = Button(this).apply {
+            text = "Radio settings / DTMF presets"
+            isEnabled = false
+            setOnClickListener { showSettings() }
+        }
+        root.addView(settingsButton)
         root.addView(Button(this).apply {
             text = "Copy Bluetooth service diagnostics"
             isAllCaps = false
@@ -134,6 +148,8 @@ class RadioProgrammingActivity : Activity() {
         readModel = null
         if (::writeButton.isInitialized) writeButton.isEnabled = false
         if (::readButton.isInitialized) readButton.isEnabled = false
+        if (::settingsButton.isInitialized) settingsButton.isEnabled = false
+        if (::memoryButton.isInitialized) memoryButton.isEnabled = false
     }
     private fun setStatus(text: String) = runOnUiThread { status.text = text }
     private fun permissions(): Boolean {
@@ -218,6 +234,8 @@ class RadioProgrammingActivity : Activity() {
         for (i in 0 until radioGroup.childCount) radioGroup.getChildAt(i).isEnabled = false
         readButton.isEnabled = false
         writeButton.isEnabled = false
+        settingsButton.isEnabled = false
+        memoryButton.isEnabled = false
         setStatus(label)
         task.submit {
             try { body() }
@@ -244,6 +262,8 @@ class RadioProgrammingActivity : Activity() {
                     readButton.isEnabled = configured
                     writeButton.isEnabled = configured && readModel == model &&
                         backupFile?.exists() == true
+                    settingsButton.isEnabled = writeButton.isEnabled && baofengBackup != null
+                    memoryButton.isEnabled = baofengBackup != null
                 }
             }
         }
@@ -297,6 +317,116 @@ class RadioProgrammingActivity : Activity() {
             }
         }
     }
+    private fun showMemories() {
+        val memories = baofengBackup?.optJSONArray("channels") ?: return
+        val list = (0 until memories.length()).map { i ->
+            val c = Channel.parse(memories.getJSONObject(i))
+            c.slot.toString() + "  " + c.name + "  " + c.receive + " MHz  " + c.mode +
+                (c.transmit?.let { " TX " + it } ?: " RX ONLY") +
+                (c.txCtcss?.let { " TX CTCSS " + it } ?: "") +
+                (c.txDcs?.let { " TX DCS " + it } ?: "")
+        }
+        AlertDialog.Builder(this).setTitle("Radio memories (" + list.size + ")")
+            .setItems(list.toTypedArray(), null).setPositiveButton("Close", null).show()
+    }
+
+    private fun showSettings() {
+        if (busy || readModel != model || !link.ready) return
+        val snapshot = baofengBackup ?: return
+        val arr = snapshot.optJSONArray("settings") ?: JSONArray()
+        if (arr.length() == 0) {
+            AlertDialog.Builder(this).setTitle("Settings unavailable")
+                .setMessage(snapshot.optString("settings_error").ifBlank { "Driver reported no supported operator settings." })
+                .setPositiveButton("OK", null).show()
+            return
+        }
+        val panel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(24, 12, 24, 12)
+        }
+        val getters = linkedMapOf<String, () -> String>()
+        val previous = linkedMapOf<String, String>()
+        for (i in 0 until arr.length()) {
+            val setting = arr.getJSONObject(i)
+            val key = setting.getString("key")
+            val value = setting.getString("value")
+            previous[key] = value
+            panel.addView(TextView(this).apply { text = setting.getString("label"); setPadding(0, 12, 0, 2) })
+            if (setting.getString("kind") == "choice") {
+                val options = setting.getJSONArray("options")
+                val values = (0 until options.length()).map { options.getString(it) }
+                val spinner = android.widget.Spinner(this)
+                spinner.adapter = android.widget.ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, values)
+                spinner.setSelection(values.indexOf(value).coerceAtLeast(0))
+                panel.addView(spinner)
+                getters[key] = { spinner.selectedItem?.toString() ?: value }
+            } else {
+                val field = android.widget.EditText(this).apply {
+                    setSingleLine(true)
+                    setText(value)
+                    if (setting.getString("kind") == "integer") {
+                        inputType = android.text.InputType.TYPE_CLASS_NUMBER or android.text.InputType.TYPE_NUMBER_FLAG_SIGNED
+                        hint = setting.optInt("min").toString() + "–" + setting.optInt("max")
+                    } else filters = arrayOf(android.text.InputFilter.LengthFilter(setting.optInt("max", 32)))
+                }
+                panel.addView(field)
+                getters[key] = { field.text.toString() }
+            }
+        }
+        val scroll = ScrollView(this).apply { addView(panel) }
+        AlertDialog.Builder(this).setTitle("Model-specific radio settings")
+            .setView(scroll).setNegativeButton("Cancel", null)
+            .setPositiveButton("Review changes") { _, _ ->
+                val changes = JSONObject()
+                val summary = mutableListOf<String>()
+                for ((key, get) in getters) {
+                    val next = get()
+                    if (next != previous[key]) {
+                        changes.put(key, next)
+                        summary.add(key + ": " + previous[key] + " → " + next)
+                    }
+                }
+                if (changes.length() == 0) return@setPositiveButton
+                AlertDialog.Builder(this).setTitle("Write " + changes.length() + " settings?")
+                    .setMessage(summary.joinToString("\n"))
+                    .setNegativeButton("Cancel", null)
+                    .setPositiveButton("Write + verify") { _, _ -> writeSettings(snapshot, changes) }.show()
+            }.show()
+    }
+
+    private fun writeSettings(snapshot: JSONObject, changes: JSONObject) {
+        if (busy || !link.ready || readModel != model || backupFile?.exists() != true ||
+            baofengBackup !== snapshot) return
+        val target = model
+        worker("Writing settings — keep radio connected...") {
+            python().callAttr("write_settings", target, snapshot.getString("sha256"), changes.toString())
+            try {
+                val readback = JSONObject(python().callAttr("read_radio", target, true).toString())
+                val arr = readback.getJSONArray("settings")
+                val actual = (0 until arr.length()).associate { i ->
+                    val row = arr.getJSONObject(i)
+                    row.getString("key") to row.getString("value")
+                }
+                val keys = changes.keys().asSequence().toList()
+                val mismatch = keys.filter { actual[it] != changes.getString(it).trimEnd() }
+                if (mismatch.isNotEmpty()) error("Settings mismatch: " + mismatch.joinToString())
+                val previous = snapshot.getJSONArray("channels")
+                val current = readback.getJSONArray("channels")
+                val oldChannels = (0 until previous.length()).map { Channel.parse(previous.getJSONObject(it)) }
+                val newChannels = (0 until current.length()).map { Channel.parse(current.getJSONObject(it)) }
+                val differences = ChirpCsv.diff(oldChannels, newChannels)
+                if (differences.isNotEmpty() || previous.length() != current.length())
+                    error("Memory changes detected after settings write: " + differences.take(5).joinToString())
+                // Keep the original file; require a fresh backup for any later write.
+                baofengBackup = readback
+                readModel = null
+                setStatus("VERIFIED " + keys.size + " settings on " + target + ". Original backup retained; read again before another write.")
+            } catch (e: Exception) {
+                throw VerificationFailure(e)
+            }
+        }
+    }
+
     private fun confirmWrite() {
         if (busy || !link.ready || readModel != model || backupFile?.exists() != true) {
             setStatus("Read and back up this specific radio before writing.")
