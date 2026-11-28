@@ -4,6 +4,9 @@ import android.Manifest
 import android.app.Activity
 import android.app.AlertDialog
 import android.bluetooth.BluetoothDevice
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.os.Build
@@ -99,6 +102,16 @@ class RadioProgrammingActivity : Activity() {
             setOnClickListener { confirmWrite() }
         }
         root.addView(writeButton)
+        root.addView(Button(this).apply {
+            text = "Copy Bluetooth service diagnostics"
+            isAllCaps = false
+            setOnClickListener {
+                val diagnostic = link.lastGattReport
+                val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                clipboard.setPrimaryClip(ClipData.newPlainText("Radio BLE services", diagnostic))
+                setStatus("Copied GATT diagnostic report. Paste the report into our chat.")
+            }
+        })
         status = header("Choose a model and scan.", 13f)
         root.addView(status)
         setContentView(root)
@@ -149,7 +162,8 @@ class RadioProgrammingActivity : Activity() {
                 readButton.isEnabled = true
                 writeButton.isEnabled = false
             }, { error ->
-                setStatus("Connection failed: " + error.message)
+                setStatus("Connection failed: " + error.message +
+                    "\nTap Copy Bluetooth service diagnostics to share detected service UUIDs.")
             })
         }
     }
