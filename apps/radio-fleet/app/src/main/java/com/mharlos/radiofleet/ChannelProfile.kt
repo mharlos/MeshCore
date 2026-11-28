@@ -59,7 +59,7 @@ data class FleetRadio(val id: String, val label: String, val model: String, val 
 }
 object StarterProfile {
     // Example values from farm planning; verify each repeater with its operator.
-    val channels = listOf(
+    private val base = listOf(
         Channel(1, "MEISS", 146.880, 146.280, 114.8),
         Channel(2, "WARREN", 146.680, 146.080, 114.8),
         Channel(3, "LONGVW", 440.375, 445.375, 123.0),
@@ -68,6 +68,26 @@ object StarterProfile {
         Channel(5, "RT22RX", 462.6625, null, narrow = true, power = "Low"),
         Channel(6, "CALL2M", 146.520, 146.520)
     )
+    // Twenty slots between requested starting points, but 22 channels per service.
+    // Keep 50/70/90 anchors and place the four overflow simplex entries at 98–101.
+    val serviceChannels: List<Channel> get() {
+        val frs = FrequencyCatalog.groups.getValue("FRS simplex (22)")
+        val gmrs = FrequencyCatalog.groups.getValue("GMRS simplex (22)")
+        val repeaters = FrequencyCatalog.groups.getValue("GMRS repeaters (8)")
+        return frs.mapIndexed { i, c -> c.copy(slot = if (i < 20) 50+i else 98+i-20) } +
+            gmrs.mapIndexed { i, c -> c.copy(slot = if (i < 20) 70+i else 100+i-20) } +
+            repeaters.mapIndexed { i, c -> c.copy(slot = 90+i) }
+    }
+    val channels: List<Channel> get() = (base + serviceChannels).sortedBy { it.slot }
+
+    // Never silently overwrite a saved custom memory; leave conflicting defaults
+    // uninstalled until the operator explicitly applies the reserved layout.
+    fun mergeMissing(existing: List<Channel>): List<Channel> {
+        val used = existing.map { it.slot }.toSet()
+        return (existing + serviceChannels.filter { c -> c.slot !in used &&
+            existing.none { it.name.equals(c.name, true) && it.service == c.service } })
+            .sortedBy { it.slot }
+    }
 }
 /** CHIRP CSV is portable between distinct CHIRP radio drivers, unlike raw radio images. */
 object ChirpCsv {
@@ -205,12 +225,20 @@ class FleetStore(context: Context) {
     fun channels(): List<Channel> {
         val json = prefs.getString("channels", null) ?: return StarterProfile.channels
         val array = JSONArray(json)
-        return (0 until array.length()).map { Channel.parse(array.getJSONObject(it)) }
+        val existing = (0 until array.length()).map { Channel.parse(array.getJSONObject(it)) }
+        if (!prefs.getBoolean("service_defaults_v1", false)) {
+            val merged = StarterProfile.mergeMissing(existing)
+            prefs.edit().putString("pre_service_defaults_backup", json)
+                .putBoolean("service_defaults_v1", true).apply()
+            saveChannels(merged)
+            return merged
+        }
+        return existing
     }
     fun saveChannels(channels: List<Channel>) {
         val arr = JSONArray()
         channels.sortedBy { it.slot }.forEach { arr.put(it.json()) }
-        prefs.edit().putString("channels", arr.toString()).apply()
+        prefs.edit().putString("channels", arr.toString()).putBoolean("service_defaults_v1", true).apply()
     }
     fun radios(): List<FleetRadio> {
         val arr = JSONArray(prefs.getString("radios", "[]")!!)
