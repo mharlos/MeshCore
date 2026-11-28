@@ -77,13 +77,17 @@ class MainActivity : Activity() {
         ))
         val currentHash = ChirpCsv.fingerprint(channels)
         host.addView(label("Master revision " + currentHash + "  •  " + channels.size + " memories", 13f, muted))
+        section(host, "DISCOVER & TOOLS")
+        addButton(host, "Frequency library — browse and add") { showLibrary() }
+        addButton(host, "Nearby repeater finder") { findRepeaters() }
+        addButton(host, "DTMF code builder") { dtmfBuilder() }
         section(host, "MASTER CHANNEL PLAN")
         for (channel in channels.sortedBy { it.slot }) {
             val rx = String.format(Locale.US, "%.5f", channel.receive)
             val tx = channel.transmit?.let { String.format(Locale.US, "%.5f", it) } ?: "RX ONLY"
             val tones = channel.txCtcss?.toString() ?: "OFF"
             addButton(host, String.format(Locale.US, "%03d", channel.slot) + "  " +
-                channel.name + "  |  RX " + rx + "  TX " + tx + "  CT " + tones) {
+                channel.name + "  |  " + channel.service + "  " + channel.mode + "\nRX " + rx + "  TX " + tx + "  CT " + tones + (channel.txDcs?.let { " DCS " + it } ?: "")) {
                 edit(channel)
             }
         }
@@ -131,20 +135,21 @@ class MainActivity : Activity() {
 
     private fun edit(channel: Channel?) {
         val host = stack()
-        val captions = listOf("Memory slot (0–127)", "Channel name (7 chars max)",
+        val captions = listOf("Memory slot (1–127 shared)", "Channel name (12 chars max; UV-5R uses 7)",
             "Receive MHz", "Transmit MHz (blank = receive only)",
             "Transmit CTCSS Hz (blank = OFF)", "Receive CTCSS Hz (blank = OFF)",
-            "Bandwidth: FM or NFM", "Power: High or Low")
+            "Modulation: FM, NFM or AM", "Power: High, Medium or Low", "TX DCS (blank = OFF)", "RX DCS (blank = OFF)", "DCS polarity (NN, NR, RN, RR)", "Service category", "Description")
         val initial = listOf(
-            (channel?.slot ?: ((channels.maxOfOrNull { it.slot } ?: 0) + 1)).toString(),
+            (channel?.slot ?: ((1..127).firstOrNull { n -> channels.none { it.slot == n } } ?: 128)).toString(),
             channel?.name ?: "", channel?.receive?.toString() ?: "",
             channel?.transmit?.toString() ?: "", channel?.txCtcss?.toString() ?: "",
-            channel?.rxCtcss?.toString() ?: "", if (channel?.narrow == true) "NFM" else "FM",
-            channel?.power ?: "High"
+            channel?.rxCtcss?.toString() ?: "", channel?.mode ?: "FM",
+            channel?.power ?: "High", channel?.txDcs?.toString() ?: "", channel?.rxDcs?.toString() ?: "",
+            channel?.dcsPolarity ?: "NN", channel?.service ?: "Custom", channel?.description ?: ""
         )
         val fields = captions.indices.map { index ->
             host.addView(label(captions[index], 12f, Color.DKGRAY))
-            input(initial[index], index in listOf(0, 2, 3, 4, 5)).also { host.addView(it) }
+            input(initial[index], index in listOf(0, 2, 3, 4, 5, 8, 9)).also { host.addView(it) }
         }
         val scroll = ScrollView(this).apply { addView(host) }
         AlertDialog.Builder(this).setTitle("Edit memory").setView(scroll)
@@ -156,22 +161,129 @@ class MainActivity : Activity() {
                 try {
                     val v = fields.map { it.text.toString().trim() }
                     val slot = v[0].toInt()
-                    require(slot in 0..127) { "Memory must be 0–127" }
+                    require(slot in 1..127 || channel?.slot == 0 && slot == 0) { "Memory must be 1–127" }
+                    require(channels.none { it.slot == slot && it.slot != channel?.slot }) { "Slot already occupied" }
                     val name = v[1].uppercase(Locale.US)
-                    require(name.isNotBlank() && name.length <= 7) { "Name must be 1–7 characters" }
+                    require(name.isNotBlank() && name.length <= 12) { "Name must be 1–12 characters" }
                     val receive = v[2].toDouble()
                     val transmit = v[3].takeIf { it.isNotBlank() }?.toDouble()
                     require(receive in 1.0..999.0 && (transmit == null || transmit in 1.0..999.0))
-                    val narrow = v[6].uppercase(Locale.US) == "NFM"
-                    val next = Channel(slot, name, receive, transmit,
-                        v[4].takeIf { it.isNotBlank() }?.toDouble(),
-                        v[5].takeIf { it.isNotBlank() }?.toDouble(),
-                        narrow, if (v[7].equals("low", true)) "Low" else "High")
+                    val mode = v[6].uppercase(Locale.US)
+                    require(mode in listOf("FM", "NFM", "AM"))
+                    require(transmit == null || (mode != "AM" && (transmit in 144.0..148.0 || transmit in 420.0..450.0))) { "Non-amateur transmit must be blank" }
+                    val power = v[7].lowercase(Locale.US).replaceFirstChar { it.uppercase() }
+                    require(power in listOf("Low","Medium","High"))
+                    val txTone = v[4].takeIf { it.isNotBlank() }?.toDouble()
+                    val rxTone = v[5].takeIf { it.isNotBlank() }?.toDouble()
+                    val txDcs = v[8].takeIf { it.isNotBlank() }?.toInt()
+                    val rxDcs = v[9].takeIf { it.isNotBlank() }?.toInt()
+                    require(txTone == null || txDcs == null) { "Choose TX CTCSS or DCS" }
+                    require(rxTone == null || rxDcs == null) { "Choose RX CTCSS or DCS" }
+                    require(v[10] in listOf("NN","NR","RN","RR")) { "Invalid DCS polarity" }
+                    val next = Channel(slot, name, receive, transmit, txTone, rxTone,
+                        mode == "NFM", power, mode, txDcs, rxDcs, v[10], v[11], v[12])
                     channels.removeAll { it.slot == slot || (channel != null && it.slot == channel.slot) }
                     channels.add(next)
                     save()
                 } catch (e: Exception) { message("Invalid memory", e.message ?: "Invalid fields") }
             }.show()
+    }
+
+    private fun showLibrary() {
+        val keys = FrequencyCatalog.groups.keys.toList()
+        AlertDialog.Builder(this).setTitle("US frequency library")
+            .setItems(keys.toTypedArray()) { _, index ->
+                val list = FrequencyCatalog.groups.getValue(keys[index])
+                chooseCatalog(keys[index], list)
+            }.setNegativeButton("Close", null).show()
+    }
+
+    private fun chooseCatalog(title: String, list: List<Channel>) {
+        val selected = BooleanArray(list.size)
+        val labels = list.map { c ->
+            c.name + "  " + String.format(Locale.US, "%.5f", c.receive) + " " + c.mode +
+                (if (c.transmit == null) " RX ONLY" else " TX " + c.transmit) + "\n" + c.description
+        }.toTypedArray()
+        if (list.isEmpty()) { message(title, "No matching entries."); return }
+        fun add(items: List<Channel>) {
+            val before = channels.size
+            channels = FrequencyCatalog.append(channels, items).toMutableList()
+            save()
+            message(title, "Added " + (channels.size - before) + " memories. Existing slots preserved. " +
+                "Duplicates, unsupported references and entries beyond available capacity skipped.")
+        }
+        AlertDialog.Builder(this).setTitle(title)
+            .setMultiChoiceItems(labels, selected) { _, index, checked -> selected[index] = checked }
+            .setPositiveButton("Add selected") { _, _ -> add(list.filterIndexed { i, _ -> selected[i] }) }
+            .setNeutralButton("Add all") { _, _ -> add(list) }
+            .setNegativeButton("Cancel", null).show()
+    }
+
+    private fun findRepeaters() {
+        val host = stack()
+        host.addView(label("City or ZIP (geocoded; no GPS permission required)", 13f, Color.DKGRAY))
+        val location = input("Rainier, Oregon, USA")
+        host.addView(location)
+        host.addView(label("Radius miles", 13f, Color.DKGRAY))
+        val radius = input("50", true)
+        host.addView(radius)
+        host.addView(label("Optional callsign filter", 13f, Color.DKGRAY))
+        val filter = input("")
+        host.addView(filter)
+        AlertDialog.Builder(this).setTitle("Nearby repeaters — HearHam")
+            .setView(host).setNegativeButton("Cancel", null)
+            .setPositiveButton("Search") { _, _ ->
+                val city = location.text.toString().trim()
+                val miles = radius.text.toString().toDoubleOrNull()
+                val query = filter.text.toString().trim()
+                if (city.isBlank() || miles == null || miles !in 1.0..200.0) {
+                    message("Invalid search", "Enter a city or ZIP and radius 1–200 miles.")
+                } else {
+                    val progress = android.app.ProgressDialog.show(this, "Repeater finder",
+                        "Resolving location and loading directory…", true, false)
+                    Thread {
+                        try {
+                            val result = RepeaterDirectory.search(this, city, miles, query)
+                            runOnUiThread {
+                                if (!isFinishing) { progress.dismiss(); chooseCatalog(result.first, result.second) }
+                            }
+                        } catch (e: Exception) {
+                            runOnUiThread {
+                                if (!isFinishing) { progress.dismiss(); message("Repeater search failed", e.message ?: "Unknown error") }
+                            }
+                        }
+                    }.start()
+                }
+            }.show()
+    }
+
+    private fun dtmfBuilder() {
+        val host = stack()
+        val digits = input("")
+        digits.filters = arrayOf(android.text.InputFilter.LengthFilter(32))
+        host.addView(label("DTMF sequence (reference / radio keypad)", 13f, Color.DKGRAY))
+        host.addView(digits)
+        val keys = listOf("123A", "456B", "789C", "*0#D")
+        for (line in keys) {
+            val row = LinearLayout(this)
+            for (key in line) {
+                val button = Button(this).apply {
+                    text = key.toString()
+                    setOnClickListener { if (digits.length() < 32) digits.append(key.toString()) }
+                }
+                row.addView(button, LinearLayout.LayoutParams(0, -2, 1f))
+            }
+            host.addView(row)
+        }
+        AlertDialog.Builder(this).setTitle("DTMF code builder").setView(host)
+            .setNeutralButton("Clear") { _, _ -> dtmfBuilder() }
+            .setPositiveButton("Copy") { _, _ ->
+                val text = digits.text.toString().uppercase(Locale.US)
+                if (text.all { it in "0123456789ABCD*#" }) {
+                    (getSystemService(CLIPBOARD_SERVICE) as android.content.ClipboardManager)
+                        .setPrimaryClip(android.content.ClipData.newPlainText("DTMF", text))
+                } else message("Invalid DTMF", "Use 0–9, A–D, * or #.")
+            }.setNegativeButton("Close", null).show()
     }
 
     private fun addRadio() {
