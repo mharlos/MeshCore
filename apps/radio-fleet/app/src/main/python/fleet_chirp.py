@@ -11,6 +11,8 @@ import hashlib
 import importlib
 import json
 import math
+import logging
+import traceback
 from java import jclass
 
 # Build workflow copies the GPL CHIRP package here from RadioDroid's vendored
@@ -20,6 +22,24 @@ for driver in ("uv5r", "baofeng_uv17Pro"):
 
 from chirp import chirp_common, directory
 RadioIo = jclass("com.mharlos.radiofleet.RadioIo")
+LOG = logging.getLogger("radiofleet.chirp")
+
+class _DriverErrors(logging.Handler):
+    """Only collect errors and stack traces; never channel/EERPOM contents."""
+    def __init__(self):
+        super().__init__(level=logging.ERROR)
+        self.messages = []
+    def emit(self, record):
+        try:
+            message = record.getMessage()
+            if record.exc_info:
+                pieces = traceback.format_exception(*record.exc_info)
+                # Include error type and last meaningful Python frame.
+                message += " | " + "".join(pieces)[-1500:]
+            self.messages.append(message[-1800:])
+        except Exception:
+            pass
+
 
 MODELS = {
     "UV-5R": ("Baofeng", "UV-5R"),
@@ -31,19 +51,48 @@ class AndroidPipe:
     def __init__(self):
         self.timeout = 3.0
         self.baudrate = 9600
+        self.read_calls = 0
+        self.write_calls = 0
+        self.rx_bytes = 0
+        self.tx_bytes = 0
+        self.last_io = "initialized"
         self.parity = "N"
         self.rts = False
         self.dtr = False
         self.is_open = True
 
     def read(self, size=1):
-        raw = RadioIo.read(int(size), max(1, int(float(self.timeout or 1) * 1000)))
-        return bytes((int(item) & 255 for item in raw))
+        self.read_calls += 1
+        requested = int(size)
+        timeout_ms = max(1, int(float(self.timeout or 1) * 1000))
+        raw = RadioIo.read(requested, timeout_ms)
+        result = bytes((int(item) & 255 for item in raw))
+        self.rx_bytes += len(result)
+        self.last_io = "read %d/%d bytes, timeout %d ms" % (
+            len(result), requested, timeout_ms)
+        return result
 
     def write(self, data):
         payload = bytes(data)
+        self.write_calls += 1
+        self.last_io = "writing %d bytes" % len(payload)
         RadioIo.write(payload)
+        self.tx_bytes += len(payload)
+        self.last_io = "wrote %d bytes" % len(payload)
         return len(payload)
+
+    def log(self, message, *args):
+        """CHIRP Baofeng driver calls pipe.log() when cloning blocks.
+
+        Missing method was raising AttributeError, then masked by CHIRP as
+        'Unexpected error communicating with the radio'.
+        """
+        LOG.debug("%s", message)
+
+    def diagnostic(self):
+        return ("baud=%d tx=%d bytes (%d calls) rx=%d bytes (%d calls); last=%s" %
+                (self.baudrate, self.tx_bytes, self.write_calls,
+                 self.rx_bytes, self.read_calls, self.last_io))
 
     def flush(self):
         return None
@@ -78,13 +127,32 @@ def _sync_in(model):
     cls = _class(model)
     radio = cls(None)
     radio.pipe = AndroidPipe()
+    # UV-5RM CHIRP driver requests 115200; UV-5R requests 9600.
+    # This sets the expected UART speed in diagnostics. The TD-BL1 adapter
+    # may also require a separate OEM baud-control command; do not assume
+    # that changing a Python property switches the hardware serial clock.
+    radio.pipe.baudrate = int(getattr(cls, "BAUD_RATE", 9600))
     radio.pipe.timeout = 5.0
+    capture = _DriverErrors()
+    driver_logger = logging.getLogger("chirp.drivers.baofeng_uv17Pro")
+    driver_logger.addHandler(capture)
     try:
         radio.sync_in()
         return radio
-    except BaseException:
+    except Exception as error:
+        diag = radio.pipe.diagnostic()
+        underlying = capture.messages[-1] if capture.messages else ""
+        # Show the genuine exception that CHIRP masks during sync_in.
+        # Redact potentially sensitive binary payloads by never logging bytes.
+        underlying = underlying.replace("\\x", "0x")
+        message = ("%s: %s | %s" % (
+            type(error).__name__, str(error), diag))
+        if underlying:
+            message += " | driver: " + underlying[-1200:]
+        raise RuntimeError(message[:2000]) from error
+    finally:
+        driver_logger.removeHandler(capture)
         radio.pipe.close()
-        raise
 
 def _image(radio):
     mmap = radio.get_mmap()
