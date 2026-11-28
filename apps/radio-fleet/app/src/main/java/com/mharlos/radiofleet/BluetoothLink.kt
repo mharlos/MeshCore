@@ -62,6 +62,15 @@ class BluetoothLink(private val context: Context) {
         UUID.fromString("0000ff00-0000-1000-8000-00805f9b34fb"),
         UUID.fromString("0000fff0-0000-1000-8000-00805f9b34fb")
     )
+    // TIDRADIO KIT firmware exposes two data-looking paths in the FF00 service.
+    // FF01 notify + FF02 write is the documented transparent BLE-UART channel.
+    // FF21 notify + FF22 write is a separate OEM/control path; do not mistake
+    // cross-paired FF01/FF22 or FF21/FF02 for valid serial transports.
+    private val tidService = UUID.fromString("0000ff00-0000-1000-8000-00805f9b34fb")
+    private val tidDataRx = UUID.fromString("0000ff01-0000-1000-8000-00805f9b34fb")
+    private val tidDataTx = UUID.fromString("0000ff02-0000-1000-8000-00805f9b34fb")
+    private val tidAuxRx = UUID.fromString("0000ff21-0000-1000-8000-00805f9b34fb")
+    private val tidAuxTx = UUID.fromString("0000ff22-0000-1000-8000-00805f9b34fb")
     private val benshiService = UUID.fromString("00001100-d102-11e1-9b23-00025b00a5a5")
     private val benshiWrite = UUID.fromString("00001101-d102-11e1-9b23-00025b00a5a5")
     private val benshiNotify = UUID.fromString("00001102-d102-11e1-9b23-00025b00a5a5")
@@ -132,6 +141,32 @@ class BluetoothLink(private val context: Context) {
      * the Benshi protocol has explicit fixed UUIDs.
      */
     private fun findUart(services: List<BluetoothGattService>): UartPair? {
+        // First handle the specific TIDRADIO KIT layout supplied by the
+        // operator's BLE GATT report. Don't build a cross-product of two
+        // independent RX/TX channel pairs.
+        val tid = services.firstOrNull { it.uuid == tidService }
+        if (tid != null) {
+            val dataRx = tid.getCharacteristic(tidDataRx)
+            val dataTx = tid.getCharacteristic(tidDataTx)
+            if (dataRx != null && dataTx != null &&
+                dataRx.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY != 0 &&
+                dataRx.getDescriptor(uuidCccd) != null &&
+                dataTx.properties and (BluetoothGattCharacteristic.PROPERTY_WRITE or
+                    BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE) != 0
+            ) {
+                lastGattReport += "\\nTIDRADIO KIT: FF01 (RX notifications) / FF02 (TX writes) selected." +
+                    "\\nSecondary FF21/FF22 channel left untouched."
+                return UartPair(tid, dataTx, dataRx)
+            }
+            // FF21/FF22 alone is not proof of a transparent serial transport;
+            // give the operator the inventory report rather than writing to
+            // an OEM control path of unknown semantics.
+            if (tid.getCharacteristic(tidAuxRx) != null ||
+                tid.getCharacteristic(tidAuxTx) != null) {
+                lastGattReport += "\\nTIDRADIO: FF21/FF22 OEM channel present, no verified FF01/FF02 data pair."
+                return null
+            }
+        }
         val pairs = services.flatMap { service ->
             val writeChars = service.characteristics.filter {
                 it.properties and (BluetoothGattCharacteristic.PROPERTY_WRITE or
