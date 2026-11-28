@@ -28,26 +28,32 @@ class KissTerminalActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(20,20,20,20) }
-        val scroll = ScrollView(this).apply { addView(root) }
-        setContentView(scroll)
-        root.addView(TextView(this).apply {
-            textSize = 20f
-            text = "BTECH APRS / KISS terminal"
-        })
-        root.addView(TextView(this).apply {
-            text = "Pair the radio in Android Bluetooth settings, enable its KISS TNC, and select the appropriate amateur packet channel on the radio. No automatic RF transmissions."
-        })
-        root.addView(Button(this).apply { text = "Connect paired radio"; setOnClickListener { choose() } })
-        root.addView(Button(this).apply { text = "Disconnect"; setOnClickListener { closeSocket() } })
-        fun field(h: String) = EditText(this).apply { hint = h; setSingleLine(true); root.addView(this) }
-        call = field("Your amateur callsign / SSID")
-        to = field("Destination callsign / SSID")
-        body = field("APRS text (67 ASCII characters max)")
-        send = Button(this).apply { text = "Send APRS packet"; isEnabled = false; setOnClickListener { confirmSend() } }
-        root.addView(send)
-        log = TextView(this).apply { setTextIsSelectable(true); text = "Disconnected" }
-        root.addView(log)
+        window.statusBarColor=Deck.bg
+        window.navigationBarColor=Deck.bg
+        val root=Deck.stack(this,12).apply { setBackgroundColor(Deck.bg) }
+        setContentView(ScrollView(this).apply { setBackgroundColor(Deck.bg);addView(root) })
+        Deck.add(root,Deck.header(this,"APRS / KISS terminal"))
+        val link=Deck.card(this)
+        Deck.heading(link,"Classic Bluetooth link")
+        Deck.add(link,Deck.text(this,"Pair the radio in Android Bluetooth settings, enable KISS TNC and select an amateur packet channel.",13f,Deck.muted))
+        val row=Deck.row(this)
+        Deck.weighted(row,Deck.button(this,"Connect paired radio",Deck.cyan){choose()})
+        Deck.weighted(row,Deck.button(this,"Disconnect",Deck.amber){closeSocket()})
+        Deck.add(link,row,0);Deck.add(root,link)
+        val compose=Deck.card(this,Deck.pink)
+        Deck.heading(compose,"Compose APRS text",Deck.pink)
+        fun field(h:String)=EditText(this).apply {
+            hint=h;setSingleLine(true);Deck.field(this);Deck.add(compose,this)
+        }
+        call=field("Your amateur callsign / SSID")
+        to=field("Destination callsign / SSID")
+        body=field("APRS text (67 ASCII characters max)")
+        send=Deck.button(this,"Transmit APRS packet",Deck.pink){confirmSend()}.apply{isEnabled=false}
+        Deck.add(compose,send,0);Deck.add(root,compose)
+        val terminal=Deck.card(this,Deck.lime)
+        Deck.heading(terminal,"Packet activity",Deck.lime)
+        log=Deck.text(this,"Disconnected",12f,Deck.lime,true).apply{setTextIsSelectable(true)}
+        Deck.add(terminal,log,0);Deck.add(root,terminal)
     }
     private fun append(line: String) {
         runOnUiThread {
