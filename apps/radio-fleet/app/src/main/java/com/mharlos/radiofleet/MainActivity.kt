@@ -102,11 +102,11 @@ class MainActivity : Activity() {
             }
         }
         addButton(host, "+ Add / edit a channel") { edit(null) }
-        addButton(host, "Add missing default FRS / GMRS memories") {
+        addButton(host, "Add missing default regional / FRS / GMRS memories") {
             val before = channels.size
             channels = StarterProfile.mergeMissing(channels).toMutableList()
             save()
-            val conflicts = StarterProfile.serviceChannels.count { c -> channels.none { it.slot == c.slot && it.name == c.name } }
+            val conflicts = StarterProfile.reservedDefaults.count { c -> channels.none { it.slot == c.slot && it.name == c.name } }
             message("Default service channels", "Added " + (channels.size-before) + " missing memories. " + conflicts + " reserved slots differ; existing channels retained.")
         }
         addButton(host, "Export CHIRP CSV master") { exportCsv() }
