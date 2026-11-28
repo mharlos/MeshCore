@@ -77,6 +77,16 @@ class MainActivity : Activity() {
         ))
         val currentHash = ChirpCsv.fingerprint(channels)
         host.addView(label("Master revision " + currentHash + "  •  " + channels.size + " memories", 13f, muted))
+        section(host, "CONNECTED DEVICES")
+        addButton(host, "BTECH UV-PRO — native Bluetooth console") {
+            startActivity(Intent(this, DeviceConsoleActivity::class.java).putExtra("family", "benshi"))
+        }
+        addButton(host, "MeshCore — connect and message") {
+            startActivity(Intent(this, DeviceConsoleActivity::class.java).putExtra("family", "meshcore"))
+        }
+        addButton(host, "BTECH APRS / KISS packet terminal") {
+            startActivity(Intent(this, KissTerminalActivity::class.java))
+        }
         section(host, "DISCOVER & TOOLS")
         addButton(host, "Frequency library — browse and add") { showLibrary() }
         addButton(host, "Nearby repeater finder") { findRepeaters() }
@@ -92,6 +102,13 @@ class MainActivity : Activity() {
             }
         }
         addButton(host, "+ Add / edit a channel") { edit(null) }
+        addButton(host, "Add missing default FRS / GMRS memories") {
+            val before = channels.size
+            channels = StarterProfile.mergeMissing(channels).toMutableList()
+            save()
+            val conflicts = StarterProfile.serviceChannels.count { c -> channels.none { it.slot == c.slot && it.name == c.name } }
+            message("Default service channels", "Added " + (channels.size-before) + " missing memories. " + conflicts + " reserved slots differ; existing channels retained.")
+        }
         addButton(host, "Export CHIRP CSV master") { exportCsv() }
         addButton(host, "Import CHIRP CSV into master") { chooseCsv(REQUEST_IMPORT) }
         section(host, "RADIO INVENTORY")
