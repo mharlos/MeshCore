@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="FleetTheme" parent="android:style/Theme.Material.NoActionBar">
+        <item name="android:colorAccent">#31E7DC</item>
+        <item name="android:windowBackground">#050C12</item>
+        <item name="android:statusBarColor">#050C12</item>
+        <item name="android:navigationBarColor">#050C12</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowLightNavigationBar">false</item>
+        <item name="android:colorBackground">#0D1822</item>
+        <item name="android:textColorPrimary">#EBF7F9</item>
+        <item name="android:textColorSecondary">#97AFBA</item>
+        <item name="android:fontFamily">sans-serif</item>
+    </style>
+</resources>
