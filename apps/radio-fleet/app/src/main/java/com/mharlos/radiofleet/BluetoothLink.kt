@@ -35,7 +35,7 @@ import java.util.concurrent.atomic.AtomicBoolean
  */
 @SuppressLint("MissingPermission")
 class BluetoothLink(private val context: Context) {
-    enum class Family { BAOFENG_DONLGE, BENSHI_UVPRO }
+    enum class Family { BAOFENG_DONLGE, BENSHI_UVPRO, MESHCORE }
     @Volatile var lastGattReport: String = "No GATT discovery yet."
         private set
     data class Candidate(val device: BluetoothDevice, val name: String, val rssi: Int)
@@ -45,6 +45,7 @@ class BluetoothLink(private val context: Context) {
     @Volatile private var gatt: BluetoothGatt? = null
     private var controlWrite: BluetoothGattCharacteristic? = null
     private var controlNotify: BluetoothGattCharacteristic? = null
+    private val packets = LinkedBlockingQueue<ByteArray>(256)
     private val controlReceived = LinkedBlockingQueue<ByteArray>(64)
     val hasTidradioControl: Boolean get() = controlWrite != null && controlNotify != null
     @Volatile var confirmedBaud: Int? = null
@@ -77,6 +78,9 @@ class BluetoothLink(private val context: Context) {
     private val tidDataTx = UUID.fromString("0000ff02-0000-1000-8000-00805f9b34fb")
     private val tidAuxRx = UUID.fromString("0000ff21-0000-1000-8000-00805f9b34fb")
     private val tidAuxTx = UUID.fromString("0000ff22-0000-1000-8000-00805f9b34fb")
+    private val meshService = UUID.fromString("6e400001-b5a3-f393-e0a9-e50e24dcca9e")
+    private val meshWrite = UUID.fromString("6e400002-b5a3-f393-e0a9-e50e24dcca9e")
+    private val meshNotify = UUID.fromString("6e400003-b5a3-f393-e0a9-e50e24dcca9e")
     private val benshiService = UUID.fromString("00001100-d102-11e1-9b23-00025b00a5a5")
     private val benshiWrite = UUID.fromString("00001101-d102-11e1-9b23-00025b00a5a5")
     private val benshiNotify = UUID.fromString("00001102-d102-11e1-9b23-00025b00a5a5")
@@ -256,6 +260,13 @@ class BluetoothLink(private val context: Context) {
                         if (svc != null && write != null && notify != null)
                             UartPair(svc, write, notify) else null
                     }
+                    Family.MESHCORE -> {
+                        val svc = g.getService(meshService)
+                        val write = svc?.getCharacteristic(meshWrite)
+                        val notify = svc?.getCharacteristic(meshNotify)
+                        if (svc != null && write != null && notify != null)
+                            UartPair(svc, write, notify) else null
+                    }
                     Family.BAOFENG_DONLGE -> findUart(g.services)
                 }
                 if (pair == null) {
@@ -344,7 +355,14 @@ class BluetoothLink(private val context: Context) {
 
     private fun routeNotification(uuid: UUID, value: ByteArray) {
         when (uuid) {
-            notifyChar?.uuid -> for (v in value) received.offer(v.toInt() and 255)
+            notifyChar?.uuid -> {
+                if (family == Family.BAOFENG_DONLGE)
+                    for (v in value) received.offer(v.toInt() and 255)
+                else if (!packets.offer(value.copyOf())) {
+                    ready = false
+                    lastGattReport += "\nPacket receive overflow; reconnect required."
+                }
+            }
             controlNotify?.uuid -> controlReceived.offer(value.copyOf())
         }
     }
@@ -379,6 +397,18 @@ class BluetoothLink(private val context: Context) {
         if (!ready || closed.get()) throw IOException("Adapter disconnected before baud confirmation")
         confirmedBaud = baud
         lastGattReport += "\nTD-BL1 UART confirmed: " + baud + " baud"
+    }
+
+    fun readPacket(timeoutMs: Long): ByteArray? {
+        if (!ready || closed.get()) throw IOException("Packet link disconnected")
+        return packets.poll(timeoutMs, TimeUnit.MILLISECONDS)
+    }
+
+    @Synchronized
+    fun writePacket(bytes: ByteArray) {
+        require(family != Family.BAOFENG_DONLGE) { "Packet transport required" }
+        require(bytes.isNotEmpty() && bytes.size <= chunkSize) { "Packet exceeds negotiated BLE MTU" }
+        write(bytes)
     }
 
     @Synchronized
@@ -453,6 +483,7 @@ class BluetoothLink(private val context: Context) {
         gatt = null; writeChar = null; notifyChar = null
         controlWrite = null; controlNotify = null
         controlReceived.clear()
+        packets.clear()
         received.clear()
         chunkSize = 20
     }
