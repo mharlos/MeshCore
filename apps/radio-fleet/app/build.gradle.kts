@@ -15,9 +15,11 @@ android {
             create("fleetRelease") {
                 storeFile = file(fleetKeystorePath!!)
                 storePassword = fleetKeystorePassword
-                keyAlias = "farmradiofleet"
+                // Keystore alias and format are configurable for private CI
+                // signing workflows; default to the dedicated PKCS#12 identity.
+                keyAlias = System.getenv("RADIO_FLEET_SIGNING_ALIAS") ?: "farmradiofleet"
                 keyPassword = fleetKeystorePassword
-                storeType = "PKCS12"
+                storeType = System.getenv("RADIO_FLEET_KEYSTORE_TYPE") ?: "PKCS12"
             }
         }
     }
