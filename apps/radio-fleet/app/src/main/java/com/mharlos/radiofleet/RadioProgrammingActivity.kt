@@ -23,6 +23,9 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.util.concurrent.Executors
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.io.IOException
 
 /**
  * One APK, three independent device drivers.
@@ -160,20 +163,54 @@ class RadioProgrammingActivity : Activity() {
         if (busy) return
         resetBackup()
         targetName = name
-        setStatus("Connecting to " + name + " ...")
-        val family = if (model == "BTECH UV-PRO")
+        val targetModel = model
+        val family = if (targetModel == "BTECH UV-PRO")
             BluetoothLink.Family.BENSHI_UVPRO else BluetoothLink.Family.BAOFENG_DONLGE
-        link.connect(device, family) { result ->
-            result.fold({ description ->
-                setStatus(description + "\nReady to READ " + model)
-                readButton.isEnabled = true
-                writeButton.isEnabled = false
-            }, { error ->
-                setStatus("Connection failed: " + error.message +
-                    "\nTap Copy Bluetooth service diagnostics to share detected service UUIDs.")
-            })
+        worker("Connecting to " + name + " ...") {
+            val description = connectBlocking(device, family)
+            if (link.hasTidradioControl) {
+                val baud = TidradioAdapterController(link).ensureBaud(targetModel, {
+                    link.disconnect()
+                    // The adapter needs time to restart advertising after AT+RST.
+                    Thread.sleep(1200)
+                    var last: Exception? = null
+                    var connected = false
+                    for (attempt in 1..3) {
+                        try {
+                            connectBlocking(device, family)
+                            connected = true
+                            break
+                        } catch (e: Exception) {
+                            if (e is InterruptedException) throw e
+                            last = e
+                            link.disconnect()
+                            if (attempt < 3) Thread.sleep(1500)
+                        }
+                    }
+                    if (!connected) throw IOException("TD-BL1 reconnect failed", last)
+                }, ::setStatus)
+                setStatus("TD-BL1 UART verified: " + baud + " baud.\nReady to READ " + targetModel)
+            } else {
+                setStatus(description + "\nReady to READ " + targetModel)
+            }
         }
     }
+
+    private fun connectBlocking(device: BluetoothDevice, family: BluetoothLink.Family): String {
+        val done = CountDownLatch(1)
+        var result: Result<String>? = null
+        // BluetoothLink delivers its result on the main thread. Never block that thread.
+        link.connect(device, family) {
+            result = it
+            done.countDown()
+        }
+        if (!done.await(15, TimeUnit.SECONDS)) {
+            link.disconnect()
+            throw IOException("BLE connection timed out")
+        }
+        return result?.getOrThrow() ?: throw IOException("BLE connection result missing")
+    }
+
     private fun worker(label: String, body: () -> Unit) {
         if (busy) return
         lastFailureReport = ""
@@ -203,8 +240,9 @@ class RadioProgrammingActivity : Activity() {
                 busy = false
                 runOnUiThread {
                     for (i in 0 until radioGroup.childCount) radioGroup.getChildAt(i).isEnabled = true
-                    readButton.isEnabled = link.ready
-                    writeButton.isEnabled = link.ready && readModel == model &&
+                    val configured = link.ready && (!link.hasTidradioControl || link.confirmedBaud != null)
+                    readButton.isEnabled = configured
+                    writeButton.isEnabled = configured && readModel == model &&
                         backupFile?.exists() == true
                 }
             }
@@ -228,6 +266,10 @@ class RadioProgrammingActivity : Activity() {
 
     private fun read() {
         val targetModel = model
+        if (link.hasTidradioControl && link.confirmedBaud != TidradioBaudProtocol.required(targetModel)) {
+            setStatus("Connect and verify TD-BL1 baud before reading.")
+            return
+        }
         worker("Reading " + targetModel + "; keep radio connected...") {
             when (targetModel) {
                 "BTECH UV-PRO" -> {
