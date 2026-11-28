@@ -327,6 +327,7 @@ def _apply(radio, item):
         if ctcss is not None:
             return ("Tone", float(ctcss), None)
         return ("", None, None)
+    memory.tmode = ""
     chirp_common.split_tone_decode(memory,
         spec(item.get("txCtcss"), item.get("txDcs"), 0),
         spec(item.get("rxCtcss"), item.get("rxDcs"), 1))
