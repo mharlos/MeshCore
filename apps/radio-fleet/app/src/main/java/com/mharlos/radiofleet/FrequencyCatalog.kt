@@ -3,7 +3,7 @@ package com.mharlos.radiofleet
 import java.util.Locale
 
 /** US channel plan. Catalog entries are templates, not assigned memory slots.
- * GMRS intent is separate from FRS monitoring; direct TX needs operator confirmation.
+ * Service intent is independent of the selected radio's certified capabilities.
  */
 internal object FrequencyCatalog {
     val groups: Map<String, List<Channel>> by lazy {
@@ -19,6 +19,11 @@ internal object FrequencyCatalog {
             }
             rx("FRS" + num(n), f, "FRS monitoring",
                 "Shared channel " + n + "; no universal privacy tone", "NFM")
+        }
+        val frs = shared.mapIndexed { i, c ->
+            val n = i + 1
+            c.copy(transmit = c.receive, service = "FRS simplex",
+                description = "FRS channel " + n + (if (n in 8..14) "; 0.5 W ERP maximum" else "; 2 W ERP maximum") + "; certified FRS radio required")
         }
         val simplex = shared.mapIndexed { i, c ->
             val n = i + 1
@@ -68,7 +73,7 @@ internal object FrequencyCatalog {
             Channel(0, "CALL2M", 146.520, 146.520, service="Amateur simplex", description="National 2m calling"),
             Channel(0, "CALL70", 446.000, 446.000, service="Amateur simplex", description="National 70cm calling")
         )
-        linkedMapOf("FRS monitoring (22)" to shared, "GMRS simplex (22)" to simplex, "GMRS repeaters (8)" to gmrs,
+        linkedMapOf("FRS simplex (22)" to frs, "FRS monitoring (22)" to shared.map { it.copy(name = "FRSRX" + it.name.takeLast(2)) }, "GMRS simplex (22)" to simplex, "GMRS repeaters (8)" to gmrs,
             "NOAA weather (7)" to weather, "Marine VHF (10)" to marine,
             "Aviation AM (7; UV-5RM only)" to aviation, "MURS (5)" to murs,
             "Amateur simplex (2)" to amateur, "CB (40; reference only)" to cb)
@@ -100,7 +105,9 @@ internal object FrequencyCatalog {
         transmit == null || (mode != "AM" && (transmit in 144.0..148.0 ||
             transmit in 420.0..450.0 || isGmrsPair(receive, transmit)))
 
-    fun gmrsTxCount(channels: List<Channel>) = channels.count { isGmrsPair(it.receive, it.transmit) }
+    fun isFrs(c: Channel) = c.service.startsWith("FRS", true) || c.name.startsWith("FRS", true)
+    fun gmrsTxCount(channels: List<Channel>) = channels.count { !isFrs(it) && isGmrsPair(it.receive, it.transmit) }
+    fun frsTxCount(channels: List<Channel>) = channels.count { isFrs(it) && isGmrsPair(it.receive, it.transmit) }
 
     fun forModel(channels: List<Channel>, model: String, gmrsAuthorized: Boolean = false): List<Channel> =
         channels.filter { supports(it, model) && it.slot in 1..127 }.map {
@@ -108,7 +115,7 @@ internal object FrequencyCatalog {
             val restricted = gmrs && hz(it.receive) in gmrsSimplexHz.subList(7,14)
             val powerLimited = gmrs && hz(it.receive) in gmrsSimplexHz.subList(0,7)
             it.copy(name = it.name.take(if (model == "UV-5R") 7 else 12),
-                transmit = if (gmrs && (!gmrsAuthorized || restricted)) null else it.transmit,
+                transmit = if (gmrs && (isFrs(it) || !gmrsAuthorized || restricted)) null else it.transmit,
                 power = if (powerLimited || restricted || model == "UV-5R" && it.power.equals("Medium", true)) "Low" else it.power)
         }
 
@@ -118,7 +125,7 @@ internal object FrequencyCatalog {
         for (c in candidates) {
             if (!supports(c, "UV-5RM")) continue
             if (result.any { kotlin.math.abs(it.receive - c.receive) < 0.000001 &&
-                    it.transmit == c.transmit && it.mode == c.mode &&
+                    isFrs(it) == isFrs(c) && it.transmit == c.transmit && it.mode == c.mode &&
                     it.txCtcss == c.txCtcss && it.rxCtcss == c.rxCtcss &&
                     it.txDcs == c.txDcs && it.rxDcs == c.rxDcs && it.dcsPolarity == c.dcsPolarity }) continue
             if (!free.hasNext()) break
